@@ -6,6 +6,7 @@
     gq2-fleet logins                 # the Claude login pool: chains, leases, missing sign-ins
     gq2-fleet attention [--ack PR]   # rounds whose agent declined to act (a PR to close?), until acknowledged
     gq2-fleet restart ID...          # restart workers between rounds (clears a long backoff)
+    gq2-fleet periodic [--now STAGE] # the cadenced curate/progress rounds
     gq2-fleet watch [--interval 30]
     gq2-fleet status
     gq2-fleet down [--leave-workers]
@@ -72,7 +73,8 @@ HOME = Path(_pwd.getpwuid(os.getuid()).pw_dir)
 # directory exists (the Mac layout), else the home directory itself (the Ubuntu fleet user).
 ROOT = Path(os.environ.get("GQ2_FLEET_ROOT") or (HOME / "claude" if (HOME / "claude").is_dir() else HOME)).expanduser()
 WORKTREE = Path(os.environ.get("GQ2_FLEET_WORKTREE", ROOT / "TauCetiWorker-v2")).expanduser()
-TARGETS = Path(os.environ.get("GQ2_FLEET_TARGETS", ROOT / "TauCetiRoadmap" / "gq2_axiom_targets.md")).expanduser()
+_REPO_TARGETS = ROOT / "tauceti-fleet" / "targets" / "gq2_axiom_targets.md"  # the tracked copy (roed-math/tauceti-fleet)
+TARGETS = Path(os.environ.get("GQ2_FLEET_TARGETS") or (_REPO_TARGETS if _REPO_TARGETS.is_file() else ROOT / "TauCetiRoadmap" / "gq2_axiom_targets.md")).expanduser()
 FLEET_HOME = Path(os.environ.get("GQ2_FLEET_HOME", ROOT / "gq2-fleet")).expanduser()
 CONFIG = FLEET_HOME / "workers.toml"
 STATE = FLEET_HOME / "state"
@@ -194,7 +196,7 @@ def assign_leases(specs: list[dict]) -> dict[str, str]:
     claude/auto workers without one, in config order. Workers left over share the operator's
     ~/.claude (and `gq2-fleet logins` says so). Pure: the caller writes the result."""
     slots = {d.name for d in login_slots()}
-    eligible = [s_["id"] for s_ in specs if s_["agent"] in ("claude", "auto") and s_["enabled"]]
+    eligible = [s_["id"] for s_ in specs if s_["agent"] in ("claude", "auto") and s_["enabled"]] + [PERIODIC_WID]
     leases = {w: slot for w, slot in read_leases().items() if w in eligible and slot in slots}
     free = sorted(slots - set(leases.values()))
     for wid in eligible:
@@ -369,14 +371,10 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             add(f"gq2-fix{i}", "auto", "fix,fix-ci,rebase")
     for i in range(1, a.reviewers + 1):
         add(f"gq2-rev{i}", "auto", "review")
-    # The two host-side kinds (no untrusted checkout to confine; each is its own stage with a global
-    # claim and a cadence): the roadmap progress reports that feed STATUS.md and the site's Progress
-    # page, and the curator that keeps the target list true so the authors are never stalled by it.
-    for i in range(1, getattr(a, "progress", 1) + 1):
-        add(f"gq2-prog{i}", "claude", "progress", sandbox="host", author_model=a.claude_model, author_effort=a.claude_effort)
-    for i in range(1, getattr(a, "curators", 1) + 1):
-        add(f"gq2-cur{i}", "claude", "curate", sandbox="host", roadmap_targets=str(TARGETS),
-            author_model=a.claude_model, author_effort=a.claude_effort)
+    # The two host-side kinds — the roadmap progress reports and the target-list curator — are not
+    # workers: a loop that surveys every 90 s to find "not due" is waste. They run as one-shot rounds
+    # on a cadence (see `periodic`), from the reconcile hook and the live view, under the id
+    # PERIODIC_WID, which holds a login chain like any worker.
     return specs
 
 
@@ -1007,6 +1005,129 @@ def _verdicts() -> dict[int, dict]:
     return out
 
 
+# ----------------------------------------------------------------------------- periodic rounds
+#
+# Two stages of the worker are not about the fleet's own PRs and want a cadence, not a loop: the
+# roadmap progress reports (TauCetiProgress, one report per run, about every 8 h) and the target-list
+# curator (every 6 h). Each runs as ONE `tauceti work` round on the host — no manager, no survey
+# polling in between — started in the background by the reconcile hook (after every round of the
+# fleet) or by the live view, whichever comes first once the stage is due. One at a time, under a
+# lock; the round's own due-check (attempt gap counters) is the second line of defence.
+
+PERIODIC_WID = "gq2-periodic"
+PERIODIC = {"curate": 6 * 3600, "progress": 8 * 3600}  # stage -> seconds between runs
+
+
+def periodic_dir() -> Path:
+    d = FLEET_HOME / "periodic"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def periodic_enabled(stage: str) -> bool:
+    """`curate` is always on. `progress` is opt-in (`gq2-fleet periodic --enable progress`) until
+    TauCetiProgress's planner rotates through the roadmaps that need an update rather than taking
+    the busiest one every time (owner's ruling 2026-09-21; the planner change is upstream's to merge
+    and pin)."""
+    return stage == "curate" or (periodic_dir() / f"{stage}.enabled").is_file()
+
+
+def periodic_due(stage: str) -> bool:
+    if not periodic_enabled(stage):
+        return False
+    last = periodic_dir() / f"{stage}.last"
+    try:
+        return time.time() - last.stat().st_mtime >= PERIODIC[stage]
+    except OSError:
+        return True
+
+
+def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
+    """The environment of a periodic round: what a worker gets (gate, budgets, models, its login
+    chain), without a manager. The login chain is leased under PERIODIC_WID like any worker's."""
+    env = worker_env()
+    env.update({
+        "TAUCETI_WORKER_ID": PERIODIC_WID,
+        "TAUCETI_ROADMAP_TARGETS": str(TARGETS),
+        "TAUCETI_AUTHORING_CLAUDE_MODEL": getattr(a, "claude_model", None) or _config_env("TAUCETI_AUTHORING_CLAUDE_MODEL") or "claude-opus-5",
+        "TAUCETI_AUTHORING_CLAUDE_EFFORT": getattr(a, "claude_effort", None) or _config_env("TAUCETI_AUTHORING_CLAUDE_EFFORT") or "high",
+        "TAUCETI_CLAUDE_REFRESH_SKEW": str(round_timeout() + 600),
+        "TAUCETI_REACTIONS": _config_env("TAUCETI_REACTIONS") or "0",
+        "TAUCETI_STUCK_ISSUES": _config_env("TAUCETI_STUCK_ISSUES") or "0",
+        "TAUCETI_AUTO_REFRESH": "1",
+        # The curator commits the target list and, in the fleet repository, pushes it so the other
+        # host and the owner see the same list. Off if the file is not git-tracked (nothing to push).
+        "TAUCETI_TARGETS_PUSH": _config_env("TAUCETI_TARGETS_PUSH") or "1",
+    })
+    d = login_dir(PERIODIC_WID)
+    if d is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(d)
+    return env
+
+
+def run_periodic(stage: str, *, quiet: bool = True, force: bool = False) -> str:
+    """Start one background round of `stage` if it is due and none is running. Returns a note."""
+    import fcntl
+
+    if stage not in PERIODIC:
+        return f"periodic: unknown stage {stage}"
+    if not force and not periodic_due(stage):
+        return ""
+    lock = open(periodic_dir() / "run.lock", "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return f"periodic: a round is already running ({stage} waits)"
+    logs = STATE / "logs" / PERIODIC_WID
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"{stage}-{datetime.now():%Y%m%d-%H%M%S}.log"
+    (periodic_dir() / f"{stage}.last").touch()
+    argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", stage, "--worker-id", PERIODIC_WID,
+            "--author-model", periodic_env().get("TAUCETI_AUTHORING_CLAUDE_MODEL", "claude-opus-5"),
+            "--author-effort", periodic_env().get("TAUCETI_AUTHORING_CLAUDE_EFFORT", "high"),
+            "--agent", "claude", "--roadmap-targets", str(TARGETS)]
+    # The lock file descriptor is inherited by the child, so the lock lives as long as the round.
+    subprocess.Popen(argv, cwd=WORKTREE, env=periodic_env(), stdout=open(log, "a"), stderr=subprocess.STDOUT,
+                     stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=(lock.fileno(),))
+    note = f"periodic: started a {stage} round → {log}"
+    _watchdog_note(note)
+    if not quiet:
+        print(note)
+    return note
+
+
+def ensure_periodic(quiet: bool) -> None:
+    """Called from the reconcile hook and the live view: start whichever periodic stage is due."""
+    for stage in PERIODIC:
+        note = run_periodic(stage, quiet=quiet)
+        if note and "already running" in note:
+            break
+
+
+def cmd_periodic(a: argparse.Namespace) -> int:
+    """Show the cadence, or run a stage now (`--now curate|progress`, in the foreground)."""
+    if a.enable:
+        (periodic_dir() / f"{a.enable}.enabled").touch()
+        print(f"{a.enable}: enabled")
+    if a.disable:
+        (periodic_dir() / f"{a.disable}.enabled").unlink(missing_ok=True)
+        print(f"{a.disable}: disabled")
+    if a.now:
+        env = periodic_env(a)
+        argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", a.now, "--worker-id", PERIODIC_WID,
+                "--author-model", env["TAUCETI_AUTHORING_CLAUDE_MODEL"], "--author-effort", env["TAUCETI_AUTHORING_CLAUDE_EFFORT"],
+                "--agent", "claude", "--roadmap-targets", str(TARGETS)]
+        (periodic_dir() / f"{a.now}.last").touch()
+        return subprocess.run(argv, cwd=WORKTREE, env=env).returncode
+    for stage, gap in PERIODIC.items():
+        last = periodic_dir() / f"{stage}.last"
+        when = f"last run {age(last.stat().st_mtime)} ago" if last.exists() else "never run"
+        state = "disabled (gq2-fleet periodic --enable progress)" if not periodic_enabled(stage) else ("DUE" if periodic_due(stage) else "not due")
+        print(f"  {stage:9s} every {gap // 3600} h — {when}; {state}")
+    print(f"logs: {STATE / 'logs' / PERIODIC_WID}/   login chain: {login_dir(PERIODIC_WID) or 'shared ~/.claude'}")
+    return 0
+
+
 def cmd_targets(a: argparse.Namespace) -> int:
     """Audit the target list's `[~]` items against their PRs. The file marks an item in flight by
     hand ("in flight: #N"); the live view promotes it to done only when a MERGED PR carries its
@@ -1160,7 +1281,7 @@ def build_view(progress: Progress, console=None):
         phase = st.get("phase") or ""
         target = st.get("target") or ""
         what = f"{phase} {target}".strip() or (st.get("detail") or "")
-        agent = st.get("agent", "") or ("claude" if re.match(r"gq2-(c\d|fix[13579]|prog\d|cur\d)$", w) else "auto")
+        agent = st.get("agent", "") or ("claude" if re.match(r"gq2-(c\d|fix[13579])$", w) else "auto")
         m = re.search(r"provider=(\w+)", st.get("detail") or "") if agent == "auto" else None
         if m and st.get("state") in ("running", "surveying"):
             agent = f"auto→{m.group(1)}"  # what the pacer picked for the round in flight
@@ -1275,6 +1396,7 @@ def cmd_watch(a: argparse.Namespace) -> int:
                     freshened = time.time()
                     try:
                         freshen_logins(quiet=True)
+                        ensure_periodic(quiet=True)
                     except Exception as exc:
                         _watchdog_note(f"login keeper: {exc}")
         except KeyboardInterrupt:
@@ -1467,6 +1589,8 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
         freshen_logins(quiet)
         ensure_pool_warm(quiet, start=not getattr(a, "dry_run", False))
         ensure_cache_proxy_alive(quiet, start=not getattr(a, "dry_run", False))
+        if not getattr(a, "dry_run", False):
+            ensure_periodic(quiet)
         if not changed or not apply:
             honor_restart_request(quiet)
             return 0
@@ -1491,8 +1615,6 @@ def _shape_from_config(a: argparse.Namespace) -> argparse.Namespace:
     a.codex = sum(1 for i in ids if i.startswith("gq2-x"))
     a.reviewers = sum(1 for i in ids if i.startswith("gq2-rev"))
     a.fixers = sum(1 for i in ids if i.startswith("gq2-fix"))
-    a.progress = sum(1 for i in ids if i.startswith("gq2-prog"))
-    a.curators = sum(1 for i in ids if i.startswith("gq2-cur"))
     a.pilot = 'TAUCETI_REACTIONS = "0"' in t
     a.sandbox = "bubble" if 'sandbox = "bubble"' in t else "host"
     a.pace = os.environ.get("TAUCETI_PACE", "") or (re.search(r'^pace\s*=\s*"([^"]+)"', t, re.M) or [None, ""])[1]
@@ -1743,8 +1865,7 @@ def cmd_logins(a: argparse.Namespace) -> int:
         print(f"  {wid:9s} {s_['agent']:6s} {state}")
     # How many chains the fleet can use at once: every Claude-capable worker the shape allows to run
     # together (Claude authors, every fixer and reviewer, all `auto`), not the number running now.
-    need = (getattr(shape, "claude", 0) + getattr(a, "max_fixers", 3) + getattr(a, "max_reviewers", 2)
-            + getattr(shape, "progress", 1) + getattr(shape, "curators", 1))
+    need = getattr(shape, "claude", 0) + getattr(a, "max_fixers", 3) + getattr(a, "max_reviewers", 2) + 1  # + periodic
     have = len(slots)
     print(f"\n{have} chain(s) for up to {need} concurrent Claude-capable workers "
           f"({getattr(shape, 'claude', 0)} Claude author(s) + {getattr(a, 'max_fixers', 3)} fixers + {getattr(a, 'max_reviewers', 2)} reviewers).")
@@ -1911,8 +2032,6 @@ def main() -> int:
     up.add_argument("--codex-model", default="")
     up.add_argument("--codex-effort", default="")
     up.add_argument("--max-fixers", type=int, default=3, help="fixers while authoring is impossible (mine_open >= 8); fewer as the backlog shrinks")
-    up.add_argument("--progress", type=int, default=1, help="roadmap progress-report workers (host-side; default 1)")
-    up.add_argument("--curators", type=int, default=1, help="target-list curators (host-side; default 1)")
     up.add_argument("--no-watch", action="store_true", help="start and return instead of opening the live view")
     up.add_argument("--dry-run", action="store_true", help="write and validate the config, pre-seed checkouts, but do not start")
     up.set_defaults(fn=cmd_up)
@@ -1964,6 +2083,13 @@ def main() -> int:
     at.add_argument("--lookup", action="store_true", help="resolve the PRs an item names (state, merge date, title) through the gate; cached in the item")
     at.add_argument("--retry", metavar="PR", help="after an infrastructure fix: reset this PR's review-error budget in every worker and archive its review-stuck item")
     at.set_defaults(fn=cmd_attention)
+    pe = sub.add_parser("periodic", help="the cadenced one-shot rounds (curate every 6 h, progress every 8 h): show, or run one now")
+    pe.add_argument("--now", choices=tuple(PERIODIC), help="run this stage now, in the foreground")
+    pe.add_argument("--enable", choices=("progress",), help="turn the progress-report cadence on")
+    pe.add_argument("--disable", choices=("progress",), help="turn the progress-report cadence off")
+    pe.add_argument("--claude-model", default=None)
+    pe.add_argument("--claude-effort", default=None)
+    pe.set_defaults(fn=cmd_periodic)
     tg = sub.add_parser("targets", help="audit the target list's in-flight items against their PRs (closed ones starve the authors)")
     tg.add_argument("--apply", action="store_true", help="mark merged and recorded-subsumed items done in the target file")
     tg.set_defaults(fn=cmd_targets)
