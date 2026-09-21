@@ -1016,6 +1016,13 @@ def _verdicts() -> dict[int, dict]:
 
 PERIODIC_WID = "gq2-periodic"
 PERIODIC = {"curate": 6 * 3600, "progress": 8 * 3600}  # stage -> seconds between runs
+# The progress reports come from the fleet's OWN fork of TauCetiProgress, pinned by SHA: its planner
+# has the `rotate` strategy (the stalest reportable roadmap first, never-reported ones before any),
+# which upstream's `busiest` lacks. The file formats are upstream's, so TauCetiRoadmap's merge gate,
+# pinned to upstream, accepts the reports. Each of these can be overridden in the fleet config.
+PROGRESS_REPO = "roed-math/TauCetiProgress"
+PROGRESS_REF = "38ce36d2f14e98ee2bfbd4d204865a85df05d35c"  # feat/rotate-strategy, 2026-09-21
+PROGRESS_STRATEGY = "rotate"
 
 
 def periodic_dir() -> Path:
@@ -1025,10 +1032,9 @@ def periodic_dir() -> Path:
 
 
 def periodic_enabled(stage: str) -> bool:
-    """`curate` is always on. `progress` is opt-in (`gq2-fleet periodic --enable progress`) until
-    TauCetiProgress's planner rotates through the roadmaps that need an update rather than taking
-    the busiest one every time (owner's ruling 2026-09-21; the planner change is upstream's to merge
-    and pin)."""
+    """`curate` is always on. `progress` is opt-in (`gq2-fleet periodic --enable progress`): it
+    publishes pull requests to TauCetiRoadmap, so it is switched on deliberately. Rotation through
+    the roadmaps (rather than busiest-first) comes from the pinned fork, see PROGRESS_REF."""
     return stage == "curate" or (periodic_dir() / f"{stage}.enabled").is_file()
 
 
@@ -1058,7 +1064,18 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
         # The curator commits the target list and, in the fleet repository, pushes it so the other
         # host and the owner see the same list. Off if the file is not git-tracked (nothing to push).
         "TAUCETI_TARGETS_PUSH": _config_env("TAUCETI_TARGETS_PUSH") or "1",
+        # Progress reports: the fork's planner, rotating, remembering its choices between runs.
+        "TAUCETI_PROGRESS_REPO": _config_env("TAUCETI_PROGRESS_REPO") or PROGRESS_REPO,
+        "TAUCETI_PROGRESS_REF": _config_env("TAUCETI_PROGRESS_REF") or PROGRESS_REF,
+        "TAUCETI_PROGRESS_STRATEGY": _config_env("TAUCETI_PROGRESS_STRATEGY") or PROGRESS_STRATEGY,
+        "TAUCETI_PROGRESS_STATE": _config_env("TAUCETI_PROGRESS_STATE") or str(periodic_dir() / "progress-rotation.json"),
     })
+    # The same pacing curve as the managed workers, which get theirs as `pace = ...` in the config.
+    # Without it the worker's default curve applies, and that one allows nothing at all early in a
+    # usage window: the first curate round (2026-09-21) ended with "no model under pace right now".
+    pace = os.environ.get("TAUCETI_PACE", "") or (re.search(r'^pace\s*=\s*"([^"]+)"', CONFIG.read_text(), re.M) or [None, ""])[1] if CONFIG.is_file() else ""
+    if pace:
+        env["TAUCETI_PACE"] = pace
     d = login_dir(PERIODIC_WID)
     if d is not None:
         env["CLAUDE_CONFIG_DIR"] = str(d)
@@ -1102,6 +1119,32 @@ def ensure_periodic(quiet: bool) -> None:
         note = run_periodic(stage, quiet=quiet)
         if note and "already running" in note:
             break
+
+
+def periodic_status(stage: str) -> dict:
+    """What the live view shows for a cadenced stage: whether a round is running now, the newest
+    log and its last line, and when the next round is due."""
+    logs = STATE / "logs" / PERIODIC_WID
+    newest = max(logs.glob(f"{stage}-*.log"), key=lambda q: q.stat().st_mtime, default=None) if logs.is_dir() else None
+    last_line, last_at = "", None
+    if newest is not None:
+        last_at = newest.stat().st_mtime
+        try:
+            tail = newest.read_text(errors="replace").strip().splitlines()
+            last_line = re.sub(r"^\S+ \S+ tauceti: ", "", tail[-1]) if tail else ""
+        except OSError:
+            pass
+    try:
+        running = subprocess.run(["pgrep", "-f", f"--only {stage} --worker-id {PERIODIC_WID}"],
+                                 capture_output=True, text=True, timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        running = False
+    last = periodic_dir() / f"{stage}.last"
+    next_at = None
+    if periodic_enabled(stage) and last.exists():
+        next_at = last.stat().st_mtime + PERIODIC[stage]
+    return {"running": running, "enabled": periodic_enabled(stage), "log": newest, "last_line": last_line,
+            "last_at": last_at, "next_at": next_at}
 
 
 def cmd_periodic(a: argparse.Namespace) -> int:
@@ -1287,6 +1330,19 @@ def build_view(progress: Progress, console=None):
             agent = f"auto→{m.group(1)}"  # what the pacer picked for the round in flight
         t.add_row(w, agent, Text(label, style=style),
                   str(what)[:60], last_log_line(w)[:120], age(st.get("activity_at")), until(st.get("next_action_at")))
+    # The cadenced stages run outside the manager (one `tauceti work` round each, on a timer), so
+    # they have no status file; one row each from their logs and the cadence files.
+    for stage in PERIODIC:
+        ps = periodic_status(stage)
+        if ps["running"]:
+            label, style, what = "running", "green", f"{stage} round in progress"
+        elif not ps["enabled"]:
+            label, style, what = "disabled", "dim", f"gq2-fleet periodic --enable {stage}"
+        else:
+            label, style, what = "idle", "dim", f"every {PERIODIC[stage] // 3600} h"
+        nxt = "running" if ps["running"] else ("—" if not ps["enabled"] else ("due" if ps["next_at"] is None or ps["next_at"] <= time.time() else until(ps["next_at"])))
+        t.add_row(f"periodic:{stage}", "claude", Text(label, style=style), what[:60], ps["last_line"][:120],
+                  age(ps["last_at"]) if ps["last_at"] else "never", nxt)
 
     d = progress.refresh() if progress.remote_ok else (progress.data or {"error": "remote refresh off (pass --refresh)"})
     gate_line = ""
