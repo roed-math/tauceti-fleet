@@ -1,0 +1,1996 @@
+#!/usr/bin/env python3
+# Runs on the operator's Python 3.11+ (stdlib only); the worker itself is imported from the worktree.
+"""gq2-fleet — start, watch and stop the GQ2 axiom-targets fleet with one command.
+
+    gq2-fleet up [--pace CURVE] [--claude 2] [--codex 2] [--fixers 2] [--reviewers 1] [--no-watch]
+    gq2-fleet logins                 # the Claude login pool: chains, leases, missing sign-ins
+    gq2-fleet attention [--ack PR]   # rounds whose agent declined to act (a PR to close?), until acknowledged
+    gq2-fleet restart ID...          # restart workers between rounds (clears a long backoff)
+    gq2-fleet watch [--interval 30]
+    gq2-fleet status
+    gq2-fleet down [--leave-workers]
+    gq2-fleet logs ID [-f]
+
+`up` writes a workers.toml for the recommended fleet, pre-seeds each authoring/fixing checkout as an
+APFS clone of an existing built checkout (seconds, ~0 bytes, instead of a 12 GB unpack), hands the
+file to the worker's own persistent manager (`tauceti workers apply`, run from the patched worktree so
+`--roadmap-targets` and worker-side target claims are available), and then opens the live view.
+
+Everything the workers print goes to durable per-worker logs under $GQ2_FLEET_HOME/state/logs/<id>/;
+the live view only shows health and progress. The pacing curve comes from --pace or $TAUCETI_PACE and
+is written into every worker; re-running `up` with a different curve restarts just the workers whose
+definition changed (the manager reconciles by spec hash).
+
+Environment overrides: GQ2_FLEET_ROOT (parent of the three below; default ~/claude if present, else ~),
+GQ2_FLEET_WORKTREE (patched TauCetiWorker checkout), GQ2_FLEET_TARGETS (target file), GQ2_FLEET_HOME (config/state/logs), CLAIM_REPO (claim namespace; every worker must agree),
+TAUCETI_PACE (default pacing curve).
+"""
+
+from __future__ import annotations
+
+import os as _os
+import sys as _sys
+
+# The live view needs `rich`, which the worker's own uv environment carries and the system
+# Python usually does not. Re-exec under that interpreter when available (both platforms):
+# $GQ2_FLEET_PYTHON, else the uv tool's python, else stay put and fail clearly later.
+try:
+    import rich  # noqa: F401
+    _HAVE_RICH = True
+except ImportError:
+    _HAVE_RICH = False
+    # A venv python may share its realpath with the system one yet import from the venv, so the
+    # loop guard is an env marker, not a path comparison. Resolve `~` via the password database:
+    # under the worker's moved $HOME (Linux) expanduser would point at the wrong place.
+    import pwd as _pwd_
+
+    _login_home = _pwd_.getpwuid(_os.getuid()).pw_dir
+    if not _os.environ.get("GQ2_FLEET_REEXEC"):
+        for _cand in (_os.environ.get("GQ2_FLEET_PYTHON"), f"{_login_home}/.local/share/uv/tools/tauceti/bin/python3"):
+            if _cand and _os.path.exists(_cand):
+                _os.environ["GQ2_FLEET_REEXEC"] = "1"
+                _os.execv(_cand, [_cand, *_sys.argv])
+    # No interpreter with rich: only the live view needs it; every other command still works.
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pwd as _pwd
+
+# The login user's real home, NOT $HOME: on Linux the worker moves $HOME to a per-worker private home
+# before running rounds, and the round-done hook runs this script from inside that environment.
+HOME = Path(_pwd.getpwuid(os.getuid()).pw_dir)
+# Where the worktree, roadmap checkout and fleet state live: $GQ2_FLEET_ROOT, else ~/claude when that
+# directory exists (the Mac layout), else the home directory itself (the Ubuntu fleet user).
+ROOT = Path(os.environ.get("GQ2_FLEET_ROOT") or (HOME / "claude" if (HOME / "claude").is_dir() else HOME)).expanduser()
+WORKTREE = Path(os.environ.get("GQ2_FLEET_WORKTREE", ROOT / "TauCetiWorker-v2")).expanduser()
+TARGETS = Path(os.environ.get("GQ2_FLEET_TARGETS", ROOT / "TauCetiRoadmap" / "gq2_axiom_targets.md")).expanduser()
+FLEET_HOME = Path(os.environ.get("GQ2_FLEET_HOME", ROOT / "gq2-fleet")).expanduser()
+CONFIG = FLEET_HOME / "workers.toml"
+STATE = FLEET_HOME / "state"
+GATE_DIR = FLEET_HOME / "gate"
+EXPECT_LOGIN = os.environ.get("GQ2_FLEET_LOGIN", "roed-math")
+CLAIM_REPO = os.environ.get("CLAIM_REPO", "TauCetiProject/tauceti-claims")
+INSTALLED_CHECKOUTS = HOME / ".local/share/uv/tools/tauceti/lib/python3.13/site-packages/tauceti_worker/checkouts"
+TAUCETI = "TauCetiProject/TauCeti"
+PYTHON = os.environ.get("GQ2_FLEET_PYTHON", sys.executable)
+IS_MAC = sys.platform == "darwin"
+
+sys.path.insert(0, str(WORKTREE))
+try:
+    from tauceti_worker.targets import load_targets, overlay_live, eligible_items, open_items  # noqa: E402
+    from tauceti_worker.survey import target_marker_ids  # noqa: E402
+except Exception as exc:  # pragma: no cover - environment problem, say so plainly
+    sys.exit(f"gq2-fleet: cannot import the patched worker from {WORKTREE}: {exc}")
+
+
+def die(msg: str) -> None:
+    sys.exit(f"gq2-fleet: {msg}")
+
+
+def worker_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(WORKTREE) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env["TAUCETI_WORKERS_STATE_DIR"] = str(STATE)
+    env["TAUCETI_WORKERS_CONFIG"] = str(CONFIG)
+    env["CLAIM_REPO"] = CLAIM_REPO
+    env["TAUCETI_GATE_DIR"] = str(GATE_DIR)
+    env["TAUCETI_GATE_REQUIRED"] = "1"
+    env["TAUCETI_EXPECT_LOGIN"] = EXPECT_LOGIN
+    # The wrapper's own gate calls (status, reconcile's backlog read, `attention --lookup`) share the
+    # workers' budgets, so they must use the workers' NUMBERS: read them from the fleet config the
+    # wrapper wrote (owner raised reads to 1200/h; a hard-coded 600 here made `gate status` print
+    # 702/600 and refused the wrapper's own reads while the workers still had headroom).
+    for var, default in (("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40"), ("TAUCETI_GATE_READS_PER_HOUR", "600")):
+        env.setdefault(var, _config_env(var) or default)
+    return env
+
+
+def _config_env(var: str) -> str | None:
+    """The value the fleet config gives every worker for `var`, or None before any config exists."""
+    if not CONFIG.is_file():
+        return None
+    m = re.search(rf'^{re.escape(var)}\s*=\s*"([^"]*)"', CONFIG.read_text(), re.M)
+    return m.group(1) if m else None
+
+
+def tauceti(*args: str, capture: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [PYTHON, "-m", "tauceti_worker", *args],
+        cwd=WORKTREE,
+        env=worker_env(),
+        text=True,
+        capture_output=capture,
+    )
+
+
+# ----------------------------------------------------------------------------- fleet definition
+
+
+def me() -> str:
+    p = subprocess.run(["gh", "api", "user", "--jq", ".login"], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def round_timeout() -> int:
+    """The per-round hard cap the fleet runs with. $TAUCETI_ROUND_TIMEOUT when set (`up` in the owner's
+    shell), else what the fleet config already records, else the worker's default. Every reconcile —
+    the owner's shell, the round-done hook under a worker's environment — must compute the same value,
+    or each rewrites the other's refresh skew and restarts idle workers for nothing (seen 2026-09-20)."""
+    v = os.environ.get("TAUCETI_ROUND_TIMEOUT")
+    if not v and CONFIG.is_file():
+        t = CONFIG.read_text()
+        m = re.search(r'^TAUCETI_ROUND_TIMEOUT\s*=\s*"(\d+)"', t, re.M)
+        if m:
+            v = m.group(1)
+        else:  # configs written before the timeout was recorded: recover it from the skew
+            m = re.search(r'^TAUCETI_CLAUDE_REFRESH_SKEW\s*=\s*"(\d+)"', t, re.M)
+            v = str(int(m.group(1)) - 600) if m else None
+    return int(v) if v else 5400
+LOGINS = FLEET_HOME / "logins"
+LEASES = LOGINS / "leases.json"
+
+
+# ----------------------------------------------------------------------------- Claude login pool
+#
+# Rotating a Claude access token revokes the old one at once (measured 2026-09-20: a reviewer's renewal
+# killed a fixer's 75-minute rebase nine seconds later), so workers that run concurrently must not share
+# one refresh chain. The pool is a set of ordinary `claude auth login`s, one per directory under
+# $GQ2_FLEET_HOME/logins, named for the POOL (claude-1, claude-2, …) and never for a worker: which
+# worker uses which chain is a lease in leases.json. Workers come, go and get renumbered as the backlog
+# reshapes the fleet; the chains stay, and no reshaping asks the owner for a new sign-in.
+#
+# Renewal never needs the owner either. A LEASED chain is renewed by its worker before each launch
+# (TAUCETI_CLAUDE_REFRESH_SKEW below), including while it is parked at a usage limit, because the
+# loop's poll offers the renewal on every wake-up. A FREE chain has no worker, so the fleet renews it
+# itself (freshen_logins, from every reconcile and from the live view) — and only free chains, since
+# rotating a leased one from outside is exactly the mid-round revocation the pool exists to prevent.
+
+
+def login_slots() -> list[Path]:
+    """Every login chain the owner created: a subdirectory of the pool holding a .credentials.json."""
+    if not LOGINS.is_dir():
+        return []
+    return sorted((d for d in LOGINS.iterdir() if d.is_dir() and (d / ".credentials.json").is_file()),
+                  key=lambda d: d.name)
+
+
+def read_leases() -> dict[str, str]:
+    d = read_json(LEASES) if LEASES.is_file() else {}
+    return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def assign_leases(specs: list[dict]) -> dict[str, str]:
+    """Sticky leases, one chain per worker: a worker keeps its chain while it exists and is enabled;
+    chains of workers that left the config or were disabled are released; free chains go to enabled
+    claude/auto workers without one, in config order. Workers left over share the operator's
+    ~/.claude (and `gq2-fleet logins` says so). Pure: the caller writes the result."""
+    slots = {d.name for d in login_slots()}
+    eligible = [s_["id"] for s_ in specs if s_["agent"] in ("claude", "auto") and s_["enabled"]]
+    leases = {w: slot for w, slot in read_leases().items() if w in eligible and slot in slots}
+    free = sorted(slots - set(leases.values()))
+    for wid in eligible:
+        if wid not in leases and free:
+            leases[wid] = free.pop(0)
+    return leases
+
+
+def write_leases(leases: dict[str, str]) -> bool:
+    if not LOGINS.is_dir() or read_leases() == leases:
+        return False
+    LEASES.write_text(json.dumps(leases, indent=2, sort_keys=True) + "\n")
+    return True
+
+
+def login_dir(wid: str, leases: dict[str, str] | None = None) -> Path | None:
+    """The chain leased to this worker, or None when it shares the operator's ~/.claude."""
+    slot = (read_leases() if leases is None else leases).get(wid)
+    return LOGINS / slot if slot and (LOGINS / slot / ".credentials.json").is_file() else None
+
+
+def with_logins(specs: list[dict], leases: dict[str, str]) -> list[dict]:
+    """Point each leased worker's CLAUDE_CONFIG_DIR at its chain (the worker seeds its private mirror
+    from there and renews there)."""
+    for s_ in specs:
+        d = login_dir(s_["id"], leases)
+        s_["env"].pop("CLAUDE_CONFIG_DIR", None)
+        if d is not None:
+            s_["env"]["CLAUDE_CONFIG_DIR"] = str(d)
+    return specs
+
+
+def lease_logins(specs: list[dict]) -> list[dict]:
+    """Assign, persist and apply the leases for these specs (the config writers call this)."""
+    leases = assign_leases(specs)
+    write_leases(leases)
+    return with_logins(specs, leases)
+
+
+def reset_stale_mirror(wid: str) -> str | None:
+    """A worker pins the credential source it was first seeded from (.tauceti-creds-source); when the
+    fleet moves it to another chain (or back to the shared ~/.claude), drop the old mirror and marker
+    so the worker reseeds from the new source at its next isolate_home. Only for a worker whose config
+    block is being switched now (write_config's `switched`): a running worker's marker is live state.
+    Returns a note when something was removed."""
+    iso = WORKTREE / "state" / wid / "home" / ".claude"
+    marker = iso / ".tauceti-creds-source"
+    if not marker.is_file():
+        return None
+    expected = login_dir(wid) or (HOME / ".claude")
+    if marker.read_text().strip() == str(expected):
+        return None
+    for f in (iso / ".credentials.json", marker):
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
+    return f"{wid}: credential mirror reset to reseed from {expected}"
+
+
+def _watchdog_note(line: str) -> None:
+    try:
+        FLEET_HOME.mkdir(parents=True, exist_ok=True)
+        with open(FLEET_HOME / "watchdog.log", "a") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {line}\n")
+    except OSError:
+        pass
+
+
+def freshen_logins(quiet: bool = True) -> list[str]:
+    """Renew every FREE chain whose access token is within the fleet's refresh skew of expiry, so a
+    chain that sits idle (nothing leased it, or the fleet was quiet for a day) stays continuable and
+    no worker that later leases it starts on a dead token. Leased chains are deliberately skipped:
+    their worker renews them, and an outside rotation would revoke the token its round holds. The
+    rotation is the worker's own (`tauceti_worker.oauth`), under the chain's file lock and success
+    cooldown, so a worker and the fleet can never double-spend one single-use refresh token. Linux
+    only: on macOS a login lives in the Keychain and the worker's warm-up renews it."""
+    if IS_MAC:
+        return []
+    try:
+        from tauceti_worker import oauth as credential_refresh
+    except ImportError:
+        return []
+    leased = set(read_leases().values())
+    notes = []
+    for d in login_slots():
+        if d.name in leased:
+            continue
+        prov = credential_refresh.provider("claude", credentials=d / ".credentials.json")
+        try:
+            if not credential_refresh.renewable(prov):
+                notes.append(f"login {d.name}: no refresh token — sign in again (gq2-fleet logins)")
+                continue
+            r = credential_refresh.refresh_if_due(prov, round_timeout() + 600, attempt_interval_seconds=600)
+        except Exception as exc:  # a failing chain must not take the reconcile down with it
+            notes.append(f"login {d.name}: renewal failed ({exc})")
+            continue
+        if r == "refreshed":
+            notes.append(f"login {d.name}: access token renewed while free")
+    for n in notes:
+        _watchdog_note(n)
+        if not quiet:
+            print(n)
+    return notes
+
+
+def fleet_specs(a: argparse.Namespace) -> list[dict]:
+    specs: list[dict] = []
+    authors_on = getattr(a, "authors_enabled", True)
+
+    def add(wid: str, agent: str, only: str, **extra):
+        # Authors stay in the config but disabled while upstream's backpressure rule (>= 8 open PRs of
+        # mine) would make them decline every round anyway; keeping the definition keeps the checkout.
+        enabled = authors_on if only == "roadmap" else True
+        spec = {"id": wid, "enabled": enabled, "agent": agent, "only": only, "sandbox": extra.pop("sandbox", a.sandbox)}
+        if a.pace:
+            spec["pace"] = a.pace
+        spec.update({k: v for k, v in extra.items() if v})
+        # Credentials: the operator's Codex file, and on Linux the Claude credential file, are rotated
+        # by the worker under the host flock (auto_refresh); on macOS an expiring Claude token is renewed
+        # by a warm-up `claude` run against the Keychain (TAUCETI_CLAUDE_WARM). Workers only ever hold
+        # access-token mirrors.
+        spec["auto_refresh"] = True
+        spec["env"] = {
+            "CLAIM_REPO": CLAIM_REPO,
+            # Rotating a Claude access token REVOKES the old one at once (measured 2026-09-20), so a
+            # worker renews only before its own agent launch, early enough that the token outlives the
+            # round. That is only safe when workers do not share one login chain: see `gq2-fleet logins`.
+            "TAUCETI_ROUND_TIMEOUT": str(round_timeout()),  # recorded so every reconcile agrees on it
+            "TAUCETI_CLAUDE_REFRESH_SKEW": str(round_timeout() + 600),
+            # CLAUDE_CONFIG_DIR (the worker's leased login chain) is added by with_logins(); see the pool above.
+            **({"TAUCETI_CLAUDE_WARM": "1"} if IS_MAC else {}),  # Keychain warm-up; Linux uses auto_refresh on the file
+            # Authoring model per provider for `auto` workers, which may not take --author-model (the
+            # worker resolves the profile for whichever provider the pacer picks). Explicit-agent
+            # workers get the same values as flags; both spell the same thing.
+            "TAUCETI_AUTHORING_CLAUDE_MODEL": a.claude_model,
+            "TAUCETI_AUTHORING_CLAUDE_EFFORT": a.claude_effort,
+            **({"TAUCETI_AUTHORING_CODEX_MODEL": a.codex_model} if a.codex_model else {}),
+            **({"TAUCETI_AUTHORING_CODEX_EFFORT": a.codex_effort} if a.codex_effort else {}),
+            # Identity gate: halt (exit 77, persistent halt.json) on any other login or credential error.
+            "TAUCETI_EXPECT_LOGIN": EXPECT_LOGIN,
+            # Shared GitHub gate: one store for the whole fleet; budgets have no defaults by design.
+            "TAUCETI_GATE_DIR": str(GATE_DIR),
+            "TAUCETI_GATE_REQUIRED": "1",
+            "TAUCETI_GATE_MUTATIONS_PER_HOUR": str(a.mutations_per_hour),
+            "TAUCETI_GATE_READS_PER_HOUR": str(a.reads_per_hour),
+            # Pilot interaction contract (brief §8.1): no reactions, no automatic stuck-review issues.
+            "TAUCETI_REACTIONS": "0" if a.pilot else "1",
+            "TAUCETI_STUCK_ISSUES": "0" if a.pilot else "1",
+            # After every round the worker calls back so the fleet shape follows the backlog it just
+            # measured (authors on/off, fixer count) with no GitHub read of its own.
+            "TAUCETI_ROUND_DONE_CMD": f"{Path(__file__).resolve()} reconcile --quiet",
+            "GQ2_FLEET_ROOT": str(ROOT),  # the hook runs under the worker's moved $HOME; pin the root
+        }
+        specs.append(spec)
+
+    for i in range(1, a.claude + 1):
+        add(f"gq2-c{i}", "claude", "roadmap", roadmap_targets=str(TARGETS),
+            author_model=a.claude_model, author_effort=a.claude_effort)
+    # The "Codex" authors run `auto` (Codex first, Claude when Codex's window is spent) so that share of
+    # authoring never parks with its subscription; the Claude authors above stay pinned.
+    for i in range(1, a.codex + 1):
+        add(f"gq2-x{i}", "auto", "roadmap", roadmap_targets=str(TARGETS))
+    # Fixers alternate: odd ones pinned to Claude, even ones `auto` (the worker's pacer prefers Codex
+    # and falls back to Claude when Codex's window is spent), so the Codex share of fixing survives
+    # its subscription running dry instead of parking. Reviewers run `auto` for the same reason. An
+    # `auto` worker may not take --author-model; its models come from TAUCETI_AUTHORING_* above.
+    for i in range(1, a.fixers + 1):
+        if i % 2 == 1:
+            add(f"gq2-fix{i}", "claude", "fix,fix-ci,rebase", author_model=a.claude_model, author_effort=a.claude_effort)
+        else:
+            add(f"gq2-fix{i}", "auto", "fix,fix-ci,rebase")
+    for i in range(1, a.reviewers + 1):
+        add(f"gq2-rev{i}", "auto", "review")
+    # The two host-side kinds (no untrusted checkout to confine; each is its own stage with a global
+    # claim and a cadence): the roadmap progress reports that feed STATUS.md and the site's Progress
+    # page, and the curator that keeps the target list true so the authors are never stalled by it.
+    for i in range(1, getattr(a, "progress", 1) + 1):
+        add(f"gq2-prog{i}", "claude", "progress", sandbox="host", author_model=a.claude_model, author_effort=a.claude_effort)
+    for i in range(1, getattr(a, "curators", 1) + 1):
+        add(f"gq2-cur{i}", "claude", "curate", sandbox="host", roadmap_targets=str(TARGETS),
+            author_model=a.claude_model, author_effort=a.claude_effort)
+    return specs
+
+
+def reviewers_for(active_authors_and_fixers: int, max_reviewers: int = 2) -> int:
+    """Two reviewers once two or more authors and fixers are active, else one. Review capacity is
+    reciprocity toward the project, not our throughput, so it tracks the fleet size, not the backlog."""
+    return max(1, min(max_reviewers, 2 if active_authors_and_fixers >= 2 else 1))
+
+
+def toml_str(v: str) -> str:
+    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+TOML_HEADER = "# Generated by gq2-fleet; re-run `gq2-fleet up` rather than editing by hand.\nversion = 1\n"
+
+
+def render_block(s: dict) -> str:
+    out = ["[[workers]]"]
+    for k, v in s.items():
+        if k == "env":
+            continue
+        if isinstance(v, bool):
+            out.append(f"{k} = {'true' if v else 'false'}")
+        elif k == "only":
+            out.append(f"{k} = [" + ", ".join(toml_str(x) for x in str(v).split(",")) + "]")
+        else:
+            out.append(f"{k} = {toml_str(str(v))}")
+    if s.get("env"):
+        out.append("[workers.env]")
+        for k, v in s["env"].items():
+            out.append(f"{k} = {toml_str(v)}")
+    return "\n".join(out) + "\n"
+
+
+def parse_blocks(text: str) -> dict[str, str]:
+    """id → its [[workers]] block, from a config this wrapper rendered."""
+    blocks = {}
+    for body in re.split(r"(?m)^\[\[workers\]\]\n", text)[1:]:
+        m = re.match(r'id\s*=\s*"([^"]+)"', body)
+        if m:
+            blocks[m.group(1)] = "[[workers]]\n" + body.rstrip("\n") + "\n"
+    return blocks
+
+
+def render_toml(specs: list[dict]) -> str:
+    return TOML_HEADER + "\n" + "\n".join(render_block(s) for s in specs)
+
+
+def mid_round(st: dict) -> bool:
+    """A round is in flight for this worker (its status is live and says so); a restart now loses it."""
+    if not st or st.get("state") not in ("running", "surveying"):
+        return False
+    hb = st.get("heartbeat_at") or st.get("status_updated_at") or 0
+    return bool(hb) and time.time() - hb < 600
+
+
+# ----------------------------------------------------------------------------- checkout pre-seed
+
+
+def checkout_dir(wid: str) -> Path:
+    return WORKTREE / "checkouts" / wid / "TauCeti"
+
+
+def pin_of(co: Path) -> tuple[str, str] | None:
+    try:
+        tc = (co / "lean-toolchain").read_text().strip()
+        manifest = json.loads((co / "lake-manifest.json").read_text())
+        rev = next(p["rev"] for p in manifest["packages"] if p["name"] == "mathlib")
+        return tc, rev
+    except Exception:
+        return None
+
+
+def donor_for(new_wid: str) -> Path | None:
+    """The best existing checkout to APFS-clone: same toolchain + mathlib pin as the newest main we
+    can see locally, preferring fleet siblings (already on this worktree's layout), then the
+    installed workers. A donor whose loop is mid-build is still fine: a half-written olean just
+    fails its trace check and is rebuilt."""
+    cands: list[Path] = []
+    for root in (WORKTREE / "checkouts", INSTALLED_CHECKOUTS):
+        if root.is_dir():
+            for d in sorted(root.iterdir()):
+                co = d / "TauCeti"
+                if d.name != new_wid and (co / ".git").is_dir() and (co / ".lake" / "build").is_dir():
+                    cands.append(co)
+    if not cands:
+        return None
+    # Newest origin/main wins; ties broken by build presence order above.
+    def main_date(co: Path) -> int:
+        p = subprocess.run(["git", "-C", str(co), "log", "-1", "--format=%ct", "origin/main"], capture_output=True, text=True)
+        return int(p.stdout.strip() or 0)
+    cands.sort(key=main_date, reverse=True)
+    best = cands[0]
+    pin = pin_of(best)
+    for co in cands:
+        if pin_of(co) == pin and (co / ".lake" / "packages" / "mathlib" / ".lake" / "build").is_dir():
+            return co
+    return best
+
+
+def preseed(wid: str) -> str:
+    co = checkout_dir(wid)
+    if (co / ".git").is_dir():
+        return "present"
+    donor = donor_for(wid)
+    if donor is None:
+        return "no donor (worker will clone + fetch caches itself)"
+    co.parent.mkdir(parents=True, exist_ok=True)
+    free0 = shutil.disk_usage(HOME).free
+    t0 = time.time()
+    if IS_MAC:
+        subprocess.run(["cp", "-c", "-R", str(donor), str(co)], check=True)
+    else:
+        # --reflink=auto is a copy-on-write clone on btrfs/xfs and a plain copy elsewhere (ext4):
+        # on ext4 this costs the donor's full size (~18 GB), so the note below reports real usage.
+        subprocess.run(["cp", "--reflink=auto", "-a", str(donor), str(co)], check=True)
+    # Land on main; the worker's prepare_checkout does this again every round.
+    subprocess.run(["git", "-C", str(co), "checkout", "-q", "-f", "-B", "main", "origin/main"], check=False)
+    used = (free0 - shutil.disk_usage(HOME).free) / 2**30
+    how = "APFS clone" if IS_MAC else ("reflink clone" if used < 3 else "full copy (no reflink support on this filesystem)")
+    return f"{how} from {donor.parent.name} in {time.time() - t0:.0f}s ({used:+.1f} GB)"
+
+
+# ----------------------------------------------------------------------------- credentials
+
+
+def _claude_file_expiry(path: Path) -> tuple[float, bool] | None:
+    """(expiry epoch seconds, has refresh token) of a Claude credential file, or None when unreadable.
+    Read in a throwaway child that emits only those two fields: the file holds live tokens, which
+    must never enter this long-running process."""
+    try:
+        p = subprocess.run(
+            ["python3", "-c",
+             "import json,sys; d=json.load(open(sys.argv[1]))['claudeAiOauth']; "
+             "print(d.get('expiresAt',0), int(bool(d.get('refreshToken'))))", str(path)],
+            capture_output=True, text=True, timeout=15)
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+        exp_ms, rt = p.stdout.split()
+        return int(exp_ms) / 1000, rt == "1"
+    except Exception:
+        return None
+
+
+def _login_pool_line() -> tuple[str, str] | None:
+    """One line on the login pool: chains, leases, nearest expiry, and any chain that can no longer be
+    renewed (a sign-in is the only fix for that). None when there is no pool (macOS, or none made)."""
+    slots = login_slots()
+    if not slots:
+        return None if IS_MAC else ("logins: none — every Claude worker shares ~/.claude (gq2-fleet logins)", "yellow")
+    leases = read_leases()
+    soonest, dead = None, []
+    for d in slots:
+        got = _claude_file_expiry(d / ".credentials.json")
+        if got is None or not got[1]:
+            dead.append(d.name)
+        elif soonest is None or got[0] < soonest:
+            soonest = got[0]
+    text = f"logins: {len(slots)} chains, {len(set(leases.values()))} leased"
+    if soonest is not None:
+        left = (soonest - time.time()) / 3600
+        text += f", nearest expiry {left:.1f} h (renewed automatically)" if left > 0 else ", one expired (renews at its next use)"
+    if dead:
+        text += "; NOT renewable: " + ", ".join(dead) + " — sign in again"
+    return text, "red" if dead else "green"
+
+
+def _claude_operator_expiry() -> tuple[str, str]:
+    """(text, style) for the operator's Claude credential; reads expiry only, never the tokens.
+    macOS: the login Keychain item. Linux: <CLAUDE_CONFIG_DIR|~/.claude>/.credentials.json, which
+    the worker's --auto-refresh rotates under a host flock."""
+    if not IS_MAC:
+        try:
+            path = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude")) / ".credentials.json"
+            got = _claude_file_expiry(path)
+            if got is None:
+                return f"claude: no readable {path} — run `claude` and log in", "red"
+            left = (got[0] - time.time()) / 3600
+            if not got[1]:
+                return "claude: no refresh token — run `claude` and log in again", "red"
+            if left < 0:
+                return f"claude: token expired {-left:.1f} h ago (auto_refresh will renew)", "yellow"
+            return f"claude: token ok, {left:.1f} h left", "green" if left > 1.5 else "yellow"
+        except Exception as exc:
+            return f"claude: {exc}", "red"
+    try:
+        # The blob holds live tokens. Read it in a throwaway child that emits only the two fields we
+        # need, so the secret never enters this long-running process.
+        p = subprocess.run(
+            ["/bin/sh", "-c",
+             'security find-generic-password -s "Claude Code-credentials" -a "$USER" -w | '
+             "python3 -c 'import json,sys; d=json.load(sys.stdin)[\"claudeAiOauth\"]; "
+             "print(d.get(\"expiresAt\",0), int(bool(d.get(\"refreshToken\"))))'"],
+            capture_output=True, text=True, timeout=15)
+        if p.returncode != 0 or not p.stdout.strip():
+            return "claude: Keychain item unreadable (locked? run `claude` once)", "red"
+        exp_ms, rt = p.stdout.split()
+        left = (int(exp_ms) / 1000 - time.time()) / 3600
+        has_rt = rt == "1"
+        if not has_rt:
+            return "claude: no refresh token — run `claude` and log in again", "red"
+        if left < 0:
+            return f"claude: token expired {-left:.1f} h ago (warm-up will renew)", "yellow"
+        return f"claude: token ok, {left:.1f} h left", "green" if left > 1.5 else "yellow"
+    except Exception as exc:
+        return f"claude: {exc}", "red"
+
+
+def _codex_operator_expiry() -> tuple[str, str]:
+    try:
+        import base64
+        path = Path(os.environ.get("CODEX_HOME", HOME / ".codex")) / "auth.json"
+        tok = json.loads(path.read_text())["tokens"]["access_token"].split(".")[1]
+        tok += "=" * (-len(tok) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(tok))["exp"]
+        left = (exp - time.time()) / 3600
+        if left < 0:
+            return f"codex: token expired {-left:.1f} h ago (auto_refresh will renew)", "yellow"
+        return f"codex: token ok, {left / 24:.1f} d left", "green" if left > 48 else "yellow"
+    except FileNotFoundError:
+        return "codex: no ~/.codex/auth.json — run `codex login`", "red"
+    except Exception as exc:
+        return f"codex: {exc}", "red"
+
+
+def _gh_status() -> tuple[str, str]:
+    p = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=30)
+    text = (p.stdout or "") + (p.stderr or "")
+    m = re.search(r"Logged in to github.com account (\S+)", text)
+    scopes = "workflow" in text
+    if p.returncode != 0 or not m:
+        return "gh: not logged in — run `gh auth login`", "red"
+    return f"gh: {m.group(1)}" + ("" if scopes else " (no `workflow` scope: gh auth refresh -s workflow)"), "green" if scopes else "yellow"
+
+
+def credential_lines() -> list[tuple[str, str]]:
+    pool = _login_pool_line()
+    return [_claude_operator_expiry(), *([pool] if pool else []), _codex_operator_expiry(), _gh_status()]
+
+
+# ----------------------------------------------------------------------------- subscription usage
+#
+# The workers' pacer reads each provider's usage endpoint with the worker's own token and caches the
+# raw response under state/<wid>/cache/quota-<provider>.json. The view shows the freshest of those:
+# no token ever enters this process and no request is made on the view's behalf. Every worker on this
+# host runs the same two subscriptions (several Claude login chains are one account), so one reading
+# per provider describes the whole fleet.
+
+
+def _parse_iso(v) -> float | None:
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def newest_quota_cache(provider: str) -> tuple[dict, float, str] | None:
+    """(payload, fetched_at, worker id) of the freshest usage response any worker cached."""
+    best = None
+    root = WORKTREE / "state"
+    if not root.is_dir():
+        return None
+    for f in root.glob(f"*/cache/quota-{provider}.json"):
+        d = read_json(f)
+        at = d.get("fetched_at")
+        if isinstance(at, (int, float)) and isinstance(d.get("payload"), dict) and (best is None or at > best[1]):
+            best = (d["payload"], float(at), f.parent.parent.name)
+    return best
+
+
+def usage_windows(provider: str, payload: dict) -> list[tuple[str, float | None, float | None]]:
+    """[(window label, used %, resets_at epoch)] from a raw usage response, most immediate window
+    first. Claude: the `limits` list (session, weekly, and per-model weekly scopes), else the flat
+    five_hour/seven_day records. Codex: the primary and, when present, secondary rate-limit windows."""
+    out: list[tuple[str, float | None, float | None]] = []
+    if provider == "claude":
+        lims = payload.get("limits")
+        if isinstance(lims, list) and lims:
+            for lim in lims:
+                if not isinstance(lim, dict):
+                    continue
+                label = "5h" if lim.get("group") == "session" else "7d"
+                scope = lim.get("scope")
+                model = (scope.get("model") or {}) if isinstance(scope, dict) else {}
+                if isinstance(model, dict) and model.get("display_name"):
+                    label += f" {model['display_name']}"
+                out.append((label, lim.get("percent"), _parse_iso(lim.get("resets_at"))))
+        else:
+            for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+                w = payload.get(key)
+                if isinstance(w, dict):
+                    out.append((label, w.get("utilization"), _parse_iso(w.get("resets_at"))))
+        return out
+    rl = payload.get("rate_limit") or {}
+    for key in ("primary_window", "secondary_window"):
+        w = rl.get(key) if isinstance(rl, dict) else None
+        if isinstance(w, dict):
+            secs = w.get("limit_window_seconds") or 0
+            label = f"{round(secs / 86400)}d" if secs >= 36 * 3600 else f"{round(secs / 3600)}h"
+            out.append((label, w.get("used_percent"), w.get("reset_at")))
+    out.sort(key=lambda t: t[2] or 0)
+    return out
+
+
+def _reset_phrase(t: float | None) -> str:
+    if not t:
+        return ""
+    left = t - time.time()
+    if left <= 0:
+        return "reset due"
+    if left < 100 * 60:
+        return f"resets in {int(left // 60)}m"
+    if left < 36 * 3600:
+        return f"resets {datetime.fromtimestamp(t):%H:%M}"
+    return f"resets {datetime.fromtimestamp(t):%a %H:%M}"
+
+
+def usage_text():
+    """The subscription-usage row: what is LEFT in each window, per provider, with its reset."""
+    from rich.text import Text
+
+    t = Text()
+    for i, provider in enumerate(("claude", "codex")):
+        if i:
+            t.append("   ")
+        t.append(f"{provider} ", "bold")
+        got = newest_quota_cache(provider)
+        if got is None:
+            t.append("no reading yet", "dim")
+            continue
+        payload, at, wid = got
+        wins = usage_windows(provider, payload)
+        if not wins:
+            t.append("unreadable response", "yellow")
+        for j, (label, used, reset) in enumerate(wins):
+            if j:
+                t.append(" · ")
+            left = max(0.0, 100.0 - float(used)) if isinstance(used, (int, float)) and not isinstance(used, bool) else None
+            style = "dim" if left is None else "red" if left < 15 else "yellow" if left < 40 else "green"
+            t.append(f"{label} ")
+            t.append("?" if left is None else f"{left:.0f}% left", style)
+            r = _reset_phrase(reset)
+            if r:
+                t.append(f" ({r})", "dim")
+        t.append(f"  [{wid}, {age(at)} ago]", "dim")
+    return t
+
+
+# ----------------------------------------------------------------------------- live data
+
+
+def read_json(path: Path) -> dict:
+    try:
+        v = json.loads(path.read_text())
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def worker_status() -> dict[str, dict]:
+    out = {}
+    if STATE.is_dir():
+        for f in sorted(STATE.glob("*.json")):
+            out[f.stem] = read_json(f)
+    return out
+
+
+def last_log_line(wid: str) -> str:
+    d = STATE / "logs" / wid
+    if not d.is_dir():
+        return ""
+    logs = sorted(d.glob("work-*.log"))
+    if not logs:
+        return ""
+    try:
+        with logs[-1].open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 20000))
+            tail = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(tail):
+        m = re.search(r"tauceti: (.*)$", line)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return tail[-1].strip() if tail else ""
+
+
+def recent_events(n: int = 8) -> list[tuple[str, str]]:  # noqa: D401 - n is the number of lines to return
+    events = []
+    if not (STATE / "logs").is_dir():
+        return events
+    for d in (STATE / "logs").iterdir():
+        for lg in sorted(d.glob("work-*.log"))[-1:]:
+            try:
+                lines = lg.read_text(errors="replace").splitlines()[-200:]
+            except OSError:
+                continue
+            for line in lines:
+                if re.search(r"→ |pull/\d+|timed out|failed|ERROR|cannot|claimed|nothing landed", line):
+                    events.append((d.name, line))
+    events.sort(key=lambda e: e[1][:19])
+    return events[-n:]
+
+
+class Progress:
+    """Target-list progress and the PR pipeline, refreshed sparingly (each refresh is two cheap gh
+    calls and one ls-remote)."""
+
+    def __init__(self, ttl: int = 300, remote_ok: bool = False):
+        self.ttl = ttl
+        self.remote_ok = remote_ok  # remote reads only when the operator asked (--refresh); they go through the gate
+        self.at = 0.0
+        self.data: dict = {}
+        self.creds: list[tuple[str, str]] = []
+
+    def refresh(self) -> dict:
+        if time.time() - self.at < self.ttl and self.data:
+            return self.data
+        d: dict = {"error": ""}
+        try:
+            targets = load_targets(TARGETS)
+            login = me()
+            base = ["gh", "pr", "list", "--repo", TAUCETI, "--limit", "200", "--json"]
+            op = subprocess.run(base + ["number,body,labels,createdAt,author", "--state", "open"], capture_output=True, text=True, timeout=60)
+            mp = subprocess.run(base + ["number,body,mergedAt,author", "--state", "merged"], capture_output=True, text=True, timeout=60)
+            open_prs = json.loads(op.stdout or "[]") if op.returncode == 0 else []
+            merged = json.loads(mp.stdout or "[]") if mp.returncode == 0 else []
+            if op.returncode != 0 or mp.returncode != 0:
+                d["error"] = (op.stderr or mp.stderr).strip().splitlines()[0][:80] if (op.stderr or mp.stderr) else "gh failed"
+            inflight, done = set(), set()
+            for p in open_prs:
+                inflight.update(target_marker_ids(p.get("body") or ""))
+            for p in merged:
+                done.update(target_marker_ids(p.get("body") or ""))
+            listed = {(a, it.slug) for a, items in targets.areas.items() for it in items}
+            live = overlay_live(targets, inflight & listed, done & listed)
+            day_ago = (datetime.now(timezone.utc).timestamp() - 86400)
+            def ts(s):
+                try:
+                    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    return 0
+            mine_open = [p for p in open_prs if (p.get("author") or {}).get("login") == login]
+            labels: dict[str, int] = {}
+            for p in mine_open:
+                for lb in p.get("labels") or []:
+                    nm = lb.get("name", "")
+                    if nm in ("awaiting-CI", "awaiting-review", "review-in-progress", "ci-failed", "awaiting-author", "ready-to-merge"):
+                        labels[nm] = labels.get(nm, 0) + 1
+            per_area = {}
+            for a, items in live.areas.items():
+                st = {"done": 0, "inflight": 0, "open": 0}
+                for it in items:
+                    st[it.status] = st.get(it.status, 0) + 1
+                st["eligible"] = len(eligible_items(live, a))
+                per_area[a] = st
+            d.update(
+                per_area=per_area,
+                opened_24h=sum(1 for p in mine_open if ts(p.get("createdAt", "")) > day_ago),
+                merged_24h=sum(1 for p in merged if (p.get("author") or {}).get("login") == login and ts(p.get("mergedAt", "")) > day_ago),
+                targets_merged_24h=sum(1 for p in merged if ts(p.get("mergedAt", "")) > day_ago and (set(target_marker_ids(p.get("body") or "")) & listed)),
+                labels=labels,
+                mine_open=len(mine_open),
+                open_total=len(open_prs),
+            )
+            lr = subprocess.run(["git", "ls-remote", f"https://github.com/{CLAIM_REPO}", "refs/tauceti-claims/author/*"], capture_output=True, text=True, timeout=60)
+            d["claims"] = [line.split("refs/tauceti-claims/author/", 1)[1] for line in lr.stdout.splitlines() if "refs/tauceti-claims/author/" in line]
+        except Exception as exc:  # keep the view alive on any hiccup
+            d["error"] = str(exc)[:80]
+        self.data = d
+        self.at = time.time()
+        return d
+
+
+# ----------------------------------------------------------------------------- rendering
+
+
+def age(t: float | None) -> str:
+    if not t:
+        return "-"
+    s = int(time.time() - t)
+    return f"{s}s" if s < 90 else f"{s // 60}m" if s < 5400 else f"{s // 3600}h{(s % 3600) // 60:02d}"
+
+
+def until(t: float | None) -> str:
+    if not t:
+        return "-"
+    s = int(t - time.time())
+    return "now" if s <= 0 else f"in {s}s" if s < 90 else f"in {s // 60}m"
+
+
+def health(st: dict) -> tuple[str, str]:
+    """(label, rich style) for one worker's manager status file."""
+    if not st:
+        return "no status", "dim"
+    state = st.get("state") or ("running" if st.get("child_pid") else "stopped")
+    now = time.time()
+    hb = st.get("heartbeat_at") or st.get("status_updated_at") or 0
+    if st.get("desired") == "stopped" or st.get("enabled") is False:
+        return "disabled", "dim"
+    if not st.get("child_pid") and st.get("exit_code") not in (None, 0):
+        return f"exited rc={st.get('exit_code')}", "red"
+    if hb and now - hb > 600:
+        return "stale (no heartbeat)", "red"
+    act = st.get("activity_at") or 0
+    if state == "running" and act and now - act > round_timeout() + 300:
+        return "stuck? (round overdue)", "red"
+    if state == "backoff" and st.get("next_action_at"):
+        return f"backoff ({until(st.get('next_action_at'))})", "green"  # a scheduled retry is normal, not ill health
+    if state in ("waiting-quota", "waiting-github"):
+        return state, "yellow"
+    if state in ("running", "surveying"):
+        return state, "green"
+    if state == "idle":
+        return "idle", "green"
+    return state, "yellow"
+
+
+def pool_line() -> str:
+    """One line on the Mathlib cache pool: revisions needed by main/open PRs vs held, from the
+    reconcile's cached pin check (no GitHub traffic) and the pool's marker files."""
+    pins = FLEET_HOME / "pins.json"
+    if not pins.is_file():
+        return "not checked yet (first reconcile checks the pins)"
+    d = read_json(pins)
+    needed, held = d.get("needed", {}), warmed_revs()
+    missing = [r for r in needed if r not in held]
+    running = False
+    try:
+        import fcntl
+        with open(FLEET_HOME / "warm-pool.lock", "a+") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        running = True
+    line = f"{len(needed) - len(missing)}/{len(needed)} needed revisions warm (checked {age(float(d.get('checked_at', 0)))} ago)"
+    if missing:
+        line += f"; missing {', '.join(r[:8] for r in missing)}" + ("; warm-pool running" if running else "; warm-pool NOT running")
+    return line
+
+
+# ----------------------------------------------------------------------------- needs-you items
+#
+# A round that finishes with nothing landed on GitHub records the agent's final message as a local
+# `declined` incident (worker `attention.py`, under <gate>/incidents/). Those, and any other local
+# incident the workers file (`contest-cap`: a review exchange hit its cap), are owner decisions:
+# close the PR, reply to the reviewer, or dismiss. They stay in the view until acknowledged.
+
+INCIDENTS = GATE_DIR / "incidents"
+ACKED = INCIDENTS / "acked"
+
+
+def attention_items() -> list[dict]:
+    """Unacknowledged incidents, newest last."""
+    items = []
+    if not INCIDENTS.is_dir():
+        return items
+    for p in sorted(INCIDENTS.glob("*.json")):
+        d = read_json(p)
+        if d.get("kind"):
+            d["_path"] = p
+            items.append(d)
+    items.sort(key=lambda d: str(d.get("last_at") or ""))
+    return items
+
+
+def attention_line(d: dict, width: int = 150) -> str:
+    pr = f"#{d['pr']}" if d.get("pr") else (d.get("key") or "?")
+    when = str(d.get("last_at") or "")[11:16]
+    tag = "[close?] " if d.get("close_hint") else ""
+    by = d.get("subsumed_by") or d.get("mentions") or []
+    if by:
+        tag += ("→ " if d.get("subsumed_by") else "mentions ") + " ".join(f"#{n}" for n in by[:3]) + " "
+    kind = d.get("kind")
+    what = d.get("summary") if kind == "declined" else (d.get("detail") or d.get("reason") or kind)
+    what = " ".join(str(what or "").split())
+    head = f"{pr} {d.get('stage') or kind} {d.get('worker', '-')} {when}Z {tag}"
+    return (head + what)[:width]
+
+
+def lookup_prs(numbers: list[int]) -> dict[int, str]:
+    """One gated read per PR: `#N  MERGED 2026-09-09  title (author)`. On demand only (--lookup), so
+    the view itself never spends the fleet's read budget."""
+    out = {}
+    for n in numbers:
+        p = subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "admit", "api_read", "pr-view", TAUCETI],
+                           cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
+        if p.returncode != 0:
+            out[n] = f"#{n}  (gate refused the read: {(p.stderr or p.stdout).strip()[-80:]})"
+            continue
+        token = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else ""
+        q = subprocess.run(["gh", "pr", "view", str(n), "--repo", TAUCETI, "--json", "state,title,mergedAt,author"],
+                           capture_output=True, text=True, timeout=60)
+        subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "record", token, str(200 if q.returncode == 0 else 500)],
+                       cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
+        if q.returncode != 0:
+            out[n] = f"#{n}  (gh failed: {q.stderr.strip()[-80:]})"
+            continue
+        d = json.loads(q.stdout or "{}")
+        when = (d.get("mergedAt") or "")[:10]
+        out[n] = f"#{n}  {d.get('state', '?')}{' ' + when if when else ''}  {d.get('title', '')} ({(d.get('author') or {}).get('login', '?')})"
+    return out
+
+
+def _gated_pr_view(n: int, fields: str) -> dict | None:
+    """One gated read of a PR (the fleet's budget), or None when refused or failed."""
+    p = subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "admit", "api_read", "pr-view", TAUCETI],
+                       cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        return None
+    token = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else ""
+    q = subprocess.run(["gh", "pr", "view", str(n), "--repo", TAUCETI, "--json", fields],
+                       capture_output=True, text=True, timeout=60)
+    subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "record", token, str(200 if q.returncode == 0 else 500)],
+                   cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
+    return json.loads(q.stdout or "{}") if q.returncode == 0 else None
+
+
+def _verdicts() -> dict[int, dict]:
+    """The agents' recorded declines by PR: live, acknowledged and infrastructure-set-aside items."""
+    out: dict[int, dict] = {}
+    for folder in [INCIDENTS, ACKED, *INCIDENTS.glob("infra-*")]:
+        for f in sorted(folder.glob("declined-*.json")) if folder.is_dir() else []:
+            d = read_json(f)
+            if isinstance(d.get("pr"), int):
+                out[d["pr"]] = d
+    return out
+
+
+def cmd_targets(a: argparse.Namespace) -> int:
+    """Audit the target list's `[~]` items against their PRs. The file marks an item in flight by
+    hand ("in flight: #N"); the live view promotes it to done only when a MERGED PR carries its
+    marker, and nothing ever demotes it, so an item whose PR was CLOSED stays in flight forever and
+    every item that needs it stays ineligible. 2026-09-21: 16 of 20 in-flight PRs had been closed
+    as subsumed by main, 0 of 88 open items were eligible, and the author idled at the backoff cap.
+    Prints a suggestion per item; --apply rewrites the confident ones (merged → done; closed with a
+    recorded subsumed-by verdict → done, naming the upstream PR) and leaves the rest for the owner."""
+    text = TARGETS.read_text()
+    verdicts = _verdicts()
+    rows, edits = [], {}
+    area = None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            area = line[3:].strip()
+            continue
+        m = re.match(r"- \[~\] `([^`]+)`.*?in flight: #(\d+)", line)
+        if not m:
+            continue
+        slug, pr = m.group(1), int(m.group(2))
+        d = _gated_pr_view(pr, "state,mergedAt")
+        state = (d or {}).get("state", "?")
+        v = verdicts.get(pr) or {}
+        by = list(v.get("subsumed_by") or []) or list(v.get("mentions") or [])
+        words = " ".join(str(v.get("summary") or "").split()).lower()
+        subsumed = bool(v) and ("subsum" in words or bool(v.get("subsumed_by")))
+        if state == "MERGED":
+            verdict, new = "landed", line.replace("- [~]", "- [x]", 1).replace(f"in flight: #{pr}", f"landed: #{pr}")
+        elif state == "CLOSED" and subsumed:
+            up = ", ".join(f"#{n}" for n in by) or "upstream (unnamed)"
+            verdict = f"closed, subsumed by {up}"
+            new = line.replace("- [~]", "- [x]", 1).replace(f"in flight: #{pr}", f"subsumed by: {up}; closed: #{pr}")
+        elif state == "CLOSED":
+            verdict, new = "closed, no subsumption verdict on record — owner decides ([ ] to re-author, [x] if done)", None
+        elif state == "OPEN":
+            verdict, new = "open, still in flight", None
+        else:
+            verdict, new = "state unknown (read refused?)", None
+        rows.append((area, slug, pr, state, verdict))
+        if new:
+            edits[line] = new
+    width = max((len(r[1]) for r in rows), default=10)
+    for area, slug, pr, state, verdict in rows:
+        print(f"{area:24s} {slug:{width}s} #{pr} {state:7s} → {verdict}")
+    print(f"\n{len(edits)} of {len(rows)} in-flight item(s) would be marked done" + ("" if a.apply else " (pass --apply)"))
+    if a.apply and edits:
+        for old, new in edits.items():
+            text = text.replace(old, new, 1)
+        TARGETS.write_text(text)
+        print(f"applied to {TARGETS} — review the diff, commit it, and copy it to the fleet host's target file")
+    return 0
+
+
+def cmd_attention(a: argparse.Namespace) -> int:
+    """List what needs the owner (full agent text, what subsumed the PR, transcript path), or
+    acknowledge items. --lookup resolves each named PR through the gate and caches the answer in
+    the incident file, so the second listing is free."""
+    items = attention_items()
+    if getattr(a, "retry", None):
+        # After an infrastructure fix: give the PR its review-error budget back in every worker
+        # (the parking is a per-worker counter file) and archive its review-stuck item.
+        pr = str(a.retry)
+        cleared = []
+        for f in (WORKTREE / "state").glob(f"*/review-err-{pr}"):
+            f.unlink()
+            cleared.append(f.parent.name)
+        print(f"#{pr}: review-error budget reset in {', '.join(sorted(cleared)) or 'no worker (nothing was parked)'}")
+        ACKED.mkdir(parents=True, exist_ok=True)
+        for d in items:
+            if d.get("kind") == "review-stuck" and str(d.get("pr")) == pr:
+                d["_path"].rename(ACKED / d["_path"].name)
+                print(f"#{pr}: review-stuck item archived; the next reviewer survey may pick it up")
+        return 0
+    if a.ack:
+        ACKED.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for d in items:
+            key = str(d.get("pr") or "")
+            if a.ack == "all" or a.ack == key or a.ack == d.get("key"):
+                d["_path"].rename(ACKED / d["_path"].name)
+                n += 1
+        print(f"acknowledged {n} item(s) → {ACKED}")
+        return 0
+    if not items:
+        print("nothing needs you.")
+        return 0
+    for d in items:
+        pr = f"PR #{d['pr']}  https://github.com/{TAUCETI}/pull/{d['pr']}" if d.get("pr") else d.get("key")
+        print(f"== {pr}  ({d.get('kind')} · {d.get('stage') or ''} · {d.get('worker', '-')} · {d.get('last_at')}"
+              f"{' · seen ' + str(d['count']) + 'x' if int(d.get('count') or 0) > 1 else ''})"
+              + ("  [the agent's words read as: close this PR]" if d.get("close_hint") else ""))
+        body = d.get("summary") or d.get("detail") or d.get("reason") or ""
+        for line in str(body).splitlines():
+            print("   " + line)
+        named = list(d.get("subsumed_by") or []) + list(d.get("mentions") or [])
+        if named:
+            known = dict(d.get("lookup") or {})
+            missing = [n for n in named if str(n) not in known]
+            if getattr(a, "lookup", False) and missing:
+                fresh = lookup_prs(missing)
+                # Cache only answers; a refused or failed read is printed now and retried next time.
+                good = {str(k): v for k, v in fresh.items() if "(gate refused" not in v and "(gh failed" not in v}
+                if good:
+                    d["lookup"] = {**known, **good}
+                    path = d.pop("_path")
+                    path.write_text(json.dumps(d, indent=1, sort_keys=True) + "\n")
+                    d["_path"] = path
+                known = {**known, **{str(k): v for k, v in fresh.items()}}
+            label = "subsumed by" if d.get("subsumed_by") else "mentions"
+            for n in named:
+                print(f"   {label}: " + known.get(str(n), f"#{n}  https://github.com/{TAUCETI}/pull/{n}" + ("" if getattr(a, "lookup", False) else "  (--lookup for state and title)")))
+                label = " " * len(label)
+        if d.get("transcript"):
+            print(f"   transcript: {d['transcript']}")
+        print()
+    print("acknowledge with: gq2-fleet attention --ack <PR number> | all")
+    return 0
+
+
+def build_view(progress: Progress, console=None):
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    statuses = worker_status()
+    specs_ids = []
+    if CONFIG.is_file():
+        specs_ids = re.findall(r'^id\s*=\s*"([^"]+)"', CONFIG.read_text(), re.M)
+    ids = specs_ids or sorted(statuses)
+    free_gb = shutil.disk_usage(HOME).free / 2**30
+    # The manager advertises itself on a Unix socket in the worker's runtime dir, which depends on the
+    # environment the manager was STARTED in ($TAUCETI_RUNTIME_DIR, else $XDG_RUNTIME_DIR/tauceti, else
+    # /tmp/tauceti-<uid>). A watch shell may differ, so look in every place it could be.
+    uid = os.getuid()
+    candidates = [Path(os.environ["TAUCETI_RUNTIME_DIR"]).expanduser()] if os.environ.get("TAUCETI_RUNTIME_DIR") else []
+    if os.environ.get("XDG_RUNTIME_DIR"):
+        candidates.append(Path(os.environ["XDG_RUNTIME_DIR"]) / "tauceti")
+    candidates += [Path(f"/run/user/{uid}/tauceti"), Path(f"/tmp/tauceti-{uid}")]
+    mgr_alive = any((c / "manager.sock").exists() for c in candidates)
+    healthy = sum(1 for w in ids if health(statuses.get(w, {}))[1] == "green")
+
+    t = Table(title=None, expand=True, pad_edge=False)
+    for col in ("worker", "agent", "health", "phase / target", "last log line", "act", "next"):
+        t.add_column(col, overflow="ellipsis", no_wrap=True, ratio=3 if col == "last log line" else None)
+    for w in ids:
+        st = statuses.get(w, {})
+        label, style = health(st)
+        if not st and re.search(rf'^id\s*=\s*"{re.escape(w)}"\s*\nenabled\s*=\s*false', CONFIG.read_text() if CONFIG.is_file() else "", re.M):
+            label, style = "disabled (backpressure)", "dim"
+        phase = st.get("phase") or ""
+        target = st.get("target") or ""
+        what = f"{phase} {target}".strip() or (st.get("detail") or "")
+        agent = st.get("agent", "") or ("claude" if re.match(r"gq2-(c\d|fix[13579]|prog\d|cur\d)$", w) else "auto")
+        m = re.search(r"provider=(\w+)", st.get("detail") or "") if agent == "auto" else None
+        if m and st.get("state") in ("running", "surveying"):
+            agent = f"auto→{m.group(1)}"  # what the pacer picked for the round in flight
+        t.add_row(w, agent, Text(label, style=style),
+                  str(what)[:60], last_log_line(w)[:120], age(st.get("activity_at")), until(st.get("next_action_at")))
+
+    d = progress.refresh() if progress.remote_ok else (progress.data or {"error": "remote refresh off (pass --refresh)"})
+    gate_line = ""
+    try:
+        g = subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "status"], cwd=WORKTREE, env=worker_env(),
+                           capture_output=True, text=True, timeout=20)
+        raw = (g.stdout.strip().splitlines() or [g.stderr.strip()])[-1]
+        # One fact per line: "gate: RUNNING; mutations 0/20 per min, 0/40 per h; reads ...; push ...; login ...; publications ..."
+        parts = [part.strip() for part in raw.replace("gate: ", "", 1).split(";") if part.strip()]
+        # The ledger lists every parked publication; after a bad afternoon that is dozens of lines and
+        # pushes the events panel off the screen. Keep the newest three and a count.
+        parked = [x for x in parts if x.startswith("parked:")]
+        if len(parked) > 3:
+            keep = parked[-3:]
+            parts = [x for x in parts if not x.startswith("parked:") or x in keep]
+            parts.append(f"… {len(parked) - 3} older parked publication(s): gq2-fleet gate status, or "
+                         f"gq2-fleet gate publication prune to archive the interrupted ones with no remote effect")
+        gate_line = "\n".join(parts)
+    except Exception as exc:
+        gate_line = f"gate: {exc}"
+    halts = sorted((WORKTREE / "state").glob("*/halt.json")) if (WORKTREE / "state").is_dir() else []
+    p = Table.grid(padding=(0, 2))
+    p.add_column(); p.add_column()
+    if d.get("per_area"):
+        area_lines = []
+        for a, st in d["per_area"].items():
+            area_lines.append(f"{a}: {st['done']} done · {st['inflight']} in flight · {st['open']} open · [bold]{st['eligible']} eligible[/bold]")
+        p.add_row("targets", "\n".join(area_lines))
+        p.add_row("last 24h", f"{d.get('opened_24h', 0)} PRs opened · {d.get('merged_24h', 0)} of mine merged · {d.get('targets_merged_24h', 0)} listed targets merged (any author)")
+        lab = d.get("labels", {})
+        p.add_row("my open PRs", f"{d.get('mine_open', 0)} of {d.get('open_total', 0)} open — " + ", ".join(f"{k} {v}" for k, v in sorted(lab.items())))
+        claims = d.get("claims") or []
+        p.add_row("claims held", ", ".join(claims) if claims else "none")
+    if d.get("error"):
+        p.add_row(Text("progress", style="yellow"), Text(f"partial: {d['error']}", style="yellow"))
+    p.add_row("gate", Text(gate_line, style="red" if "HALTED" in gate_line else "yellow" if "COOLDOWN" in gate_line else "", overflow="fold"))
+    if halts:
+        p.add_row(Text("halted", style="red"), Text(", ".join(h.parent.name for h in halts) + "  (gq2-fleet clear-halt)", style="red"))
+    needs = attention_items()
+    if needs:
+        lines = Text()
+        for i, d in enumerate(needs[-6:]):
+            if i:
+                lines.append("\n")
+            lines.append(attention_line(d, 140), style="bold red" if d.get("close_hint") else "yellow")
+        if len(needs) > 6:
+            lines.append(f"\n… {len(needs) - 6} more")
+        lines.append("\n(gq2-fleet attention for the full text; --ack <PR> once handled)", style="dim")
+        p.add_row(Text("needs you", style="bold red"), lines)
+    if not progress.creds or time.time() - getattr(progress, "creds_at", 0) > 300:
+        try:
+            progress.creds = credential_lines()
+        except Exception as exc:
+            progress.creds = [(f"credentials: {exc}", "red")]
+        progress.creds_at = time.time()
+    p.add_row("usage", usage_text())
+    p.add_row("credentials", Text.assemble(*[(t + "   ", st) for t, st in progress.creds]))
+    p.add_row("mathlib pool", Text(pool_line(), overflow="fold"))
+    p.add_row("refreshed", f"{age(progress.at)} ago (every {progress.ttl // 60} min)")
+
+    header = Text.assemble(
+        (f" {datetime.now():%Y-%m-%d %H:%M:%S} ", "bold"),
+        (f" workers {healthy}/{len(ids)} healthy ", "green" if healthy == len(ids) and ids else "yellow"),
+        (f" manager {'up' if mgr_alive else 'not seen'} ", "green" if mgr_alive else "red"),
+        (f" disk free {free_gb:.0f} GB ", "red" if free_gb < 40 else "yellow" if free_gb < 80 else "green"),
+        *([(f" needs you {len(needs)} ", "bold red")] if needs else []),
+        (f" targets {TARGETS.name} ", "dim"),
+    )
+    top = Group(header, t, Panel(p, title="progress", border_style="blue"))
+    # Give every remaining terminal line to the events panel: measure what the rest takes, then fill.
+    n_events = 8
+    if console is not None:
+        try:
+            used = len(console.render_lines(top, console.options))
+            n_events = max(3, console.size.height - used - 3)  # panel border + title
+        except Exception:
+            pass
+    ev = Table.grid(padding=(0, 1))
+    ev.add_column(style="dim"); ev.add_column(overflow="ellipsis", no_wrap=True)
+    for w, line in recent_events(n_events):
+        ev.add_row(w, line)
+    return Group(top, Panel(ev, title=f"recent events (last {n_events})", border_style="dim"))
+
+
+def cmd_watch(a: argparse.Namespace) -> int:
+    if not _HAVE_RICH:
+        die("the live view needs the `rich` module; set GQ2_FLEET_PYTHON to an interpreter that has it "
+            "(the uv tool's ~/.local/share/uv/tools/tauceti/bin/python3, or `pip install rich`)")
+    from rich.console import Console
+    from rich.live import Live
+
+    console = Console()
+    progress = Progress(remote_ok=getattr(a, "refresh", False))
+    if a.once:
+        console.print(build_view(progress, console))
+        return 0
+    with Live(build_view(progress, console), console=console, screen=True, refresh_per_second=1) as live:
+        freshened = time.time()
+        try:
+            while True:
+                time.sleep(a.interval)
+                live.update(build_view(progress, console))
+                # A fully quiet fleet (every worker parked at a usage limit) finishes no rounds, so no
+                # reconcile runs; the view is the process that is still awake, so it keeps the free
+                # login chains renewable. Leased chains are their workers' business (see the pool).
+                if time.time() - freshened > 1800:
+                    freshened = time.time()
+                    try:
+                        freshen_logins(quiet=True)
+                    except Exception as exc:
+                        _watchdog_note(f"login keeper: {exc}")
+        except KeyboardInterrupt:
+            return 0
+
+
+# ----------------------------------------------------------------------------- commands
+
+
+def cmd_up(a: argparse.Namespace) -> int:
+    if not (WORKTREE / "tauceti_worker").is_dir():
+        die(f"worktree not found: {WORKTREE}")
+    if not TARGETS.is_file():
+        die(f"target file not found: {TARGETS}")
+    if a.pilot:
+        # The pilot's shape: one Claude author and no Codex author unless the owner says otherwise
+        # on the command line; reconcile then sets fixers and reviewers from the backlog.
+        a.claude = 1 if a.claude is None else a.claude
+        a.codex = 0 if a.codex is None else a.codex
+        a.fixers, a.reviewers = 1, 1
+        a.sandbox = a.sandbox or "bubble"
+    a.claude = 2 if a.claude is None else a.claude
+    a.codex = 2 if a.codex is None else a.codex
+    a.sandbox = a.sandbox or "host"
+    if a.sandbox == "bubble" and shutil.which("bubble") is None:
+        die("--sandbox bubble requested but `bubble` is not on PATH; install it or pass --sandbox host (host mode leaves the wrappers as a convention, not a control — see docs/gate.md)")
+    if a.mutations_per_hour <= 0 or a.reads_per_hour <= 0:
+        die("the gate budgets must be positive (owner-approved pilot values are 40 mutations/h, 600 reads/h)")
+    GATE_DIR.mkdir(parents=True, exist_ok=True)
+    halted = [p for p in (WORKTREE / "state").glob("*/halt.json")] if (WORKTREE / "state").is_dir() else []
+    if halted:
+        die("a worker is halted (" + ", ".join(p.parent.name for p in halted) + "); inspect and clear with "
+            "`gq2-fleet clear-halt` before starting anything")
+    t = load_targets(TARGETS)
+    roadmap_root = TARGETS.parent / "TauCetiRoadmap"
+    bad = [a for a in t.areas if not re.fullmatch(r"[A-Za-z0-9_-]+", a) or not (roadmap_root / a / "README.md").is_file()]
+    if bad:
+        die("target file names areas that are not roadmap directories under " + str(roadmap_root) + ": "
+            + ", ".join(repr(a[:40]) for a in bad) + " — a worker would author against a roadmap that does not exist; "
+            "move drafted areas under the Gaps section until their roadmap PR merges")
+    n_open = sum(len(open_items(t, area)) for area in t.areas)
+    print(f"targets: {TARGETS} — {n_open} open items in {len(t.areas)} areas")
+    a.authors_enabled = True
+    specs = lease_logins(fleet_specs(a))
+    for text, style in credential_lines():
+        print(f"creds: {text}")
+    if any(s["agent"] == "codex" for s in specs) and shutil.which("codex") is None:
+        die("Codex workers requested but no `codex` binary is on PATH (npm install -g @openai/codex, then `codex login`)")
+    if any(s["agent"] == "auto" for s in specs) and shutil.which("codex") is None:
+        print("note: no `codex` binary on PATH — the auto workers will run on Claude only")
+    STATE.mkdir(parents=True, exist_ok=True)
+    changed, _switched, deferred = write_config(specs, worker_status())
+    print(f"config: {CONFIG} ({'updated' if changed else 'unchanged'}; pace={a.pace or 'worker default'})"
+          + (f"; kept for workers mid-round: {', '.join(deferred)}" if deferred else ""))
+    chk = tauceti("workers", "--config", str(CONFIG), "apply", "--check", capture=True)
+    if chk.returncode != 0:
+        print(chk.stdout, chk.stderr)
+        die("workers.toml failed validation")
+    # Pre-seed in parallel: an APFS clone of a built checkout is ~1 GB on disk but walks ~200k
+    # files, which took 14 min single-threaded on this Mac; three at a time overlap the metadata work.
+    from concurrent.futures import ThreadPoolExecutor
+    todo = [s["id"] for s in specs if s["only"] != "review"]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for wid, note in zip(todo, pool.map(preseed, todo)):
+            print(f"checkout {wid}: {note}")
+    # Shape the fleet to the backlog before the first start: authors off under backpressure, fixers
+    # sized to awaiting-author. From here on every finished round re-runs this through the hook.
+    reconcile(a, apply=False, quiet=False)
+    if a.dry_run:
+        print("dry run: not starting the manager")
+        return 0
+    r = tauceti("workers", "--config", str(CONFIG), "apply")
+    if r.returncode != 0:
+        die("`tauceti workers apply` failed")
+    print(f"logs: {STATE / 'logs'}/<id>/work-*.log   (gq2-fleet logs ID -f to follow one)")
+    if a.no_watch:
+        return 0
+    a.interval, a.once, a.refresh = 30, False, False
+    return cmd_watch(a)
+
+
+def write_config(specs: list[dict], statuses: dict[str, dict] | None = None,
+                 hook_wid: str | None = None) -> tuple[bool, list[str], list[str]]:
+    """Write workers.toml; returns (changed, switched ids, deferred ids). The manager reconciles by
+    spec hash and restarts any enabled worker whose block changed — mid-round, that throws away a
+    build in progress. So a worker whose status says a round is in flight keeps its CURRENT block
+    (changed, disabled or removed alike) and is switched at a later reconcile that finds it between
+    rounds; the one that runs from its own round-done hook (`hook_wid`) always qualifies, since that
+    worker's status still reads "running" at that instant."""
+    FLEET_HOME.mkdir(parents=True, exist_ok=True)
+    old_text = CONFIG.read_text() if CONFIG.is_file() else ""
+    old = parse_blocks(old_text)
+    new = {s_["id"]: render_block(s_) for s_ in specs}
+    switched, deferred, blocks = [], [], []
+    for wid in list(new) + [w for w in old if w not in new]:
+        blk = new.get(wid)
+        if wid in old and old[wid] != blk:
+            if statuses is not None and wid != hook_wid and mid_round(statuses.get(wid, {})):
+                blk, _ = old[wid], deferred.append(wid)
+            else:
+                switched.append(wid)
+        if blk is not None:
+            blocks.append(blk)
+    text = TOML_HEADER + "\n" + "\n".join(blocks)
+    changed = old_text != text
+    CONFIG.write_text(text)
+    return changed, switched, deferred
+
+
+MAX_OPEN_PRS_BACKPRESSURE = 8  # upstream's fixed rule: an author declines while >= 8 of my PRs are open
+
+
+def fixers_for(mine_open: int, awaiting_author: int, max_fixers: int = 3) -> int:
+    """How many fix workers the backlog deserves. While mine_open >= 8 authoring cannot happen
+    (upstream's backpressure rule), so every worker slot should fix: max_fixers. Below that the
+    awaiting-author count decides: 6 or 7 -> 2, fewer -> 1. Never more fixers than there are PRs to
+    fix (an idle fixer still surveys each round), never fewer than 1. Fixers share the fleet-wide
+    mutation budget, so the count changes who spends it, not how much GitHub traffic there is."""
+    if mine_open >= MAX_OPEN_PRS_BACKPRESSURE:
+        want = max_fixers
+    elif awaiting_author >= 6:
+        want = 2
+    else:
+        want = 1
+    return max(1, min(want, max_fixers, awaiting_author))
+
+
+def fleet_backlog(max_age_s: int = 7200) -> tuple[int | None, int | None, str]:
+    """(mine_open, mine_awaiting_author, source): the freshest counts any worker's last survey left in
+    its status file, if younger than max_age_s; else one gated read of my open PRs; else (None, None)."""
+    best = None
+    if STATE.is_dir():
+        for f in STATE.glob("*.json"):
+            d = read_json(f)
+            at = d.get("survey_at")
+            if at and d.get("mine_open") is not None and (best is None or at > best[0]):
+                best = (at, int(d["mine_open"]), int(d.get("mine_awaiting_author") or 0), f.stem)
+    if best and time.time() - best[0] < max_age_s:
+        return best[1], best[2], f"status of {best[3]} ({age(best[0])} ago)"
+    p = subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "admit", "api_read", "pr-list", TAUCETI],
+                       cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        return None, None, f"gate refused the read: {(p.stderr or p.stdout).strip()[-120:]}"
+    token = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else ""
+    q = subprocess.run(["gh", "pr", "list", "--repo", TAUCETI, "--author", "@me", "--state", "open", "--limit", "200",
+                        "--json", "number,labels"], capture_output=True, text=True, timeout=120)
+    subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "record", token, str(200 if q.returncode == 0 else 500)],
+                   cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
+    if q.returncode != 0:
+        return None, None, f"gh pr list failed: {q.stderr.strip()[-120:]}"
+    prs = json.loads(q.stdout or "[]")
+    backlog = sum(1 for pr in prs if any(lb.get("name") == "awaiting-author" for lb in pr.get("labels") or []))
+    return len(prs), backlog, "one gated read"
+
+
+def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
+    """Set the fleet's shape from the backlog: authors enabled only when authoring can happen
+    (mine_open < 8), fixers by fixers_for (3 while authoring is impossible, else by backlog). Under a
+    lock, idempotent: the config is rewritten and applied only when the shape changed. Counts come
+    from the workers' own status files; a GitHub read happens only when those are stale."""
+    import fcntl
+
+    FLEET_HOME.mkdir(parents=True, exist_ok=True)
+    with open(FLEET_HOME / "reconcile.lock", "a+") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        mine_open, backlog, source = fleet_backlog()
+        if mine_open is None:
+            if not quiet:
+                print(f"reconcile: backlog unknown ({source}); leaving the fleet as it is")
+            return 0
+        want_fix = fixers_for(mine_open, backlog, a.max_fixers)
+        authors_on = mine_open < MAX_OPEN_PRS_BACKPRESSURE
+        a.authors_enabled = authors_on
+        a.fixers = want_fix
+        active = want_fix + ((a.claude + a.codex) if authors_on else 0)
+        a.reviewers = reviewers_for(active, getattr(a, "max_reviewers", 2))
+        specs = lease_logins(fleet_specs(a))
+        changed, switched, deferred = write_config(specs, worker_status(), os.environ.get("TAUCETI_ROUND_WID"))
+        for wid in switched:
+            note = reset_stale_mirror(wid)
+            if note:
+                print(note)
+        line = (f"reconcile: mine_open={mine_open} awaiting-author={backlog} [{source}] → "
+                f"authors {'on' if authors_on else 'off (backpressure ≥ 8)'}, fixers {want_fix}, reviewers {a.reviewers}; "
+                f"config {'updated' if changed else 'unchanged'}")
+        if deferred:
+            line += f"; deferred (mid-round): {', '.join(deferred)}"
+        if not quiet or changed:
+            print(line)
+        freshen_logins(quiet)
+        ensure_pool_warm(quiet, start=not getattr(a, "dry_run", False))
+        ensure_cache_proxy_alive(quiet, start=not getattr(a, "dry_run", False))
+        if not changed or not apply:
+            honor_restart_request(quiet)
+            return 0
+        for s_ in specs:
+            if s_["only"] != "review" and s_["enabled"]:
+                note = preseed(s_["id"])
+                if not quiet or "cloned" in note or "copy" in note:
+                    print(f"checkout {s_['id']}: {note}")
+        rc = tauceti("workers", "--config", str(CONFIG), "apply").returncode
+        honor_restart_request(quiet)
+        return rc
+
+
+def _shape_from_config(a: argparse.Namespace) -> argparse.Namespace:
+    """Recover the fleet's fixed choices (author counts, reviewers, pilot flags, sandbox, budgets,
+    models) from the config the wrapper wrote, so a reconcile changes only what the backlog governs."""
+    if not CONFIG.is_file():
+        die("no fleet config yet: run `gq2-fleet up` first")
+    t = CONFIG.read_text()
+    ids = re.findall(r'^id\s*=\s*"([^"]+)"', t, re.M)
+    a.claude = sum(1 for i in ids if i.startswith("gq2-c"))
+    a.codex = sum(1 for i in ids if i.startswith("gq2-x"))
+    a.reviewers = sum(1 for i in ids if i.startswith("gq2-rev"))
+    a.fixers = sum(1 for i in ids if i.startswith("gq2-fix"))
+    a.progress = sum(1 for i in ids if i.startswith("gq2-prog"))
+    a.curators = sum(1 for i in ids if i.startswith("gq2-cur"))
+    a.pilot = 'TAUCETI_REACTIONS = "0"' in t
+    a.sandbox = "bubble" if 'sandbox = "bubble"' in t else "host"
+    a.pace = os.environ.get("TAUCETI_PACE", "") or (re.search(r'^pace\s*=\s*"([^"]+)"', t, re.M) or [None, ""])[1]
+    m = re.search(r'TAUCETI_GATE_MUTATIONS_PER_HOUR\s*=\s*"(\d+)"', t); a.mutations_per_hour = int(m.group(1)) if m else 40
+    m = re.search(r'TAUCETI_GATE_READS_PER_HOUR\s*=\s*"(\d+)"', t); a.reads_per_hour = int(m.group(1)) if m else 600
+    for k, d in (("claude_model", "claude-opus-5"), ("claude_effort", "high"), ("codex_model", ""), ("codex_effort", "")):
+        if not getattr(a, k, None):
+            setattr(a, k, d)
+    return a
+
+
+def cmd_reconcile(a: argparse.Namespace) -> int:
+    return reconcile(_shape_from_config(a), apply=not a.dry_run, quiet=a.quiet)
+
+
+def cmd_scale(a: argparse.Namespace) -> int:
+    """Alias of reconcile (kept for the runbook)."""
+    return cmd_reconcile(a)
+
+
+def cmd_round(a: argparse.Namespace) -> int:
+    """One round, foreground, with exactly the pilot's environment (gate store and budgets, pinned
+    login, reactions and stuck-issues off, bubble) — the deployment-isolation round of the brief's
+    §11 Stage A. Prints the gate report afterwards so every request the round made is visible."""
+    if not TARGETS.is_file():
+        die(f"target file not found: {TARGETS}")
+    if a.sandbox == "bubble" and shutil.which("bubble") is None:
+        die("bubble is not on PATH")
+    GATE_DIR.mkdir(parents=True, exist_ok=True)
+    env = worker_env()
+    env.update({
+        "TAUCETI_GATE_MUTATIONS_PER_HOUR": str(a.mutations_per_hour),
+        "TAUCETI_GATE_READS_PER_HOUR": str(a.reads_per_hour),
+        "TAUCETI_REACTIONS": "0",
+        "TAUCETI_STUCK_ISSUES": "0",
+        "TAUCETI_PACE": os.environ.get("TAUCETI_PACE", "0:100,100:100"),
+    })
+    argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", a.only, "--agent", a.agent, "--worker-id", a.worker_id,
+            "--roadmap-targets", str(TARGETS), "--author-model", a.claude_model if a.agent == "claude" else a.codex_model or "",
+            "--author-effort", a.claude_effort if a.agent == "claude" else a.codex_effort or ""]
+    argv = [x for x in argv if x != ""]
+    if a.sandbox == "bubble":
+        argv.append("--bubble")
+    print("round:", " ".join(argv[2:]))
+    rc = subprocess.run(argv, cwd=WORKTREE, env=env).returncode
+    print(f"round exited {rc}; gate report for the last 3 hours:")
+    subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "report", "--since", "3h"], cwd=WORKTREE, env=env)
+    subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "publication", "list"], cwd=WORKTREE, env=env)
+    return rc
+
+
+def pool_dir() -> Path:
+    return Path(os.environ.get("TAUCETI_MATHLIB_POOL") or (HOME / ".cache" / "mathlib"))
+
+
+def warmed_revs() -> set[str]:
+    """Mathlib revisions warm-pool has completed into the pool (one marker file each)."""
+    d = pool_dir() / ".warmed"
+    return {f.name for f in d.iterdir() if f.is_file()} if d.is_dir() else set()
+
+
+def needed_revs(max_age_s: int = 1800) -> dict[str, list[str]]:
+    """Mathlib revision -> who pins it, for main and every open PR of mine. Reads go through the gate;
+    a PR's pin is cached by head commit in <fleet>/pins.json so steady state costs one PR listing,
+    and the whole check is skipped (cached answer returned) within max_age_s of the last one."""
+    cache_f = FLEET_HOME / "pins.json"
+    cache = read_json(cache_f) if cache_f.is_file() else {}
+    if time.time() - float(cache.get("checked_at", 0)) < max_age_s and cache.get("needed"):
+        return cache["needed"]
+    env = worker_env()
+
+    def gated(op, argv, timeout=120):
+        adm = subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "admit", "api_read", op, TAUCETI],
+                             cwd=WORKTREE, env=env, capture_output=True, text=True, timeout=60)
+        if adm.returncode != 0:
+            raise RuntimeError(f"gate refused {op}: {(adm.stderr or adm.stdout).strip()[-100:]}")
+        token = adm.stdout.strip().splitlines()[-1] if adm.stdout.strip() else ""
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "record", token, str(200 if r.returncode == 0 else 500)],
+                       cwd=WORKTREE, env=env, capture_output=True, text=True, timeout=60)
+        return r
+
+    def mathlib_rev(text):
+        try:
+            return next(p["rev"] for p in json.loads(text)["packages"] if p["name"] == "mathlib")
+        except Exception:
+            return None
+
+    pins: dict = cache.get("pins", {})  # head oid -> mathlib rev
+    needed: dict[str, list[str]] = {}
+    r = gated("main-head", ["gh", "api", f"repos/{TAUCETI}/commits/main", "--jq", ".sha"])
+    main_sha = r.stdout.strip() if r.returncode == 0 else ""
+    if main_sha and main_sha not in pins:
+        m = gated("manifest-main", ["gh", "api", f"repos/{TAUCETI}/contents/lake-manifest.json?ref={main_sha}",
+                                    "-H", "Accept: application/vnd.github.raw+json"])
+        pins[main_sha] = mathlib_rev(m.stdout) if m.returncode == 0 else None
+    if main_sha and pins.get(main_sha):
+        needed.setdefault(pins[main_sha], []).append("main")
+    r = gated("pr-list", ["gh", "pr", "list", "--repo", TAUCETI, "--author", "@me", "--state", "open", "--limit", "200",
+                          "--json", "number,headRefOid,headRepository,headRepositoryOwner"])
+    prs = json.loads(r.stdout or "[]") if r.returncode == 0 else []
+    for pr in prs:
+        oid = pr.get("headRefOid", "")
+        owner = (pr.get("headRepositoryOwner") or {}).get("login"); repo = (pr.get("headRepository") or {}).get("name")
+        if oid not in pins and owner and repo:
+            m = gated(f"manifest-{pr['number']}", ["gh", "api", f"repos/{owner}/{repo}/contents/lake-manifest.json?ref={oid}",
+                                                  "-H", "Accept: application/vnd.github.raw+json"])
+            pins[oid] = mathlib_rev(m.stdout) if m.returncode == 0 else None
+        if pins.get(oid):
+            needed.setdefault(pins[oid], []).append(f"#{pr['number']}")
+    live = {main_sha, *(pr.get("headRefOid", "") for pr in prs)}
+    cache = {"checked_at": time.time(), "pins": {k: v for k, v in pins.items() if k in live}, "needed": needed}
+    FLEET_HOME.mkdir(parents=True, exist_ok=True)
+    cache_f.write_text(json.dumps(cache, indent=1))
+    return needed
+
+
+def cache_proxy_wedged() -> str | None:
+    """Is bubble's artifact-cache daemon (the container-side Mathlib/TauCeti cache proxy on :7655)
+    wedged? Seen 2026-09-20 twice: main thread parked on a futex with no handler threads, every
+    container's `curl` waiting forever on an ESTABLISHED connection that is never answered, and
+    `bubble cache status` still saying "running" because the pid is alive. The first time it also
+    left 130 half-closed client sockets; the second time only 38, which is why the count alone is not
+    the test. The daemon answers no unauthenticated request even when healthy, so it cannot be probed
+    over HTTP from the host; the signature is a SILENT log (a healthy proxy logs every HIT/MISS) while
+    clients are connected — either a pile of CLOSE-WAIT sockets (a healthy threaded server drains
+    them: busy baseline 8 with 43 established) or a dozen-plus established ones with nothing logged
+    for ten minutes. Linux only; None when healthy or unobservable."""
+    if IS_MAC:
+        return None
+    try:
+        out = subprocess.run(["ss", "-tan"], capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return None
+    lines = [line for line in out.splitlines()[1:] if ":7655" in line]
+    close_wait = sum(1 for line in lines if line.startswith("CLOSE-WAIT"))
+    established = sum(1 for line in lines if line.startswith("ESTAB"))
+    log = HOME / ".bubble" / "artifact-cache.log"
+    try:
+        silent_s = time.time() - log.stat().st_mtime
+    except OSError:
+        return None
+    if silent_s <= 600:
+        return None
+    if close_wait >= 50:
+        return f"{close_wait} half-closed client sockets on :7655 and no log line for {age(time.time() - silent_s)}"
+    if established >= 10:
+        return f"{established} client connections open on :7655 and no log line for {age(time.time() - silent_s)}"
+    return None
+
+
+def ensure_cache_proxy_alive(quiet: bool, *, start: bool = True) -> None:
+    """Restart bubble's artifact-cache daemon when `cache_proxy_wedged` says so. Called from reconcile,
+    so at `up` and after every round. The restart is `bubble cache stop` + `start` (the systemd user
+    unit); waiting containers' downloads fail their current request and retry against the new daemon
+    (Mathlib's cache tool uses `curl --retry 3`). Logged to <fleet>/watchdog.log."""
+    why = cache_proxy_wedged()
+    if not why:
+        return
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} cache proxy wedged: {why}"
+    if not start:
+        print(f"{line}; a live run would restart it")
+        return
+    bubble = shutil.which("bubble") or str(HOME / ".local" / "bin" / "bubble")
+    r1 = subprocess.run([bubble, "cache", "stop"], capture_output=True, text=True, timeout=120)
+    r2 = subprocess.run([bubble, "cache", "start"], capture_output=True, text=True, timeout=180)
+    result = f"restarted (stop rc={r1.returncode}, start rc={r2.returncode})"
+    FLEET_HOME.mkdir(parents=True, exist_ok=True)
+    with open(FLEET_HOME / "watchdog.log", "a") as f:
+        f.write(f"{line} → {result}\n{(r1.stderr + r2.stderr).strip()}\n")
+    print(f"{line} → {result}")
+
+
+def ensure_pool_warm(quiet: bool, *, start: bool = True) -> None:
+    """Start a background warm-pool for any needed Mathlib revision the pool lacks, unless one is
+    already running. Called from reconcile (after every round) and from up. Best effort: a failure
+    to check is logged and never blocks the fleet."""
+    try:
+        needed = needed_revs()
+    except Exception as exc:
+        if not quiet:
+            print(f"pool check skipped: {exc}")
+        return
+    missing = [rev for rev in needed if rev not in warmed_revs()]
+    if not missing:
+        return
+    if not start:
+        print(f"pool: {len(missing)} Mathlib revision(s) missing ({', '.join(r[:8] for r in missing)}); "
+              f"a live run would warm them in the background")
+        return
+    import fcntl
+
+    lock = open(FLEET_HOME / "warm-pool.lock", "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if not quiet:
+            print(f"pool: {len(missing)} revision(s) missing; a warm-pool is already running")
+        return
+    finally:
+        lock.close()
+    log = FLEET_HOME / "warm-pool.log"
+    with open(log, "ab") as lf:
+        subprocess.Popen([str(Path(__file__).resolve()), "warm-pool", "--revs", *missing], stdout=lf, stderr=lf,
+                         stdin=subprocess.DEVNULL, start_new_session=True, env={**os.environ, "GQ2_FLEET_ROOT": str(ROOT)})
+    print(f"pool: warming {len(missing)} missing Mathlib revision(s) in the background "
+          f"({', '.join(r[:8] + ' ' + ','.join(needed[r][:2]) for r in missing)}) → {log}")
+
+
+def cmd_logins(a: argparse.Namespace) -> int:
+    """The Claude login pool: which chains exist, which worker leases which, how many the fleet can
+    use at once, and the sign-in commands for the ones still missing. See the pool notes above for
+    why one chain per concurrently running worker, and why no reshaping or quiet spell ever asks for
+    a new sign-in."""
+    if CONFIG.is_file():
+        shape = _shape_from_config(a)
+    else:  # no fleet yet: describe the pilot's default shape
+        shape = argparse.Namespace(claude=1, codex=0, fixers=a.max_fixers, reviewers=a.max_reviewers, sandbox="bubble",
+                                   pace="", pilot=True, mutations_per_hour=40, reads_per_hour=600,
+                                   claude_model="claude-opus-5", claude_effort="high", codex_model="", codex_effort="")
+    specs = fleet_specs(shape)
+    slots, leases = login_slots(), read_leases()
+    holder = {slot: wid for wid, slot in leases.items()}
+    print(f"login chains under {LOGINS}:")
+    for d in slots:
+        got = _claude_file_expiry(d / ".credentials.json")
+        if got is None:
+            state = "UNREADABLE"
+        elif not got[1]:
+            state = "NOT renewable (no refresh token) — sign in again"
+        else:
+            left = (got[0] - time.time()) / 3600
+            state = f"token {'expired, renews at next use' if left < 0 else f'ok, {left:.1f} h left'}"
+        print(f"  {d.name:10s} {('leased to ' + holder[d.name]) if d.name in holder else 'free':22s} {state}")
+    if not slots:
+        print("  (none yet)")
+    print("\nClaude-capable workers:")
+    for s_ in specs:
+        if s_["agent"] not in ("claude", "auto"):
+            continue
+        wid = s_["id"]
+        if not s_["enabled"]:
+            state = "disabled (no chain held)"
+        elif wid in leases:
+            state = f"chain {leases[wid]}"
+        else:
+            state = "SHARED ~/.claude — a renewal by any other worker revokes this one's in-flight token"
+        print(f"  {wid:9s} {s_['agent']:6s} {state}")
+    # How many chains the fleet can use at once: every Claude-capable worker the shape allows to run
+    # together (Claude authors, every fixer and reviewer, all `auto`), not the number running now.
+    need = (getattr(shape, "claude", 0) + getattr(a, "max_fixers", 3) + getattr(a, "max_reviewers", 2)
+            + getattr(shape, "progress", 1) + getattr(shape, "curators", 1))
+    have = len(slots)
+    print(f"\n{have} chain(s) for up to {need} concurrent Claude-capable workers "
+          f"({getattr(shape, 'claude', 0)} Claude author(s) + {getattr(a, 'max_fixers', 3)} fixers + {getattr(a, 'max_reviewers', 2)} reviewers).")
+    if have < need:
+        print("Create the missing ones (each opens a browser sign-in; the same Claude account is fine, any order):")
+        taken = {d.name for d in slots}
+        k, made = 1, 0
+        while made < need - have:
+            name = f"claude-{k}"
+            k += 1
+            if name in taken:
+                continue
+            print(f"  CLAUDE_CONFIG_DIR={LOGINS / name} claude auth login")
+            made += 1
+        print("A new chain is leased at the next reconcile (after any round ends, or `gq2-fleet reconcile`) to a "
+              "worker between rounds; a worker mid-round gets its chain when that round finishes. Chains are "
+              "renewed without you: leased ones by their worker before each launch, free ones by the fleet.")
+    if IS_MAC:
+        print("\n(macOS: logins live in the Keychain, not in files; the pool is for the Linux fleet host.)")
+    return 0
+
+
+def cmd_warm_pool(a: argparse.Namespace) -> int:
+    """Fill the Mathlib cache pool for every revision the fleet needs (main's and each open PR's), or
+    for the revisions given with --revs. The pool is keyed by file content, so revisions coexist and
+    a present one costs nothing; a marker per completed revision lets the fleet know what it holds.
+    In bubble mode a round's own downloads die with its overlay, so this pool is the only place a
+    download can be kept. The reconcile after every round starts this in the background when a
+    needed revision is missing, so by hand it is only needed to see the list or to force a run."""
+    import fcntl
+
+    pool = pool_dir()
+    pool.mkdir(parents=True, exist_ok=True)
+    if a.revs:
+        needed = {r: ["--revs"] for r in a.revs}
+    else:
+        needed = needed_revs(max_age_s=0)
+        print(f"{len(needed)} distinct Mathlib revision(s) across main and my open PRs:")
+        for rev, who in needed.items():
+            print(f"  {rev[:12]}  {'warm' if rev in warmed_revs() else 'MISSING':7s}  {', '.join(who[:6])}{' …' if len(who) > 6 else ''}")
+    if a.list_only:
+        return 0
+    if shutil.which("lake") is None:
+        die("`lake` is not on PATH (install elan for this user)")
+    FLEET_HOME.mkdir(parents=True, exist_ok=True)
+    lock = open(FLEET_HOME / "warm-pool.lock", "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        die("another warm-pool is running (see warm-pool.log)")
+    ml = FLEET_HOME / "mathlib"
+    if not (ml / ".git").is_dir():
+        print("cloning Mathlib (blobless, once) …", flush=True)
+        subprocess.run(["git", "clone", "-q", "--filter=blob:none", "https://github.com/leanprover-community/mathlib4.git", str(ml)], check=True)
+    (pool / ".warmed").mkdir(exist_ok=True)
+    for rev, who in needed.items():
+        if rev in warmed_revs() and not a.force:
+            print(f"== {rev[:12]} already warm", flush=True)
+            continue
+        print(f"== {rev[:12]} ({', '.join(who[:3])}{' …' if len(who) > 3 else ''}) {time.strftime('%H:%M:%S')}", flush=True)
+        subprocess.run(["git", "-C", str(ml), "fetch", "-q", "origin", rev], check=False)
+        subprocess.run(["git", "-C", str(ml), "checkout", "-q", "--force", rev], check=True)
+        t0 = time.time()
+        r = subprocess.run(["lake", "exe", "cache", "get"], cwd=ml, env={**os.environ, "MATHLIB_CACHE_DIR": str(pool)},
+                           capture_output=True, text=True, timeout=4 * 3600)
+        tail = (r.stdout.strip().splitlines() or [""])[-1]
+        print(f"   {tail[:110]}  ({time.time() - t0:.0f}s, rc={r.returncode})", flush=True)
+        if r.returncode == 0:
+            (pool / ".warmed" / rev).write_text(time.strftime("%Y-%m-%dT%H:%M:%S"))
+    print(f"pool: {pool}  warm: {len(warmed_revs())} revision(s)")
+    return 0
+
+
+def cmd_down(a: argparse.Namespace) -> int:
+    args = ["workers", "--config", str(CONFIG), "manager-stop"]
+    if a.leave_workers:
+        args.append("--leave-workers")
+    return tauceti(*args).returncode
+
+
+RESTART_REQUESTS = FLEET_HOME / "restart-requested"
+
+
+def restart_when_idle(wid: str) -> None:
+    """Honoured by the reconcile that runs from this worker's own round-done hook: that is the one
+    moment it is provably between rounds, which busy workers never are for long enough to catch
+    from outside (rounds chain 20 s apart)."""
+    RESTART_REQUESTS.mkdir(parents=True, exist_ok=True)
+    (RESTART_REQUESTS / wid).write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S}\n")
+
+
+def honor_restart_request(quiet: bool) -> None:
+    """Called at the end of a reconcile. If it runs from a worker's round-done hook and that worker
+    has a pending idle-restart request, restart it now, between rounds. The manager's SIGTERM will
+    end this very process (the hook runs inside the loop), which is fine: the request is dispatched."""
+    wid = os.environ.get("TAUCETI_ROUND_WID")
+    if not wid or not (RESTART_REQUESTS / wid).is_file():
+        return
+    try:
+        (RESTART_REQUESTS / wid).unlink()
+    except OSError:
+        pass
+    # Note it BEFORE asking: the manager's SIGTERM ends this process (the hook runs inside the loop)
+    # possibly before the call returns, and it did on the first use.
+    _watchdog_note(f"{wid}: idle restart honoured at round end")
+    tauceti("workers", "--config", str(CONFIG), "restart", wid, capture=True)
+    if not quiet:
+        print(f"{wid}: restarted between rounds as requested")
+
+
+def cmd_restart(a: argparse.Namespace) -> int:
+    """Restart workers through the manager (one id per call, as the manager wants). Between rounds
+    this loses nothing and resets the no-progress streak, so a worker parked in a long backoff after
+    a run of declined rounds surveys again at once. Mid-round it throws the round away, so say so;
+    --when-idle instead leaves a request that the worker's own round-done reconcile honours."""
+    statuses = worker_status()
+    rc = 0
+    for wid in a.ids:
+        st = statuses.get(wid, {})
+        if a.when_idle and mid_round(st):
+            restart_when_idle(wid)
+            print(f"{wid}: mid-round ({st.get('phase')} {st.get('target', '')[:24]}) — will restart when this round ends")
+            continue
+        if mid_round(st) and not a.force:
+            print(f"{wid}: mid-round ({st.get('phase')} {st.get('target', '')[:24]}) — skipped; --force to restart anyway, --when-idle to queue it")
+            continue
+        r = tauceti("workers", "--config", str(CONFIG), "restart", wid, capture=True)
+        print(f"{wid}: {'restarted' if r.returncode == 0 else 'restart failed: ' + (r.stderr or r.stdout).strip()[-120:]}")
+        rc = rc or r.returncode
+    return rc
+
+
+def cmd_logs(a: argparse.Namespace) -> int:
+    args = ["workers", "--config", str(CONFIG), "logs"]
+    if a.follow:
+        args.append("--follow")
+    return tauceti(*args, a.id).returncode
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="gq2-fleet", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    up = sub.add_parser("up", help="write the fleet config, pre-seed checkouts, start the manager, watch")
+    up.add_argument("--pace", default=os.environ.get("TAUCETI_PACE", ""), help="pacing curve for every worker (default: $TAUCETI_PACE)")
+    up.add_argument("--pilot", action="store_true",
+                    help="brief Stage B: one Claude authoring worker, one fixer, one reviewer, bubble sandbox, "
+                         "reactions and stuck-issue escalation off (overrides the count flags)")
+    # Pilot budgets approved by the owner on 2026-09-20 (GITHUB_GATE_DESIGN.md §9): 40 mutations/h, 600 reads/h,
+    # fleet-wide rolling windows. They are staging controls, not safety guarantees; raise only after a
+    # measured pilot (`gq2-fleet gate report`).
+    up.add_argument("--mutations-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40") or 40),
+                    help="fleet-wide API mutation budget, rolling hour (default 40, owner-approved for the pilot)")
+    up.add_argument("--reads-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_READS_PER_HOUR", "600") or 600),
+                    help="fleet-wide API read budget, rolling hour (default 600, owner-approved for the pilot)")
+    up.add_argument("--sandbox", choices=("host", "bubble"), default=None,
+                    help="where rounds run; the pilot default is bubble (egress-denied), else host")
+    up.add_argument("--claude", type=int, default=None, help="Claude authoring workers (default 2; 1 under --pilot)")
+    up.add_argument("--codex", type=int, default=None, help="Codex-first (auto) authoring workers (default 2; 0 under --pilot)")
+    up.add_argument("--fixers", type=int, default=2, help="initial fix/fix-ci workers, alternating Claude and auto (Codex, else Claude); reconcile sets the count")
+    up.add_argument("--reviewers", type=int, default=1, help="initial review workers; reconcile sets 1 or 2 by fleet size")
+    up.add_argument("--max-reviewers", type=int, default=2)
+    up.add_argument("--claude-model", default="claude-opus-5")
+    up.add_argument("--claude-effort", default="high")
+    up.add_argument("--codex-model", default="")
+    up.add_argument("--codex-effort", default="")
+    up.add_argument("--max-fixers", type=int, default=3, help="fixers while authoring is impossible (mine_open >= 8); fewer as the backlog shrinks")
+    up.add_argument("--progress", type=int, default=1, help="roadmap progress-report workers (host-side; default 1)")
+    up.add_argument("--curators", type=int, default=1, help="target-list curators (host-side; default 1)")
+    up.add_argument("--no-watch", action="store_true", help="start and return instead of opening the live view")
+    up.add_argument("--dry-run", action="store_true", help="write and validate the config, pre-seed checkouts, but do not start")
+    up.set_defaults(fn=cmd_up)
+    w = sub.add_parser("watch", help="live health and progress view")
+    w.add_argument("--interval", type=int, default=30)
+    w.add_argument("--once", action="store_true")
+    w.add_argument("--refresh", action="store_true", help="also refresh PR/claim state from GitHub (through the gate) every 5 min")
+    w.set_defaults(fn=cmd_watch)
+    s = sub.add_parser("status", help="print the view once")
+    s.add_argument("--refresh", action="store_true")
+    s.set_defaults(fn=lambda a: cmd_watch(argparse.Namespace(interval=0, once=True, refresh=a.refresh)))
+    ch = sub.add_parser("clear-halt", help="print each worker's halt incident, then clear it (owner action)")
+    ch.set_defaults(fn=lambda a: [print(f"== {h.parent.name}\n{h.read_text()}") or h.unlink() for h in sorted((WORKTREE / "state").glob("*/halt.json"))] and 0 or 0)
+    gt = sub.add_parser("gate", help="pass-through to `tauceti gate ...` (status, report, resume, halt)")
+    gt.add_argument("args", nargs=argparse.REMAINDER)
+    gt.set_defaults(fn=lambda a: tauceti("gate", *a.args).returncode)
+    r = sub.add_parser("round", help="run ONE round in the foreground with the pilot's environment, then print the gate report")
+    r.add_argument("--worker-id", default="gq2-c1")
+    r.add_argument("--only", default="roadmap")
+    r.add_argument("--agent", choices=("claude", "codex"), default="claude")
+    r.add_argument("--sandbox", choices=("host", "bubble"), default="bubble")
+    r.add_argument("--mutations-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40") or 40))
+    r.add_argument("--reads-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_READS_PER_HOUR", "600") or 600))
+    r.add_argument("--claude-model", default="claude-opus-5")
+    r.add_argument("--claude-effort", default="high")
+    r.add_argument("--codex-model", default="")
+    r.add_argument("--codex-effort", default="")
+    r.set_defaults(fn=cmd_round)
+    rc_ = sub.add_parser("reconcile", help="shape the fleet to the backlog (authors on/off, fixer count); runs after every round via the hook")
+    for _p in (rc_,):
+        _p.add_argument("--max-fixers", type=int, default=3, help="fixers while authoring is impossible (mine_open >= 8)")
+        _p.add_argument("--max-reviewers", type=int, default=2)
+        _p.add_argument("--quiet", action="store_true", help="print only when the shape changes (the hook uses this)")
+        _p.add_argument("--dry-run", action="store_true")
+        _p.set_defaults(fn=cmd_reconcile)
+    sc = sub.add_parser("scale", help="alias of reconcile")
+    sc.add_argument("--max-fixers", type=int, default=3)
+    sc.add_argument("--mutations-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40") or 40))
+    sc.add_argument("--reads-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_READS_PER_HOUR", "600") or 600))
+    sc.add_argument("--claude-model", default="claude-opus-5")
+    sc.add_argument("--claude-effort", default="high")
+    sc.add_argument("--codex-model", default="")
+    sc.add_argument("--codex-effort", default="")
+    sc.add_argument("--quiet", action="store_true")
+    sc.add_argument("--dry-run", action="store_true")
+    sc.set_defaults(fn=cmd_scale)
+    at = sub.add_parser("attention", help="what needs you: rounds whose agent declined to act (PRs to close?), capped review exchanges")
+    at.add_argument("--ack", metavar="PR|all", help="acknowledge (archive) the item(s) for this PR number, or all")
+    at.add_argument("--lookup", action="store_true", help="resolve the PRs an item names (state, merge date, title) through the gate; cached in the item")
+    at.add_argument("--retry", metavar="PR", help="after an infrastructure fix: reset this PR's review-error budget in every worker and archive its review-stuck item")
+    at.set_defaults(fn=cmd_attention)
+    tg = sub.add_parser("targets", help="audit the target list's in-flight items against their PRs (closed ones starve the authors)")
+    tg.add_argument("--apply", action="store_true", help="mark merged and recorded-subsumed items done in the target file")
+    tg.set_defaults(fn=cmd_targets)
+    lg = sub.add_parser("logins", help="the Claude login pool: chains, leases, and the sign-ins still missing")
+    lg.add_argument("--max-fixers", type=int, default=3)
+    lg.add_argument("--max-reviewers", type=int, default=2)
+    lg.set_defaults(fn=cmd_logins)
+    wp = sub.add_parser("warm-pool", help="fill the Mathlib cache pool for main's revision and every open PR's (once per Mathlib bump)")
+    wp.add_argument("--list-only", action="store_true", help="only list the revisions; do not download")
+    wp.add_argument("--revs", nargs="*", help="warm exactly these Mathlib revisions (used by the automatic background run)")
+    wp.add_argument("--force", action="store_true", help="re-fetch even revisions marked warm")
+    wp.set_defaults(fn=cmd_warm_pool)
+    d = sub.add_parser("down", help="stop the manager and its workers")
+    d.add_argument("--leave-workers", action="store_true")
+    d.set_defaults(fn=cmd_down)
+    rs = sub.add_parser("restart", help="restart workers between rounds (clears a backoff); mid-round ones are skipped unless --force")
+    rs.add_argument("ids", nargs="+", metavar="ID")
+    rs.add_argument("--force", action="store_true", help="restart even a worker whose round is in flight (the round is lost)")
+    rs.add_argument("--when-idle", action="store_true", help="for a mid-round worker, queue the restart for the moment its round ends")
+    rs.set_defaults(fn=cmd_restart)
+    lg = sub.add_parser("logs", help="show or follow one worker's durable log")
+    lg.add_argument("id")
+    lg.add_argument("-f", "--follow", action="store_true")
+    lg.set_defaults(fn=cmd_logs)
+    a = ap.parse_args()
+    return a.fn(a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
