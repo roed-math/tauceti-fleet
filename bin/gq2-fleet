@@ -100,6 +100,12 @@ def die(msg: str) -> None:
 
 def worker_env() -> dict[str, str]:
     env = dict(os.environ)
+    # The tools the worker needs (uvx, claude, codex, gh, elan) are installed per user; a round started
+    # from a non-login shell (ssh, the reconcile hook, a timer) has no ~/.local/bin on PATH and fails
+    # preflight with "missing 'uvx'" (2026-09-21).
+    for extra in (HOME / ".local" / "bin", HOME / ".cargo" / "bin", HOME / ".elan" / "bin"):
+        if extra.is_dir() and str(extra) not in env.get("PATH", "").split(os.pathsep):
+            env["PATH"] = str(extra) + os.pathsep + env.get("PATH", "")
     env["PYTHONPATH"] = str(WORKTREE) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env["TAUCETI_WORKERS_STATE_DIR"] = str(STATE)
     env["TAUCETI_WORKERS_CONFIG"] = str(CONFIG)
