@@ -1070,6 +1070,8 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
         # The curator commits the target list and, in the fleet repository, pushes it so the other
         # host and the owner see the same list. Off if the file is not git-tracked (nothing to push).
         "TAUCETI_TARGETS_PUSH": _config_env("TAUCETI_TARGETS_PUSH") or "1",
+        # The one repository the gate lets the curator push to: the target list's own.
+        "TAUCETI_TARGETS_REPO": _config_env("TAUCETI_TARGETS_REPO") or _targets_repo() or "",
         # Progress reports: the fork's planner, rotating, remembering its choices between runs.
         "TAUCETI_PROGRESS_REPO": _config_env("TAUCETI_PROGRESS_REPO") or PROGRESS_REPO,
         "TAUCETI_PROGRESS_REF": _config_env("TAUCETI_PROGRESS_REF") or PROGRESS_REF,
@@ -1086,6 +1088,17 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
     if d is not None:
         env["CLAUDE_CONFIG_DIR"] = str(d)
     return env
+
+
+def _targets_repo() -> str:
+    """`owner/name` of the repository the target list lives in (its `origin`), or "" if not git-tracked."""
+    try:
+        url = subprocess.run(["git", "-C", str(TARGETS.parent), "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    m = re.search(r"github\.com[:/]([^/]+/[^/\s]+?)(?:\.git)?$", url)
+    return m.group(1) if m else ""
 
 
 def run_periodic(stage: str, *, quiet: bool = True, force: bool = False) -> str:
