@@ -1161,7 +1161,18 @@ def cmd_periodic(a: argparse.Namespace) -> int:
                 "--author-model", env["TAUCETI_AUTHORING_CLAUDE_MODEL"], "--author-effort", env["TAUCETI_AUTHORING_CLAUDE_EFFORT"],
                 "--agent", "claude", "--roadmap-targets", str(TARGETS)]
         (periodic_dir() / f"{a.now}.last").touch()
-        return subprocess.run(argv, cwd=WORKTREE, env=env).returncode
+        # To the same stage-named log a timed round writes, so the view's row and `gq2-fleet periodic`
+        # see a manual round too; echoed to the terminal as it goes.
+        logs = STATE / "logs" / PERIODIC_WID
+        logs.mkdir(parents=True, exist_ok=True)
+        log = logs / f"{a.now}-{datetime.now():%Y%m%d-%H%M%S}.log"
+        print(f"log: {log}")
+        with open(log, "a") as out, subprocess.Popen(argv, cwd=WORKTREE, env=env, stdout=subprocess.PIPE,
+                                                     stderr=subprocess.STDOUT, text=True) as proc:
+            for line in proc.stdout:
+                out.write(line); out.flush()
+                sys.stdout.write(line); sys.stdout.flush()
+        return proc.returncode
     for stage, gap in PERIODIC.items():
         last = periodic_dir() / f"{stage}.last"
         when = f"last run {age(last.stat().st_mtime)} ago" if last.exists() else "never run"
