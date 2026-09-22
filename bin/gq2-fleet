@@ -1183,6 +1183,11 @@ def cmd_periodic(a: argparse.Namespace) -> int:
                 "--author-model", env["TAUCETI_AUTHORING_CLAUDE_MODEL"], "--author-effort", env["TAUCETI_AUTHORING_CLAUDE_EFFORT"],
                 "--agent", "claude", "--roadmap-targets", str(TARGETS)]
         (periodic_dir() / f"{a.now}.last").touch()
+        # A forced round means now: clear the worker's own attempt gap for the stage (and the cached
+        # progress verdict), or the round says "no eligible work" while the gap runs.
+        wstate = WORKTREE / "state" / PERIODIC_WID
+        for stale in (wstate / f"{a.now}-attempt-ts", wstate / "cache" / "progress-due.json"):
+            stale.unlink(missing_ok=True)
         # To the same stage-named log a timed round writes, so the view's row and `gq2-fleet periodic`
         # see a manual round too; echoed to the terminal as it goes.
         logs = STATE / "logs" / PERIODIC_WID
