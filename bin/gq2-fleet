@@ -1021,7 +1021,10 @@ def _verdicts() -> dict[int, dict]:
 # lock; the round's own due-check (attempt gap counters) is the second line of defence.
 
 PERIODIC_WID = "gq2-periodic"
-PERIODIC = {"curate": 6 * 3600, "progress": 8 * 3600}  # stage -> seconds between runs
+# `progress` is tried every 2 h, not every 8: the planner itself requires 8 h since the last LANDED
+# report (project-wide), and a runner on the same period would drift out of phase with it and land a
+# report every 16 h. A not-due attempt costs the survey's reads and one `due` call.
+PERIODIC = {"curate": 6 * 3600, "progress": 2 * 3600}  # stage -> seconds between runs
 # The progress reports come from the fleet's OWN fork of TauCetiProgress, pinned by SHA: its planner
 # has the `rotate` strategy (the stalest reportable roadmap first, never-reported ones before any),
 # which upstream's `busiest` lacks. The file formats are upstream's, so TauCetiRoadmap's merge gate,
