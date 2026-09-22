@@ -74,6 +74,9 @@ HOME = Path(_pwd.getpwuid(os.getuid()).pw_dir)
 ROOT = Path(os.environ.get("GQ2_FLEET_ROOT") or (HOME / "claude" if (HOME / "claude").is_dir() else HOME)).expanduser()
 WORKTREE = Path(os.environ.get("GQ2_FLEET_WORKTREE", ROOT / "TauCetiWorker-v2")).expanduser()
 _REPO_TARGETS = ROOT / "tauceti-fleet" / "targets" / "gq2_axiom_targets.md"  # the tracked copy (roed-math/tauceti-fleet)
+# A TauCetiRoadmap checkout, for checking that the target list's areas are real roadmaps. The list
+# used to live inside that checkout; now it lives in this repository, so the checkout is named apart.
+ROADMAP_CHECKOUT = Path(os.environ.get("GQ2_FLEET_ROADMAP") or ROOT / "TauCetiRoadmap").expanduser()
 TARGETS = Path(os.environ.get("GQ2_FLEET_TARGETS") or (_REPO_TARGETS if _REPO_TARGETS.is_file() else ROOT / "TauCetiRoadmap" / "gq2_axiom_targets.md")).expanduser()
 FLEET_HOME = Path(os.environ.get("GQ2_FLEET_HOME", ROOT / "gq2-fleet")).expanduser()
 CONFIG = FLEET_HOME / "workers.toml"
@@ -1525,12 +1528,15 @@ def cmd_up(a: argparse.Namespace) -> int:
         die("a worker is halted (" + ", ".join(p.parent.name for p in halted) + "); inspect and clear with "
             "`gq2-fleet clear-halt` before starting anything")
     t = load_targets(TARGETS)
-    roadmap_root = TARGETS.parent / "TauCetiRoadmap"
+    roadmap_root = ROADMAP_CHECKOUT / "TauCetiRoadmap"
+    if not roadmap_root.is_dir():
+        die(f"no TauCetiRoadmap checkout at {ROADMAP_CHECKOUT} to check the target areas against (set GQ2_FLEET_ROADMAP)")
     bad = [a for a in t.areas if not re.fullmatch(r"[A-Za-z0-9_-]+", a) or not (roadmap_root / a / "README.md").is_file()]
     if bad:
         die("target file names areas that are not roadmap directories under " + str(roadmap_root) + ": "
             + ", ".join(repr(a[:40]) for a in bad) + " — a worker would author against a roadmap that does not exist; "
-            "move drafted areas under the Gaps section until their roadmap PR merges")
+            f"if the roadmap merged recently, `git -C {ROADMAP_CHECKOUT} pull` first; otherwise move the area under "
+            "the Gaps section until its roadmap PR merges")
     n_open = sum(len(open_items(t, area)) for area in t.areas)
     print(f"targets: {TARGETS} — {n_open} open items in {len(t.areas)} areas")
     a.authors_enabled = True
