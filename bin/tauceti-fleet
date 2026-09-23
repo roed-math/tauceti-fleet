@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
 # Runs on the operator's Python 3.11+ (stdlib only); the worker itself is imported from the worktree.
-"""gq2-fleet — start, watch and stop the GQ2 axiom-targets fleet with one command.
+"""tauceti-fleet — run a fleet of TauCetiWorker workers against one operator target list.
 
-    gq2-fleet up [--pace CURVE] [--claude 2] [--codex 2] [--fixers 2] [--reviewers 1] [--no-watch]
-    gq2-fleet logins                 # the Claude login pool: chains, leases, missing sign-ins
-    gq2-fleet attention [--ack PR]   # rounds whose agent declined to act (a PR to close?), until acknowledged
-    gq2-fleet restart ID...          # restart workers between rounds (clears a long backoff)
-    gq2-fleet periodic [--now STAGE] # the cadenced curate/progress rounds
-    gq2-fleet watch [--interval 30]
-    gq2-fleet status
-    gq2-fleet down [--leave-workers]
-    gq2-fleet logs ID [-f]
+    tauceti-fleet init --name NAME --targets FILE --github-login LOGIN   # once: write the fleet's settings
+    tauceti-fleet up [--pilot] [--claude N] [--codex N] [--sandbox bubble] [--no-watch]
+    tauceti-fleet logins                 # the Claude login pool: chains, leases, missing sign-ins
+    tauceti-fleet attention [--ack PR]   # rounds whose agent declined to act (a PR to close?), until acknowledged
+    tauceti-fleet restart ID...          # restart workers between rounds (clears a long backoff)
+    tauceti-fleet periodic [--now STAGE] # the cadenced curate/progress rounds
+    tauceti-fleet watch | status | down | logs ID [-f] | reconcile | targets
 
-`up` writes a workers.toml for the recommended fleet, pre-seeds each authoring/fixing checkout as an
-APFS clone of an existing built checkout (seconds, ~0 bytes, instead of a 12 GB unpack), hands the
-file to the worker's own persistent manager (`tauceti workers apply`, run from the patched worktree so
-`--roadmap-targets` and worker-side target claims are available), and then opens the live view.
+A fleet lives in one directory, its HOME ($TAUCETI_FLEET_HOME, default ~/.tauceti-fleet): `fleet.toml`
+(the settings `init` writes; see README.md), the generated `workers.toml`, the GitHub gate, the Claude
+login pool, and every worker's logs under `state/logs/<id>/`. Worker ids are `<name>-c1`, `<name>-fix1`,
+`<name>-rev1`, …, so fleets with different names can share a host.
 
-Everything the workers print goes to durable per-worker logs under $GQ2_FLEET_HOME/state/logs/<id>/;
-the live view only shows health and progress. The pacing curve comes from --pace or $TAUCETI_PACE and
-is written into every worker; re-running `up` with a different curve restarts just the workers whose
-definition changed (the manager reconciles by spec hash).
-
-Environment overrides: GQ2_FLEET_ROOT (parent of the three below; default ~/claude if present, else ~),
-GQ2_FLEET_WORKTREE (patched TauCetiWorker checkout), GQ2_FLEET_TARGETS (target file), GQ2_FLEET_HOME (config/state/logs), CLAIM_REPO (claim namespace; every worker must agree),
-TAUCETI_PACE (default pacing curve).
+`up` writes workers.toml for the fleet's shape and hands it to the worker's own persistent manager
+(`tauceti workers apply`); after every round the worker calls `reconcile`, which reshapes the fleet from
+the backlog it just measured. The live view shows health and progress; the logs hold everything.
 """
 
 from __future__ import annotations
@@ -34,7 +27,7 @@ import sys as _sys
 
 # The live view needs `rich`, which the worker's own uv environment carries and the system
 # Python usually does not. Re-exec under that interpreter when available (both platforms):
-# $GQ2_FLEET_PYTHON, else the uv tool's python, else stay put and fail clearly later.
+# $TAUCETI_FLEET_PYTHON, else the uv tool's python, else stay put and fail clearly later.
 try:
     import rich  # noqa: F401
     _HAVE_RICH = True
@@ -46,10 +39,10 @@ except ImportError:
     import pwd as _pwd_
 
     _login_home = _pwd_.getpwuid(_os.getuid()).pw_dir
-    if not _os.environ.get("GQ2_FLEET_REEXEC"):
-        for _cand in (_os.environ.get("GQ2_FLEET_PYTHON"), f"{_login_home}/.local/share/uv/tools/tauceti/bin/python3"):
+    if not _os.environ.get("TAUCETI_FLEET_REEXEC"):
+        for _cand in (_os.environ.get("TAUCETI_FLEET_PYTHON"), f"{_login_home}/.local/share/uv/tools/tauceti/bin/python3"):
             if _cand and _os.path.exists(_cand):
-                _os.environ["GQ2_FLEET_REEXEC"] = "1"
+                _os.environ["TAUCETI_FLEET_REEXEC"] = "1"
                 _os.execv(_cand, [_cand, *_sys.argv])
     # No interpreter with rich: only the live view needs it; every other command still works.
 
@@ -69,29 +62,69 @@ import pwd as _pwd
 # The login user's real home, NOT $HOME: on Linux the worker moves $HOME to a per-worker private home
 # before running rounds, and the round-done hook runs this script from inside that environment.
 HOME = Path(_pwd.getpwuid(os.getuid()).pw_dir)
-# Where the worktree, roadmap checkout and fleet state live: $GQ2_FLEET_ROOT, else ~/claude when that
-# directory exists (the Mac layout), else the home directory itself (the Ubuntu fleet user).
-ROOT = Path(os.environ.get("GQ2_FLEET_ROOT") or (HOME / "claude" if (HOME / "claude").is_dir() else HOME)).expanduser()
-WORKTREE = Path(os.environ.get("GQ2_FLEET_WORKTREE", ROOT / "TauCetiWorker-v2")).expanduser()
-_REPO_TARGETS = ROOT / "tauceti-fleet" / "targets" / "gq2_axiom_targets.md"  # the tracked copy (roed-math/tauceti-fleet)
-# The Claude model and effort every Claude round uses unless `up --claude-model/--claude-effort`
-# says otherwise. Once written into the config, reconcile keeps the config's choice.
-DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
-DEFAULT_CLAUDE_EFFORT = "high"
+PROG = "tauceti-fleet"
 
-# A TauCetiRoadmap checkout, for checking that the target list's areas are real roadmaps. The list
-# used to live inside that checkout; now it lives in this repository, so the checkout is named apart.
-ROADMAP_CHECKOUT = Path(os.environ.get("GQ2_FLEET_ROADMAP") or ROOT / "TauCetiRoadmap").expanduser()
-TARGETS = Path(os.environ.get("GQ2_FLEET_TARGETS") or (_REPO_TARGETS if _REPO_TARGETS.is_file() else ROOT / "TauCetiRoadmap" / "gq2_axiom_targets.md")).expanduser()
-FLEET_HOME = Path(os.environ.get("GQ2_FLEET_HOME", ROOT / "gq2-fleet")).expanduser()
+
+def _expand(v: str | Path) -> Path:
+    """`~` is the login user's real home (see HOME), not a moved $HOME."""
+    v = str(v)
+    return (HOME / v[2:]) if v.startswith("~/") else Path(v)
+
+
+# The fleet's home and its settings. Everything specific to one fleet is in `fleet.toml` there (written
+# by `init`, edited by hand afterwards); this program carries only generic defaults. An environment
+# variable overrides a setting of the same meaning, for one-off runs.
+FLEET_HOME = _expand(os.environ.get("TAUCETI_FLEET_HOME") or "~/.tauceti-fleet")
+SETTINGS_FILE = FLEET_HOME / "fleet.toml"
+
+
+def _load_settings() -> dict:
+    if not SETTINGS_FILE.is_file():
+        return {}
+    import tomllib
+
+    try:
+        return tomllib.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        sys.exit(f"{PROG}: cannot read {SETTINGS_FILE}: {exc}")
+
+
+SETTINGS = _load_settings()
+
+
+def setting(section: str, key: str, default: str = "", env: str | None = None) -> str:
+    if env and os.environ.get(env):
+        return os.environ[env]
+    v = SETTINGS.get(section, {}).get(key)
+    return str(v) if v not in (None, "") else default
+
+
+def _setting_bool(section: str, key: str) -> bool:
+    return setting(section, key).lower() in ("true", "1", "yes")
+
+
+def _setting_int(section: str, key: str) -> int | None:
+    v = setting(section, key)
+    return int(v) if v else None
+
+
+NAME = setting("fleet", "name", env="TAUCETI_FLEET_NAME")
+TARGETS = _expand(setting("fleet", "targets", "", "TAUCETI_FLEET_TARGETS") or FLEET_HOME / "targets.md")
+EXPECT_LOGIN = setting("fleet", "github_login", env="TAUCETI_EXPECT_LOGIN")
+CLAIM_REPO = setting("fleet", "claim_repo", "TauCetiProject/tauceti-claims", "CLAIM_REPO")
+WORKTREE = _expand(setting("paths", "worker", "~/TauCetiWorker-v2", "TAUCETI_FLEET_WORKER"))
+ROADMAP_CHECKOUT = _expand(setting("paths", "roadmap", "~/TauCetiRoadmap", "TAUCETI_FLEET_ROADMAP"))
+# The Claude model and effort every Claude round uses unless `up --claude-model/--claude-effort` says
+# otherwise. Once written into workers.toml, reconcile keeps that choice.
+DEFAULT_CLAUDE_MODEL = setting("models", "claude", "claude-opus-5-5")
+DEFAULT_CLAUDE_EFFORT = setting("models", "claude_effort", "high")
 CONFIG = FLEET_HOME / "workers.toml"
 STATE = FLEET_HOME / "state"
 GATE_DIR = FLEET_HOME / "gate"
-EXPECT_LOGIN = os.environ.get("GQ2_FLEET_LOGIN", "roed-math")
-CLAIM_REPO = os.environ.get("CLAIM_REPO", "TauCetiProject/tauceti-claims")
-INSTALLED_CHECKOUTS = HOME / ".local/share/uv/tools/tauceti/lib/python3.13/site-packages/tauceti_worker/checkouts"
+INSTALLED_CHECKOUTS = next(iter((HOME / ".local/share/uv/tools/tauceti/lib").glob("python3*/site-packages/tauceti_worker/checkouts")),
+                           HOME / ".local/share/uv/tools/tauceti/lib/python3/site-packages/tauceti_worker/checkouts")
 TAUCETI = "TauCetiProject/TauCeti"
-PYTHON = os.environ.get("GQ2_FLEET_PYTHON", sys.executable)
+PYTHON = os.environ.get("TAUCETI_FLEET_PYTHON", sys.executable)
 IS_MAC = sys.platform == "darwin"
 
 sys.path.insert(0, str(WORKTREE))
@@ -99,11 +132,13 @@ try:
     from tauceti_worker.targets import load_targets, overlay_live, eligible_items, open_items  # noqa: E402
     from tauceti_worker.survey import target_marker_ids  # noqa: E402
 except Exception as exc:  # pragma: no cover - environment problem, say so plainly
-    sys.exit(f"gq2-fleet: cannot import the patched worker from {WORKTREE}: {exc}")
+    # Without settings, main() says "run init", which is the useful message.
+    if SETTINGS_FILE.is_file() and sys.argv[1:2] not in (["init"], ["-h"], ["--help"], []):
+        sys.exit(f"{PROG}: cannot import TauCetiWorker from {WORKTREE} (paths.worker in {SETTINGS_FILE}): {exc}")
 
 
 def die(msg: str) -> None:
-    sys.exit(f"gq2-fleet: {msg}")
+    sys.exit(f"{PROG}: {msg}")
 
 
 def worker_env() -> dict[str, str]:
@@ -123,7 +158,7 @@ def worker_env() -> dict[str, str]:
     env["TAUCETI_EXPECT_LOGIN"] = EXPECT_LOGIN
     # The wrapper's own gate calls (status, reconcile's backlog read, `attention --lookup`) share the
     # workers' budgets, so they must use the workers' NUMBERS: read them from the fleet config the
-    # wrapper wrote (owner raised reads to 1200/h; a hard-coded 600 here made `gate status` print
+    # wrapper wrote (a hard-coded 600 here once made `gate status` print
     # 702/600 and refused the wrapper's own reads while the workers still had headroom).
     for var, default in (("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40"), ("TAUCETI_GATE_READS_PER_HOUR", "600")):
         env.setdefault(var, _config_env(var) or default)
@@ -180,7 +215,7 @@ LEASES = LOGINS / "leases.json"
 # Rotating a Claude access token revokes the old one at once (measured 2026-09-20: a reviewer's renewal
 # killed a fixer's 75-minute rebase nine seconds later), so workers that run concurrently must not share
 # one refresh chain. The pool is a set of ordinary `claude auth login`s, one per directory under
-# $GQ2_FLEET_HOME/logins, named for the POOL (claude-1, claude-2, …) and never for a worker: which
+# the fleet home's logins/, named for the POOL (claude-1, claude-2, …) and never for a worker: which
 # worker uses which chain is a lease in leases.json. Workers come, go and get renumbered as the backlog
 # reshapes the fleet; the chains stay, and no reshaping asks the owner for a new sign-in.
 #
@@ -208,7 +243,7 @@ def assign_leases(specs: list[dict]) -> dict[str, str]:
     """Sticky leases, one chain per worker: a worker keeps its chain while it exists and is enabled;
     chains of workers that left the config or were disabled are released; free chains go to enabled
     claude/auto workers without one, in config order. Workers left over share the operator's
-    ~/.claude (and `gq2-fleet logins` says so). Pure: the caller writes the result."""
+    ~/.claude (and `tauceti-fleet logins` says so). Pure: the caller writes the result."""
     slots = {d.name for d in login_slots()}
     eligible = [s_["id"] for s_ in specs if s_["agent"] in ("claude", "auto") and s_["enabled"]] + [PERIODIC_WID]
     leases = {w: slot for w, slot in read_leases().items() if w in eligible and slot in slots}
@@ -302,7 +337,7 @@ def freshen_logins(quiet: bool = True) -> list[str]:
         prov = credential_refresh.provider("claude", credentials=d / ".credentials.json")
         try:
             if not credential_refresh.renewable(prov):
-                notes.append(f"login {d.name}: no refresh token — sign in again (gq2-fleet logins)")
+                notes.append(f"login {d.name}: no refresh token — sign in again (tauceti-fleet logins)")
                 continue
             r = credential_refresh.refresh_if_due(prov, round_timeout() + 600, attempt_interval_seconds=600)
         except Exception as exc:  # a failing chain must not take the reconcile down with it
@@ -315,6 +350,12 @@ def freshen_logins(quiet: bool = True) -> list[str]:
         if not quiet:
             print(n)
     return notes
+
+
+def wid(kind: str, i: int | None = None) -> str:
+    """A worker id: `<fleet name>-<kind><i>` (c = Claude author, x = auto author, fix, rev, periodic).
+    The name keeps two fleets on one host apart: container names, checkouts and state all key on it."""
+    return f"{NAME}-{kind}{'' if i is None else i}"
 
 
 def fleet_specs(a: argparse.Namespace) -> list[dict]:
@@ -338,7 +379,7 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             "CLAIM_REPO": CLAIM_REPO,
             # Rotating a Claude access token REVOKES the old one at once (measured 2026-09-20), so a
             # worker renews only before its own agent launch, early enough that the token outlives the
-            # round. That is only safe when workers do not share one login chain: see `gq2-fleet logins`.
+            # round. That is only safe when workers do not share one login chain: see `tauceti-fleet logins`.
             "TAUCETI_ROUND_TIMEOUT": str(round_timeout()),  # recorded so every reconcile agrees on it
             "TAUCETI_CLAUDE_REFRESH_SKEW": str(round_timeout() + 600),
             # CLAUDE_CONFIG_DIR (the worker's leased login chain) is added by with_logins(); see the pool above.
@@ -357,34 +398,34 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             "TAUCETI_GATE_REQUIRED": "1",
             "TAUCETI_GATE_MUTATIONS_PER_HOUR": str(a.mutations_per_hour),
             "TAUCETI_GATE_READS_PER_HOUR": str(a.reads_per_hour),
-            # Pilot interaction contract (brief §8.1): no reactions, no automatic stuck-review issues.
+            # Pilot mode interacts less on GitHub: no reactions, no automatic stuck-review issues.
             "TAUCETI_REACTIONS": "0" if a.pilot else "1",
             "TAUCETI_STUCK_ISSUES": "0" if a.pilot else "1",
             # After every round the worker calls back so the fleet shape follows the backlog it just
             # measured (authors on/off, fixer count) with no GitHub read of its own.
             "TAUCETI_ROUND_DONE_CMD": f"{Path(__file__).resolve()} reconcile --quiet",
-            "GQ2_FLEET_ROOT": str(ROOT),  # the hook runs under the worker's moved $HOME; pin the root
+            "TAUCETI_FLEET_HOME": str(FLEET_HOME),  # the hook runs under the worker's moved $HOME; pin the fleet
         }
         specs.append(spec)
 
     for i in range(1, a.claude + 1):
-        add(f"gq2-c{i}", "claude", "roadmap", roadmap_targets=str(TARGETS),
+        add(wid("c", i), "claude", "roadmap", roadmap_targets=str(TARGETS),
             author_model=a.claude_model, author_effort=a.claude_effort)
     # The "Codex" authors run `auto` (Codex first, Claude when Codex's window is spent) so that share of
     # authoring never parks with its subscription; the Claude authors above stay pinned.
     for i in range(1, a.codex + 1):
-        add(f"gq2-x{i}", "auto", "roadmap", roadmap_targets=str(TARGETS))
+        add(wid("x", i), "auto", "roadmap", roadmap_targets=str(TARGETS))
     # Fixers alternate: odd ones pinned to Claude, even ones `auto` (the worker's pacer prefers Codex
     # and falls back to Claude when Codex's window is spent), so the Codex share of fixing survives
     # its subscription running dry instead of parking. Reviewers run `auto` for the same reason. An
     # `auto` worker may not take --author-model; its models come from TAUCETI_AUTHORING_* above.
     for i in range(1, a.fixers + 1):
         if i % 2 == 1:
-            add(f"gq2-fix{i}", "claude", "fix,fix-ci,rebase", author_model=a.claude_model, author_effort=a.claude_effort)
+            add(wid("fix", i), "claude", "fix,fix-ci,rebase", author_model=a.claude_model, author_effort=a.claude_effort)
         else:
-            add(f"gq2-fix{i}", "auto", "fix,fix-ci,rebase")
+            add(wid("fix", i), "auto", "fix,fix-ci,rebase")
     for i in range(1, a.reviewers + 1):
-        add(f"gq2-rev{i}", "auto", "review")
+        add(wid("rev", i), "auto", "review")
     # The two host-side kinds — the roadmap progress reports and the target-list curator — are not
     # workers: a loop that surveys every 90 s to find "not due" is waste. They run as one-shot rounds
     # on a cadence (see `periodic`), from the reconcile hook and the live view, under the id
@@ -402,7 +443,7 @@ def toml_str(v: str) -> str:
     return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-TOML_HEADER = "# Generated by gq2-fleet; re-run `gq2-fleet up` rather than editing by hand.\nversion = 1\n"
+TOML_HEADER = "# Generated by tauceti-fleet; re-run `tauceti-fleet up` rather than editing by hand.\nversion = 1\n"
 
 
 def render_block(s: dict) -> str:
@@ -538,7 +579,7 @@ def _login_pool_line() -> tuple[str, str] | None:
     renewed (a sign-in is the only fix for that). None when there is no pool (macOS, or none made)."""
     slots = login_slots()
     if not slots:
-        return None if IS_MAC else ("logins: none — every Claude worker shares ~/.claude (gq2-fleet logins)", "yellow")
+        return None if IS_MAC else ("logins: none — every Claude worker shares ~/.claude (tauceti-fleet logins)", "yellow")
     leases = read_leases()
     soonest, dead = None, []
     for d in slots:
@@ -1028,18 +1069,17 @@ def _verdicts() -> dict[int, dict]:
 # fleet) or by the live view, whichever comes first once the stage is due. One at a time, under a
 # lock; the round's own due-check (attempt gap counters) is the second line of defence.
 
-PERIODIC_WID = "gq2-periodic"
+PERIODIC_WID = wid("periodic")
 # `progress` is tried every 2 h, not every 8: the planner itself requires 8 h since the last LANDED
 # report (project-wide), and a runner on the same period would drift out of phase with it and land a
 # report every 16 h. A not-due attempt costs the survey's reads and one `due` call.
 PERIODIC = {"curate": 6 * 3600, "progress": 2 * 3600}  # stage -> seconds between runs
-# The progress reports come from the fleet's OWN fork of TauCetiProgress, pinned by SHA: its planner
-# has the `rotate` strategy (the stalest reportable roadmap first, never-reported ones before any),
-# which upstream's `busiest` lacks. The file formats are upstream's, so TauCetiRoadmap's merge gate,
-# pinned to upstream, accepts the reports. Each of these can be overridden in the fleet config.
-PROGRESS_REPO = "roed-math/TauCetiProgress"
-PROGRESS_REF = "38ce36d2f14e98ee2bfbd4d204865a85df05d35c"  # feat/rotate-strategy, 2026-09-21
-PROGRESS_STRATEGY = "rotate"
+# Which TauCetiProgress the progress rounds run, and how it picks a roadmap. Empty = the worker's own
+# pinned upstream and its default strategy. A fork must keep upstream's file formats, since
+# TauCetiRoadmap's merge gate is pinned to upstream.
+PROGRESS_REPO = setting("progress", "repo")
+PROGRESS_REF = setting("progress", "ref")
+PROGRESS_STRATEGY = setting("progress", "strategy")
 
 
 def periodic_dir() -> Path:
@@ -1049,7 +1089,7 @@ def periodic_dir() -> Path:
 
 
 def periodic_enabled(stage: str) -> bool:
-    """`curate` is always on. `progress` is opt-in (`gq2-fleet periodic --enable progress`): it
+    """`curate` is always on. `progress` is opt-in (`tauceti-fleet periodic --enable progress`): it
     publishes pull requests to TauCetiRoadmap, so it is switched on deliberately. Rotation through
     the roadmaps (rather than busiest-first) comes from the pinned fork, see PROGRESS_REF."""
     return stage == "curate" or (periodic_dir() / f"{stage}.enabled").is_file()
@@ -1084,11 +1124,13 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
         # The one repository the gate lets the curator push to: the target list's own.
         "TAUCETI_TARGETS_REPO": _config_env("TAUCETI_TARGETS_REPO") or _targets_repo() or "",
         # Progress reports: the fork's planner, rotating, remembering its choices between runs.
-        "TAUCETI_PROGRESS_REPO": _config_env("TAUCETI_PROGRESS_REPO") or PROGRESS_REPO,
-        "TAUCETI_PROGRESS_REF": _config_env("TAUCETI_PROGRESS_REF") or PROGRESS_REF,
-        "TAUCETI_PROGRESS_STRATEGY": _config_env("TAUCETI_PROGRESS_STRATEGY") or PROGRESS_STRATEGY,
         "TAUCETI_PROGRESS_STATE": _config_env("TAUCETI_PROGRESS_STATE") or str(periodic_dir() / "progress-rotation.json"),
     })
+    for var, value in (("TAUCETI_PROGRESS_REPO", PROGRESS_REPO), ("TAUCETI_PROGRESS_REF", PROGRESS_REF),
+                       ("TAUCETI_PROGRESS_STRATEGY", PROGRESS_STRATEGY)):
+        value = _config_env(var) or value
+        if value:
+            env[var] = value
     # The same pacing curve as the managed workers, which get theirs as `pace = ...` in the config.
     # Without it the worker's default curve applies, and that one allows nothing at all early in a
     # usage window: the first curate round (2026-09-21) ended with "no model under pace right now".
@@ -1196,7 +1238,7 @@ def cmd_periodic(a: argparse.Namespace) -> int:
         wstate = WORKTREE / "state" / PERIODIC_WID
         for stale in (wstate / f"{a.now}-attempt-ts", wstate / "cache" / "progress-due.json"):
             stale.unlink(missing_ok=True)
-        # To the same stage-named log a timed round writes, so the view's row and `gq2-fleet periodic`
+        # To the same stage-named log a timed round writes, so the view's row and `tauceti-fleet periodic`
         # see a manual round too; echoed to the terminal as it goes.
         logs = STATE / "logs" / PERIODIC_WID
         logs.mkdir(parents=True, exist_ok=True)
@@ -1211,7 +1253,7 @@ def cmd_periodic(a: argparse.Namespace) -> int:
     for stage, gap in PERIODIC.items():
         last = periodic_dir() / f"{stage}.last"
         when = f"last run {age(last.stat().st_mtime)} ago" if last.exists() else "never run"
-        state = "disabled (gq2-fleet periodic --enable progress)" if not periodic_enabled(stage) else ("DUE" if periodic_due(stage) else "not due")
+        state = "disabled (tauceti-fleet periodic --enable progress)" if not periodic_enabled(stage) else ("DUE" if periodic_due(stage) else "not due")
         print(f"  {stage:9s} every {gap // 3600} h — {when}; {state}")
     print(f"logs: {STATE / 'logs' / PERIODIC_WID}/   login chain: {login_dir(PERIODIC_WID) or 'shared ~/.claude'}")
     return 0
@@ -1332,7 +1374,7 @@ def cmd_attention(a: argparse.Namespace) -> int:
         if d.get("transcript"):
             print(f"   transcript: {d['transcript']}")
         print()
-    print("acknowledge with: gq2-fleet attention --ack <PR number> | all")
+    print("acknowledge with: tauceti-fleet attention --ack <PR number> | all")
     return 0
 
 
@@ -1370,7 +1412,7 @@ def build_view(progress: Progress, console=None):
         phase = st.get("phase") or ""
         target = st.get("target") or ""
         what = f"{phase} {target}".strip() or (st.get("detail") or "")
-        agent = st.get("agent", "") or ("claude" if re.match(r"gq2-(c\d|fix[13579])$", w) else "auto")
+        agent = st.get("agent", "") or ("claude" if re.fullmatch(rf"{re.escape(NAME)}-(c\d+|fix\d*[13579])", w) else "auto")
         m = re.search(r"provider=(\w+)", st.get("detail") or "") if agent == "auto" else None
         if m and st.get("state") in ("running", "surveying"):
             agent = f"auto→{m.group(1)}"  # what the pacer picked for the round in flight
@@ -1383,7 +1425,7 @@ def build_view(progress: Progress, console=None):
         if ps["running"]:
             label, style, what = "running", "green", f"{stage} round in progress"
         elif not ps["enabled"]:
-            label, style, what = "disabled", "dim", f"gq2-fleet periodic --enable {stage}"
+            label, style, what = "disabled", "dim", f"tauceti-fleet periodic --enable {stage}"
         else:
             label, style, what = "idle", "dim", f"every {PERIODIC[stage] // 3600} h"
         nxt = "running" if ps["running"] else ("—" if not ps["enabled"] else ("due" if ps["next_at"] is None or ps["next_at"] <= time.time() else until(ps["next_at"])))
@@ -1404,8 +1446,8 @@ def build_view(progress: Progress, console=None):
         if len(parked) > 3:
             keep = parked[-3:]
             parts = [x for x in parts if not x.startswith("parked:") or x in keep]
-            parts.append(f"… {len(parked) - 3} older parked publication(s): gq2-fleet gate status, or "
-                         f"gq2-fleet gate publication prune to archive the interrupted ones with no remote effect")
+            parts.append(f"… {len(parked) - 3} older parked publication(s): tauceti-fleet gate status, or "
+                         f"tauceti-fleet gate publication prune to archive the interrupted ones with no remote effect")
         gate_line = "\n".join(parts)
     except Exception as exc:
         gate_line = f"gate: {exc}"
@@ -1426,7 +1468,7 @@ def build_view(progress: Progress, console=None):
         p.add_row(Text("progress", style="yellow"), Text(f"partial: {d['error']}", style="yellow"))
     p.add_row("gate", Text(gate_line, style="red" if "HALTED" in gate_line else "yellow" if "COOLDOWN" in gate_line else "", overflow="fold"))
     if halts:
-        p.add_row(Text("halted", style="red"), Text(", ".join(h.parent.name for h in halts) + "  (gq2-fleet clear-halt)", style="red"))
+        p.add_row(Text("halted", style="red"), Text(", ".join(h.parent.name for h in halts) + "  (tauceti-fleet clear-halt)", style="red"))
     needs = attention_items()
     if needs:
         lines = Text()
@@ -1436,7 +1478,7 @@ def build_view(progress: Progress, console=None):
             lines.append(attention_line(d, 140), style="bold red" if d.get("close_hint") else "yellow")
         if len(needs) > 6:
             lines.append(f"\n… {len(needs) - 6} more")
-        lines.append("\n(gq2-fleet attention for the full text; --ack <PR> once handled)", style="dim")
+        lines.append("\n(tauceti-fleet attention for the full text; --ack <PR> once handled)", style="dim")
         p.add_row(Text("needs you", style="bold red"), lines)
     if not progress.creds or time.time() - getattr(progress, "creds_at", 0) > 300:
         try:
@@ -1475,7 +1517,7 @@ def build_view(progress: Progress, console=None):
 
 def cmd_watch(a: argparse.Namespace) -> int:
     if not _HAVE_RICH:
-        die("the live view needs the `rich` module; set GQ2_FLEET_PYTHON to an interpreter that has it "
+        die("the live view needs the `rich` module; set TAUCETI_FLEET_PYTHON to an interpreter that has it "
             "(the uv tool's ~/.local/share/uv/tools/tauceti/bin/python3, or `pip install rich`)")
     from rich.console import Console
     from rich.live import Live
@@ -1526,16 +1568,16 @@ def cmd_up(a: argparse.Namespace) -> int:
     if a.sandbox == "bubble" and shutil.which("bubble") is None:
         die("--sandbox bubble requested but `bubble` is not on PATH; install it or pass --sandbox host (host mode leaves the wrappers as a convention, not a control — see docs/gate.md)")
     if a.mutations_per_hour <= 0 or a.reads_per_hour <= 0:
-        die("the gate budgets must be positive (owner-approved pilot values are 40 mutations/h, 600 reads/h)")
+        die("the gate budgets must be positive (gate.mutations_per_hour and gate.reads_per_hour in fleet.toml)")
     GATE_DIR.mkdir(parents=True, exist_ok=True)
     halted = [p for p in (WORKTREE / "state").glob("*/halt.json")] if (WORKTREE / "state").is_dir() else []
     if halted:
         die("a worker is halted (" + ", ".join(p.parent.name for p in halted) + "); inspect and clear with "
-            "`gq2-fleet clear-halt` before starting anything")
+            "`tauceti-fleet clear-halt` before starting anything")
     t = load_targets(TARGETS)
     roadmap_root = ROADMAP_CHECKOUT / "TauCetiRoadmap"
     if not roadmap_root.is_dir():
-        die(f"no TauCetiRoadmap checkout at {ROADMAP_CHECKOUT} to check the target areas against (set GQ2_FLEET_ROADMAP)")
+        die(f"no TauCetiRoadmap checkout at {ROADMAP_CHECKOUT} to check the target areas against (paths.roadmap in fleet.toml)")
     bad = [a for a in t.areas if not re.fullmatch(r"[A-Za-z0-9_-]+", a) or not (roadmap_root / a / "README.md").is_file()]
     if bad:
         die("target file names areas that are not roadmap directories under " + str(roadmap_root) + ": "
@@ -1576,7 +1618,7 @@ def cmd_up(a: argparse.Namespace) -> int:
     r = tauceti("workers", "--config", str(CONFIG), "apply")
     if r.returncode != 0:
         die("`tauceti workers apply` failed")
-    print(f"logs: {STATE / 'logs'}/<id>/work-*.log   (gq2-fleet logs ID -f to follow one)")
+    print(f"logs: {STATE / 'logs'}/<id>/work-*.log   (tauceti-fleet logs ID -f to follow one)")
     if a.no_watch:
         return 0
     a.interval, a.once, a.refresh = 30, False, False
@@ -1713,13 +1755,13 @@ def _shape_from_config(a: argparse.Namespace) -> argparse.Namespace:
     """Recover the fleet's fixed choices (author counts, reviewers, pilot flags, sandbox, budgets,
     models) from the config the wrapper wrote, so a reconcile changes only what the backlog governs."""
     if not CONFIG.is_file():
-        die("no fleet config yet: run `gq2-fleet up` first")
+        die("no fleet config yet: run `tauceti-fleet up` first")
     t = CONFIG.read_text()
     ids = re.findall(r'^id\s*=\s*"([^"]+)"', t, re.M)
-    a.claude = sum(1 for i in ids if i.startswith("gq2-c"))
-    a.codex = sum(1 for i in ids if i.startswith("gq2-x"))
-    a.reviewers = sum(1 for i in ids if i.startswith("gq2-rev"))
-    a.fixers = sum(1 for i in ids if i.startswith("gq2-fix"))
+    a.claude = sum(1 for i in ids if re.fullmatch(rf"{re.escape(NAME)}-c\d+", i))
+    a.codex = sum(1 for i in ids if re.fullmatch(rf"{re.escape(NAME)}-x\d+", i))
+    a.reviewers = sum(1 for i in ids if re.fullmatch(rf"{re.escape(NAME)}-rev\d+", i))
+    a.fixers = sum(1 for i in ids if re.fullmatch(rf"{re.escape(NAME)}-fix\d+", i))
     a.pilot = 'TAUCETI_REACTIONS = "0"' in t
     a.sandbox = "bubble" if 'sandbox = "bubble"' in t else "host"
     a.pace = os.environ.get("TAUCETI_PACE", "") or (re.search(r'^pace\s*=\s*"([^"]+)"', t, re.M) or [None, ""])[1]
@@ -1747,11 +1789,12 @@ def cmd_scale(a: argparse.Namespace) -> int:
 
 
 def cmd_round(a: argparse.Namespace) -> int:
-    """One round, foreground, with exactly the pilot's environment (gate store and budgets, pinned
-    login, reactions and stuck-issues off, bubble) — the deployment-isolation round of the brief's
-    §11 Stage A. Prints the gate report afterwards so every request the round made is visible."""
+    """One round, foreground, with the pilot's environment (gate store and budgets, pinned login,
+    reactions and stuck-issues off, bubble): a first isolated round on a new host, before `up`.
+    Prints the gate report afterwards so every request the round made is visible."""
     if not TARGETS.is_file():
         die(f"target file not found: {TARGETS}")
+    a.worker_id = a.worker_id or wid("c", 1)
     if a.sandbox == "bubble" and shutil.which("bubble") is None:
         die("bubble is not on PATH")
     GATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1930,7 +1973,7 @@ def ensure_pool_warm(quiet: bool, *, start: bool = True) -> None:
     log = FLEET_HOME / "warm-pool.log"
     with open(log, "ab") as lf:
         subprocess.Popen([str(Path(__file__).resolve()), "warm-pool", "--revs", *missing], stdout=lf, stderr=lf,
-                         stdin=subprocess.DEVNULL, start_new_session=True, env={**os.environ, "GQ2_FLEET_ROOT": str(ROOT)})
+                         stdin=subprocess.DEVNULL, start_new_session=True, env={**os.environ, "TAUCETI_FLEET_HOME": str(FLEET_HOME)})
     print(f"pool: warming {len(missing)} missing Mathlib revision(s) in the background "
           f"({', '.join(r[:8] + ' ' + ','.join(needed[r][:2]) for r in missing)}) → {log}")
 
@@ -1991,7 +2034,7 @@ def cmd_logins(a: argparse.Namespace) -> int:
                 continue
             print(f"  CLAUDE_CONFIG_DIR={LOGINS / name} claude auth login")
             made += 1
-        print("A new chain is leased at the next reconcile (after any round ends, or `gq2-fleet reconcile`) to a "
+        print("A new chain is leased at the next reconcile (after any round ends, or `tauceti-fleet reconcile`) to a "
               "worker between rounds; a worker mid-round gets its chain when that round finishes. Chains are "
               "renewed without you: leased ones by their worker before each launch, free ones by the fleet.")
     if IS_MAC:
@@ -2116,25 +2159,95 @@ def cmd_logs(a: argparse.Namespace) -> int:
     return tauceti(*args, a.id).returncode
 
 
+SETTINGS_TEMPLATE = """\
+# Settings for one tauceti-fleet fleet. `tauceti-fleet init` wrote this; edit it freely.
+# An environment variable of the same meaning overrides a value for one run (see README.md).
+
+[fleet]
+# Short and unique on this host: worker ids are <name>-c1, <name>-fix1, <name>-rev1, ...
+name = {name}
+# The operator target list the authors work through (a `<!-- tauceti-targets:v1 -->` file).
+targets = {targets}
+# The GitHub account every worker must act as; a worker halts on any other identity.
+github_login = {login}
+# The claim namespace shared by every worker of the project (all fleets must agree on it).
+claim_repo = "TauCetiProject/tauceti-claims"
+
+[paths]
+worker = {worker}      # a TauCetiWorker checkout (see README.md for the branch)
+roadmap = {roadmap}    # a TauCetiRoadmap checkout, to check the target list's areas
+
+[up]
+# Defaults for `tauceti-fleet up`; its flags override them.
+pilot = true
+sandbox = "bubble"
+# pace = "0:100,100:100"
+# claude = 2
+# codex = 2
+
+[gate]
+# Fleet-wide rolling-hour budgets for everything done as github_login. Two fleets acting as the
+# same login must share these, not double them.
+mutations_per_hour = 40
+reads_per_hour = 600
+
+[models]
+# claude = "claude-opus-5-5"
+# claude_effort = "high"
+
+[progress]
+# Which TauCetiProgress the progress rounds run; empty = the worker's pinned upstream.
+# repo = "owner/TauCetiProgress"
+# ref = "<full sha>"
+# strategy = "rotate"
+"""
+
+
+def cmd_init(a: argparse.Namespace) -> int:
+    """Write the fleet's settings file. Refuses to overwrite one unless --force."""
+    if not re.fullmatch(r"[a-z][a-z0-9]{0,11}", a.name):
+        die("--name must be a short lowercase word (letters and digits, at most 12): it prefixes every worker id")
+    if SETTINGS_FILE.exists() and not a.force:
+        die(f"{SETTINGS_FILE} already exists (--force to replace it)")
+    targets = _expand(a.targets).resolve()
+    if not targets.is_file():
+        die(f"no target file at {targets}")
+    FLEET_HOME.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(SETTINGS_TEMPLATE.format(
+        name=toml_str(a.name), targets=toml_str(str(targets)), login=toml_str(a.github_login),
+        worker=toml_str(a.worker), roadmap=toml_str(a.roadmap)), encoding="utf-8")
+    print(f"wrote {SETTINGS_FILE}")
+    print(f"next: {PROG} logins (sign in the Claude login pool), then {PROG} up")
+    return 0
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="gq2-fleet", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(prog=PROG, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    it = sub.add_parser("init", help="write the fleet's settings (fleet.toml in the fleet home)")
+    it.add_argument("--name", required=True, help="short fleet name; prefixes every worker id")
+    it.add_argument("--targets", required=True, help="the operator target list for the authors")
+    it.add_argument("--github-login", required=True, help="the GitHub account the workers act as")
+    it.add_argument("--worker", default="~/TauCetiWorker-v2", help="TauCetiWorker checkout (default ~/TauCetiWorker-v2)")
+    it.add_argument("--roadmap", default="~/TauCetiRoadmap", help="TauCetiRoadmap checkout (default ~/TauCetiRoadmap)")
+    it.add_argument("--force", action="store_true")
+    it.set_defaults(fn=cmd_init)
     up = sub.add_parser("up", help="write the fleet config, pre-seed checkouts, start the manager, watch")
-    up.add_argument("--pace", default=os.environ.get("TAUCETI_PACE", ""), help="pacing curve for every worker (default: $TAUCETI_PACE)")
-    up.add_argument("--pilot", action="store_true",
-                    help="brief Stage B: one Claude authoring worker, one fixer, one reviewer, bubble sandbox, "
-                         "reactions and stuck-issue escalation off (overrides the count flags)")
-    # Pilot budgets approved by the owner on 2026-09-20 (GITHUB_GATE_DESIGN.md §9): 40 mutations/h, 600 reads/h,
-    # fleet-wide rolling windows. They are staging controls, not safety guarantees; raise only after a
-    # measured pilot (`gq2-fleet gate report`).
-    up.add_argument("--mutations-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40") or 40),
-                    help="fleet-wide API mutation budget, rolling hour (default 40, owner-approved for the pilot)")
-    up.add_argument("--reads-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_READS_PER_HOUR", "600") or 600),
-                    help="fleet-wide API read budget, rolling hour (default 600, owner-approved for the pilot)")
-    up.add_argument("--sandbox", choices=("host", "bubble"), default=None,
-                    help="where rounds run; the pilot default is bubble (egress-denied), else host")
-    up.add_argument("--claude", type=int, default=None, help="Claude authoring workers (default 2; 1 under --pilot)")
-    up.add_argument("--codex", type=int, default=None, help="Codex-first (auto) authoring workers (default 2; 0 under --pilot)")
+    up.add_argument("--pace", default=setting("up", "pace", "", "TAUCETI_PACE"), help="pacing curve for every worker (default: up.pace)")
+    up.add_argument("--pilot", action=argparse.BooleanOptionalAction, default=_setting_bool("up", "pilot"),
+                    help="the cautious shape: one Claude author, no auto author (unless --claude/--codex say "
+                         "otherwise), bubble sandbox, and no reactions or stuck-review issues on GitHub (default: up.pilot)")
+    # Fleet-wide rolling-hour budgets for everything the fleet does as its GitHub login. Staging
+    # controls, not safety guarantees; raise them only after measuring (`tauceti-fleet gate report`).
+    up.add_argument("--mutations-per-hour", type=int, default=int(setting("gate", "mutations_per_hour", "40", "TAUCETI_GATE_MUTATIONS_PER_HOUR")),
+                    help="fleet-wide API mutation budget, rolling hour (default: gate.mutations_per_hour, else 40)")
+    up.add_argument("--reads-per-hour", type=int, default=int(setting("gate", "reads_per_hour", "600", "TAUCETI_GATE_READS_PER_HOUR")),
+                    help="fleet-wide API read budget, rolling hour (default: gate.reads_per_hour, else 600)")
+    up.add_argument("--sandbox", choices=("host", "bubble"), default=setting("up", "sandbox") or None,
+                    help="where rounds run: bubble (egress-denied containers) or host (default: up.sandbox, else bubble "
+                         "under --pilot and host otherwise)")
+    up.add_argument("--claude", type=int, default=_setting_int("up", "claude"), help="Claude authoring workers (default: up.claude, else 2; 1 under --pilot)")
+    up.add_argument("--codex", type=int, default=_setting_int("up", "codex"), help="auto (Codex first, then Claude) authoring workers (default: up.codex, else 2; 0 under --pilot)")
     up.add_argument("--fixers", type=int, default=2, help="initial fix/fix-ci workers, alternating Claude and auto (Codex, else Claude); reconcile sets the count")
     up.add_argument("--reviewers", type=int, default=1, help="initial review workers; reconcile sets 1 or 2 by fleet size")
     up.add_argument("--max-reviewers", type=int, default=2)
@@ -2160,12 +2273,12 @@ def main() -> int:
     gt.add_argument("args", nargs=argparse.REMAINDER)
     gt.set_defaults(fn=lambda a: tauceti("gate", *a.args).returncode)
     r = sub.add_parser("round", help="run ONE round in the foreground with the pilot's environment, then print the gate report")
-    r.add_argument("--worker-id", default="gq2-c1")
+    r.add_argument("--worker-id", default=None, help="default: the first Claude author")
     r.add_argument("--only", default="roadmap")
     r.add_argument("--agent", choices=("claude", "codex"), default="claude")
     r.add_argument("--sandbox", choices=("host", "bubble"), default="bubble")
-    r.add_argument("--mutations-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40") or 40))
-    r.add_argument("--reads-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_READS_PER_HOUR", "600") or 600))
+    r.add_argument("--mutations-per-hour", type=int, default=int(setting("gate", "mutations_per_hour", "40", "TAUCETI_GATE_MUTATIONS_PER_HOUR")))
+    r.add_argument("--reads-per-hour", type=int, default=int(setting("gate", "reads_per_hour", "600", "TAUCETI_GATE_READS_PER_HOUR")))
     r.add_argument("--claude-model", default=DEFAULT_CLAUDE_MODEL)
     r.add_argument("--claude-effort", default=DEFAULT_CLAUDE_EFFORT)
     r.add_argument("--codex-model", default="")
@@ -2180,8 +2293,8 @@ def main() -> int:
         _p.set_defaults(fn=cmd_reconcile)
     sc = sub.add_parser("scale", help="alias of reconcile")
     sc.add_argument("--max-fixers", type=int, default=3)
-    sc.add_argument("--mutations-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40") or 40))
-    sc.add_argument("--reads-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_READS_PER_HOUR", "600") or 600))
+    sc.add_argument("--mutations-per-hour", type=int, default=int(setting("gate", "mutations_per_hour", "40", "TAUCETI_GATE_MUTATIONS_PER_HOUR")))
+    sc.add_argument("--reads-per-hour", type=int, default=int(setting("gate", "reads_per_hour", "600", "TAUCETI_GATE_READS_PER_HOUR")))
     sc.add_argument("--claude-model", default=DEFAULT_CLAUDE_MODEL)
     sc.add_argument("--claude-effort", default=DEFAULT_CLAUDE_EFFORT)
     sc.add_argument("--codex-model", default="")
@@ -2194,7 +2307,7 @@ def main() -> int:
     at.add_argument("--lookup", action="store_true", help="resolve the PRs an item names (state, merge date, title) through the gate; cached in the item")
     at.add_argument("--retry", metavar="PR", help="after an infrastructure fix: reset this PR's review-error budget in every worker and archive its review-stuck item")
     at.set_defaults(fn=cmd_attention)
-    pe = sub.add_parser("periodic", help="the cadenced one-shot rounds (curate every 6 h, progress every 8 h): show, or run one now")
+    pe = sub.add_parser("periodic", help="the cadenced one-shot rounds (curate every 6 h, progress tried every 2 h): show, or run one now")
     pe.add_argument("--now", choices=tuple(PERIODIC), help="run this stage now, in the foreground")
     pe.add_argument("--enable", choices=("progress",), help="turn the progress-report cadence on")
     pe.add_argument("--disable", choices=("progress",), help="turn the progress-report cadence off")
@@ -2226,6 +2339,9 @@ def main() -> int:
     lg.add_argument("-f", "--follow", action="store_true")
     lg.set_defaults(fn=cmd_logs)
     a = ap.parse_args()
+    if a.cmd != "init" and not (NAME and EXPECT_LOGIN):
+        die(f"no fleet settings in {SETTINGS_FILE} (fleet.name and fleet.github_login are required): run "
+            f"`{PROG} init`, or set TAUCETI_FLEET_HOME to an existing fleet's home")
     return a.fn(a) or 0
 
 
