@@ -74,7 +74,9 @@ def _expand(v: str | Path) -> Path:
 # The fleet's home and its settings. Everything specific to one fleet is in `fleet.toml` there (written
 # by `init`, edited by hand afterwards); this program carries only generic defaults. An environment
 # variable overrides a setting of the same meaning, for one-off runs.
-FLEET_HOME = _expand(os.environ.get("TAUCETI_FLEET_HOME") or "~/.tauceti-fleet")
+# Resolved, so a home reached through a symlink yields the same paths in workers.toml as before
+# (a changed path string would read as a changed worker and restart it).
+FLEET_HOME = _expand(os.environ.get("TAUCETI_FLEET_HOME") or "~/.tauceti-fleet").resolve()
 SETTINGS_FILE = FLEET_HOME / "fleet.toml"
 
 
@@ -278,10 +280,12 @@ def with_logins(specs: list[dict], leases: dict[str, str]) -> list[dict]:
     return specs
 
 
-def lease_logins(specs: list[dict]) -> list[dict]:
-    """Assign, persist and apply the leases for these specs (the config writers call this)."""
+def lease_logins(specs: list[dict], persist: bool = True) -> list[dict]:
+    """Assign, persist and apply the leases for these specs (the config writers call this).
+    `persist=False` (a dry run) computes them without writing."""
     leases = assign_leases(specs)
-    write_leases(leases)
+    if persist:
+        write_leases(leases)
     return with_logins(specs, leases)
 
 
@@ -1587,7 +1591,7 @@ def cmd_up(a: argparse.Namespace) -> int:
     n_open = sum(len(open_items(t, area)) for area in t.areas)
     print(f"targets: {TARGETS} — {n_open} open items in {len(t.areas)} areas")
     a.authors_enabled = True
-    specs = lease_logins(fleet_specs(a))
+    specs = lease_logins(fleet_specs(a), persist=not a.dry_run)
     for text, style in credential_lines():
         print(f"creds: {text}")
     if any(s["agent"] == "codex" for s in specs) and shutil.which("codex") is None:
@@ -1595,10 +1599,14 @@ def cmd_up(a: argparse.Namespace) -> int:
     if any(s["agent"] == "auto" for s in specs) and shutil.which("codex") is None:
         print("note: no `codex` binary on PATH — the auto workers will run on Claude only")
     STATE.mkdir(parents=True, exist_ok=True)
-    changed, _switched, deferred = write_config(specs, worker_status())
-    print(f"config: {CONFIG} ({'updated' if changed else 'unchanged'}; pace={a.pace or 'worker default'})"
+    # A dry run validates a separate file: writing the live one would leave it changed but never
+    # applied, and the next reconcile would then see nothing to apply.
+    target = FLEET_HOME / "workers.dry-run.toml" if a.dry_run else CONFIG
+    changed, _switched, deferred = write_config(specs, worker_status(), path=target)
+    print(f"config: {target} ({'would change' if a.dry_run and changed else 'updated' if changed else 'unchanged'}; "
+          f"pace={a.pace or 'worker default'})"
           + (f"; kept for workers mid-round: {', '.join(deferred)}" if deferred else ""))
-    chk = tauceti("workers", "--config", str(CONFIG), "apply", "--check", capture=True)
+    chk = tauceti("workers", "--config", str(target), "apply", "--check", capture=True)
     if chk.returncode != 0:
         print(chk.stdout, chk.stderr)
         die("workers.toml failed validation")
@@ -1626,7 +1634,8 @@ def cmd_up(a: argparse.Namespace) -> int:
 
 
 def write_config(specs: list[dict], statuses: dict[str, dict] | None = None,
-                 hook_wid: str | None = None) -> tuple[bool, list[str], list[str]]:
+                 hook_wid: str | None = None, write: bool = True,
+                 path: Path | None = None) -> tuple[bool, list[str], list[str]]:
     """Write workers.toml; returns (changed, switched ids, deferred ids). The manager reconciles by
     spec hash and restarts any enabled worker whose block changed — mid-round, that throws away a
     build in progress. So a worker whose status says a round is in flight keeps its CURRENT block
@@ -1649,7 +1658,10 @@ def write_config(specs: list[dict], statuses: dict[str, dict] | None = None,
             blocks.append(blk)
     text = TOML_HEADER + "\n" + "\n".join(blocks)
     changed = old_text != text
-    CONFIG.write_text(text)
+    # A dry run must not write: a later real reconcile would then find the file "unchanged" and never
+    # hand it to the manager.
+    if write:
+        (path or CONFIG).write_text(text)
     return changed, switched, deferred
 
 
@@ -1720,20 +1732,23 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
         a.fixers = want_fix
         active = want_fix + ((a.claude + a.codex) if authors_on else 0)
         a.reviewers = reviewers_for(active, getattr(a, "max_reviewers", 2))
-        specs = lease_logins(fleet_specs(a))
-        changed, switched, deferred = write_config(specs, worker_status(), os.environ.get("TAUCETI_ROUND_WID"))
+        dry = bool(getattr(a, "dry_run", False))
+        specs = lease_logins(fleet_specs(a), persist=not dry)
+        changed, switched, deferred = write_config(specs, worker_status(), os.environ.get("TAUCETI_ROUND_WID"), write=not dry)
         for wid in switched:
-            note = reset_stale_mirror(wid)
+            note = f"{wid}: would switch to its new definition" if dry else reset_stale_mirror(wid)
             if note:
                 print(note)
+        verdict = ("would change" if dry else "updated") if changed else "unchanged"
         line = (f"reconcile: mine_open={mine_open} awaiting-author={backlog} [{source}] → "
                 f"authors {'on' if authors_on else 'off (backpressure ≥ 8)'}, fixers {want_fix}, reviewers {a.reviewers}; "
-                f"config {'updated' if changed else 'unchanged'}")
+                f"config {verdict}")
         if deferred:
             line += f"; deferred (mid-round): {', '.join(deferred)}"
         if not quiet or changed:
             print(line)
-        freshen_logins(quiet)
+        if not dry:
+            freshen_logins(quiet)
         ensure_pool_warm(quiet, start=not getattr(a, "dry_run", False))
         ensure_cache_proxy_alive(quiet, start=not getattr(a, "dry_run", False))
         if not getattr(a, "dry_run", False):
