@@ -74,6 +74,11 @@ HOME = Path(_pwd.getpwuid(os.getuid()).pw_dir)
 ROOT = Path(os.environ.get("GQ2_FLEET_ROOT") or (HOME / "claude" if (HOME / "claude").is_dir() else HOME)).expanduser()
 WORKTREE = Path(os.environ.get("GQ2_FLEET_WORKTREE", ROOT / "TauCetiWorker-v2")).expanduser()
 _REPO_TARGETS = ROOT / "tauceti-fleet" / "targets" / "gq2_axiom_targets.md"  # the tracked copy (roed-math/tauceti-fleet)
+# The Claude model and effort every Claude round uses unless `up --claude-model/--claude-effort`
+# says otherwise. Once written into the config, reconcile keeps the config's choice.
+DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
+DEFAULT_CLAUDE_EFFORT = "high"
+
 # A TauCetiRoadmap checkout, for checking that the target list's areas are real roadmaps. The list
 # used to live inside that checkout; now it lives in this repository, so the checkout is named apart.
 ROADMAP_CHECKOUT = Path(os.environ.get("GQ2_FLEET_ROADMAP") or ROOT / "TauCetiRoadmap").expanduser()
@@ -1067,7 +1072,7 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
     env.update({
         "TAUCETI_WORKER_ID": PERIODIC_WID,
         "TAUCETI_ROADMAP_TARGETS": str(TARGETS),
-        "TAUCETI_AUTHORING_CLAUDE_MODEL": getattr(a, "claude_model", None) or _config_env("TAUCETI_AUTHORING_CLAUDE_MODEL") or "claude-opus-5",
+        "TAUCETI_AUTHORING_CLAUDE_MODEL": getattr(a, "claude_model", None) or _config_env("TAUCETI_AUTHORING_CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL,
         "TAUCETI_AUTHORING_CLAUDE_EFFORT": getattr(a, "claude_effort", None) or _config_env("TAUCETI_AUTHORING_CLAUDE_EFFORT") or "high",
         "TAUCETI_CLAUDE_REFRESH_SKEW": str(round_timeout() + 600),
         "TAUCETI_REACTIONS": _config_env("TAUCETI_REACTIONS") or "0",
@@ -1125,7 +1130,7 @@ def run_periodic(stage: str, *, quiet: bool = True, force: bool = False) -> str:
     log = logs / f"{stage}-{datetime.now():%Y%m%d-%H%M%S}.log"
     (periodic_dir() / f"{stage}.last").touch()
     argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", stage, "--worker-id", PERIODIC_WID,
-            "--author-model", periodic_env().get("TAUCETI_AUTHORING_CLAUDE_MODEL", "claude-opus-5"),
+            "--author-model", periodic_env().get("TAUCETI_AUTHORING_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
             "--author-effort", periodic_env().get("TAUCETI_AUTHORING_CLAUDE_EFFORT", "high"),
             "--agent", "claude", "--roadmap-targets", str(TARGETS)]
     # The lock file descriptor is inherited by the child, so the lock lives as long as the round.
@@ -1720,9 +1725,15 @@ def _shape_from_config(a: argparse.Namespace) -> argparse.Namespace:
     a.pace = os.environ.get("TAUCETI_PACE", "") or (re.search(r'^pace\s*=\s*"([^"]+)"', t, re.M) or [None, ""])[1]
     m = re.search(r'TAUCETI_GATE_MUTATIONS_PER_HOUR\s*=\s*"(\d+)"', t); a.mutations_per_hour = int(m.group(1)) if m else 40
     m = re.search(r'TAUCETI_GATE_READS_PER_HOUR\s*=\s*"(\d+)"', t); a.reads_per_hour = int(m.group(1)) if m else 600
-    for k, d in (("claude_model", "claude-opus-5"), ("claude_effort", "high"), ("codex_model", ""), ("codex_effort", "")):
+    # The models are the config's, not this version's defaults: a reconcile must not undo the model
+    # the owner chose with `up`.
+    for k, var, d in (("claude_model", "TAUCETI_AUTHORING_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
+                      ("claude_effort", "TAUCETI_AUTHORING_CLAUDE_EFFORT", DEFAULT_CLAUDE_EFFORT),
+                      ("codex_model", "TAUCETI_AUTHORING_CODEX_MODEL", ""),
+                      ("codex_effort", "TAUCETI_AUTHORING_CODEX_EFFORT", "")):
         if not getattr(a, k, None):
-            setattr(a, k, d)
+            m = re.search(rf'^{var}\s*=\s*"([^"]*)"', t, re.M)
+            setattr(a, k, (m.group(1) if m else "") or d)
     return a
 
 
@@ -1934,7 +1945,7 @@ def cmd_logins(a: argparse.Namespace) -> int:
     else:  # no fleet yet: describe the pilot's default shape
         shape = argparse.Namespace(claude=1, codex=0, fixers=a.max_fixers, reviewers=a.max_reviewers, sandbox="bubble",
                                    pace="", pilot=True, mutations_per_hour=40, reads_per_hour=600,
-                                   claude_model="claude-opus-5", claude_effort="high", codex_model="", codex_effort="")
+                                   claude_model=DEFAULT_CLAUDE_MODEL, claude_effort=DEFAULT_CLAUDE_EFFORT, codex_model="", codex_effort="")
     specs = fleet_specs(shape)
     slots, leases = login_slots(), read_leases()
     holder = {slot: wid for wid, slot in leases.items()}
@@ -2127,8 +2138,8 @@ def main() -> int:
     up.add_argument("--fixers", type=int, default=2, help="initial fix/fix-ci workers, alternating Claude and auto (Codex, else Claude); reconcile sets the count")
     up.add_argument("--reviewers", type=int, default=1, help="initial review workers; reconcile sets 1 or 2 by fleet size")
     up.add_argument("--max-reviewers", type=int, default=2)
-    up.add_argument("--claude-model", default="claude-opus-5")
-    up.add_argument("--claude-effort", default="high")
+    up.add_argument("--claude-model", default=DEFAULT_CLAUDE_MODEL)
+    up.add_argument("--claude-effort", default=DEFAULT_CLAUDE_EFFORT)
     up.add_argument("--codex-model", default="")
     up.add_argument("--codex-effort", default="")
     up.add_argument("--max-fixers", type=int, default=3, help="fixers while authoring is impossible (mine_open >= 8); fewer as the backlog shrinks")
@@ -2155,8 +2166,8 @@ def main() -> int:
     r.add_argument("--sandbox", choices=("host", "bubble"), default="bubble")
     r.add_argument("--mutations-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40") or 40))
     r.add_argument("--reads-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_READS_PER_HOUR", "600") or 600))
-    r.add_argument("--claude-model", default="claude-opus-5")
-    r.add_argument("--claude-effort", default="high")
+    r.add_argument("--claude-model", default=DEFAULT_CLAUDE_MODEL)
+    r.add_argument("--claude-effort", default=DEFAULT_CLAUDE_EFFORT)
     r.add_argument("--codex-model", default="")
     r.add_argument("--codex-effort", default="")
     r.set_defaults(fn=cmd_round)
@@ -2171,8 +2182,8 @@ def main() -> int:
     sc.add_argument("--max-fixers", type=int, default=3)
     sc.add_argument("--mutations-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40") or 40))
     sc.add_argument("--reads-per-hour", type=int, default=int(os.environ.get("TAUCETI_GATE_READS_PER_HOUR", "600") or 600))
-    sc.add_argument("--claude-model", default="claude-opus-5")
-    sc.add_argument("--claude-effort", default="high")
+    sc.add_argument("--claude-model", default=DEFAULT_CLAUDE_MODEL)
+    sc.add_argument("--claude-effort", default=DEFAULT_CLAUDE_EFFORT)
     sc.add_argument("--codex-model", default="")
     sc.add_argument("--codex-effort", default="")
     sc.add_argument("--quiet", action="store_true")
