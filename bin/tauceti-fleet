@@ -1427,7 +1427,10 @@ def cmd_attention(a: argparse.Namespace) -> int:
         if d.get("transcript"):
             print(f"   transcript: {d['transcript']}")
         print()
-    print("acknowledge with: tauceti-fleet attention --ack <PR number> | all")
+    if any("_path" in d for d in items):
+        print("acknowledge with: tauceti-fleet attention --ack <PR number> | all")
+    if any(d.get("kind") == "targets-undecided" for d in items):
+        print(f"the target list's questions clear when you settle the items in {TARGETS}")
     return 0
 
 
