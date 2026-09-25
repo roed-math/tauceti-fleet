@@ -1753,6 +1753,12 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
         ensure_cache_proxy_alive(quiet, start=not getattr(a, "dry_run", False))
         if not getattr(a, "dry_run", False):
             ensure_periodic(quiet)
+            # A round that ended before publishing anything (the agent declined, the build broke) leaves
+            # a ledger entry with every step still pending, parked `interrupted`. It records no remote
+            # state, so archive it (never delete) rather than let hundreds pile up in the gate status.
+            pr_ = tauceti("gate", "publication", "prune", capture=True)
+            if pr_.returncode == 0 and not quiet and "archived 0 " not in (pr_.stdout or ""):
+                print((pr_.stdout or "").strip())
         if not changed or not apply:
             honor_restart_request(quiet)
             return 0
