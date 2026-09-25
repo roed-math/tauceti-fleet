@@ -988,17 +988,61 @@ ACKED = INCIDENTS / "acked"
 
 
 def attention_items() -> list[dict]:
-    """Unacknowledged incidents, newest last."""
+    """Unacknowledged incidents, newest last, plus the target list's open questions.
+
+    A curator record (`targets-updated`) is a report, not a question, so it never needs acknowledging;
+    the only part of it that needs the owner is its `undecided` list, which is shown as one live item
+    (see targets_undecided) that clears by itself once those items are settled."""
     items = []
     if not INCIDENTS.is_dir():
         return items
     for p in sorted(INCIDENTS.glob("*.json")):
         d = read_json(p)
-        if d.get("kind"):
+        if d.get("kind") and d.get("kind") != "targets-updated":
             d["_path"] = p
             items.append(d)
     items.sort(key=lambda d: str(d.get("last_at") or ""))
+    undecided = targets_undecided()
+    if undecided:
+        items.append({"kind": "targets-undecided", "key": "targets", "worker": PERIODIC_WID,
+                      "last_at": undecided[0][0], "summary": "\n".join(n for _t, n in undecided),
+                      "slugs": [n.split("`")[1] for _t, n in undecided if n.count("`") >= 2]})
     return items
+
+
+def targets_undecided() -> list[tuple[str, str]]:
+    """The curator's open questions that are still open: from its newest record (live or archived),
+    the notes whose item is still in the state the curator asked about. A closed-PR question lasts
+    while the item is still `[~]`; a declined-target question while the item is open and its decline
+    record has not been deleted. [(recorded_at, note)]."""
+    newest = None
+    for folder in (INCIDENTS, INCIDENTS / "acked"):
+        for f in folder.glob("targets-updated-*.json") if folder.is_dir() else []:
+            d = read_json(f)
+            if newest is None or str(d.get("last_at") or "") > str(newest.get("last_at") or ""):
+                newest = d
+    if not newest or not newest.get("undecided") or not TARGETS.is_file():
+        return []
+    try:
+        t = load_targets(TARGETS)
+    except (Exception, SystemExit):
+        return []
+    status = {it.slug: it.status for items in t.areas.values() for it in items}
+    declined = {f.stem.split("-", 3)[-1] for folder in (INCIDENTS, INCIDENTS / "acked") if folder.is_dir()
+                for f in folder.glob("declined-roadmap-*.json")}
+    out = []
+    for note in newest["undecided"]:
+        m = re.match(r"`([^`]+)`", str(note))
+        if not m:
+            continue
+        slug = m.group(1)
+        if "declined it" in note:
+            still = status.get(slug) == "open" and any(d.endswith(slug) for d in declined)
+        else:
+            still = status.get(slug) == "inflight"
+        if still:
+            out.append((str(newest.get("last_at") or ""), str(note)))
+    return out
 
 
 def attention_line(d: dict, width: int = 150) -> str:
@@ -1009,6 +1053,9 @@ def attention_line(d: dict, width: int = 150) -> str:
     if by:
         tag += ("→ " if d.get("subsumed_by") else "mentions ") + " ".join(f"#{n}" for n in by[:3]) + " "
     kind = d.get("kind")
+    if kind == "targets-undecided":
+        slugs = d.get("slugs") or []
+        return (f"target list: {len(slugs)} item(s) await your decision: " + ", ".join(slugs))[:width]
     what = d.get("summary") if kind == "declined" else (d.get("detail") or d.get("reason") or kind)
     what = " ".join(str(what or "").split())
     head = f"{pr} {d.get('stage') or kind} {d.get('worker', '-')} {when}Z {tag}"
@@ -1341,6 +1388,8 @@ def cmd_attention(a: argparse.Namespace) -> int:
         n = 0
         for d in items:
             key = str(d.get("pr") or "")
+            if "_path" not in d:
+                continue  # a live question (the target list's), not a record: it clears when answered
             if a.ack == "all" or a.ack == key or a.ack == d.get("key"):
                 d["_path"].rename(ACKED / d["_path"].name)
                 n += 1
