@@ -465,8 +465,9 @@ def authors_idle(statuses: dict[str, dict]) -> bool:
     hook_wid, hook_rc = os.environ.get("TAUCETI_ROUND_WID", ""), os.environ.get("TAUCETI_ROUND_RC", "")
 
     def idle(wid: str, st: dict) -> bool:
-        between = hook_rc == "75" if wid == hook_wid else st.get("state") != "running"
-        return between and bool(_AUTHOR_IDLE_RE.search(str(st.get("failure_reason") or "")))
+        if wid == hook_wid:
+            return hook_rc == "75"  # its recorded reason is the previous round's; the exit code is this one's
+        return st.get("state") != "running" and bool(_AUTHOR_IDLE_RE.search(str(st.get("failure_reason") or "")))
 
     authors = [(wid, st) for wid, st in statuses.items()
                if re.fullmatch(rf"{re.escape(NAME)}-[cx]\d+", wid) and wid not in off]
