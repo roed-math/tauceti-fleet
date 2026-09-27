@@ -1507,7 +1507,9 @@ def build_view(progress: Progress, console=None):
         candidates.append(Path(os.environ["XDG_RUNTIME_DIR"]) / "tauceti")
     candidates += [Path(f"/run/user/{uid}/tauceti"), Path(f"/tmp/tauceti-{uid}")]
     mgr_alive = any((c / "manager.sock").exists() for c in candidates)
-    healthy = sum(1 for w in ids if health(statuses.get(w, {}))[1] == "green")
+    _off = set(re.findall(r'^id\s*=\s*"([^"]+)"\s*\nenabled\s*=\s*false', CONFIG.read_text() if CONFIG.is_file() else "", re.M))
+    enabled_ids = [w for w in ids if w not in _off]  # disabled workers are neither healthy nor unhealthy
+    healthy = sum(1 for w in enabled_ids if health(statuses.get(w, {}))[1] == "green")
 
     t = Table(title=None, expand=True, pad_edge=False)
     for col in ("worker", "agent", "health", "phase / target", "last log line", "act", "next"):
@@ -1611,7 +1613,8 @@ def build_view(progress: Progress, console=None):
 
     header = Text.assemble(
         (f" {datetime.now():%Y-%m-%d %H:%M:%S} ", "bold"),
-        (f" workers {healthy}/{len(ids)} healthy ", "green" if healthy == len(ids) and ids else "yellow"),
+        (f" workers {healthy}/{len(enabled_ids)} healthy{f' ({len(ids) - len(enabled_ids)} off)' if len(enabled_ids) < len(ids) else ''} ",
+         "green" if healthy == len(enabled_ids) and enabled_ids else "yellow"),
         (f" manager {'up' if mgr_alive else 'not seen'} ", "green" if mgr_alive else "red"),
         (f" disk free {free_gb:.0f} GB ", "red" if free_gb < 40 else "yellow" if free_gb < 80 else "green"),
         *([(f" needs you {len(needs)} ", "bold red")] if needs else []),
