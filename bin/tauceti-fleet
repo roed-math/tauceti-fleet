@@ -452,12 +452,17 @@ _AUTHOR_IDLE_RE = re.compile(r"nothing to author|not authoring outside the list|
 
 
 def authors_idle(statuses: dict[str, dict]) -> bool:
-    """Every ENABLED author's latest round ended with nothing to author (and it is waiting to retry).
-    Disabled authors are not asked: while idle, only the probe runs, and its next real round (a target
-    opens up, a PR merges and makes room) ends idleness at the following reconcile."""
+    """Every ENABLED author's latest round ended with nothing to author, and none is in a round now.
+    Authors the config has turned off are not asked (their status files still describe their last
+    loop, "loop terminated"): while idle only the probe runs, and its next real round (a target opens
+    up, a merge makes room) ends idleness at the following reconcile. A probe between rounds —
+    surveying, backing off — is still idle; only a round in progress says otherwise."""
+    cfg = CONFIG.read_text() if CONFIG.is_file() else ""
+    off = set(re.findall(r'^id\s*=\s*"([^"]+)"\s*\nenabled\s*=\s*false', cfg, re.M))
     authors = [st for wid, st in statuses.items()
-               if re.fullmatch(rf"{re.escape(NAME)}-[cx]\d+", wid) and st.get("state") not in (None, "disabled", "stopped")]
-    return bool(authors) and all(st.get("state") == "backoff" and _AUTHOR_IDLE_RE.search(str(st.get("failure_reason") or ""))
+               if re.fullmatch(rf"{re.escape(NAME)}-[cx]\d+", wid) and wid not in off]
+    return bool(authors) and all(st.get("state") != "running"
+                                 and _AUTHOR_IDLE_RE.search(str(st.get("failure_reason") or ""))
                                  for st in authors)
 
 
@@ -1919,13 +1924,15 @@ def _shape_from_config(a: argparse.Namespace) -> argparse.Namespace:
     a.reads_per_hour = int(setting("gate", "reads_per_hour") or (m.group(1) if m else 600))
     # The models are the config's, not this version's defaults: a reconcile must not undo the model
     # the owner chose with `up`.
-    for k, var, d in (("claude_model", "TAUCETI_AUTHORING_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
-                      ("claude_effort", "TAUCETI_AUTHORING_CLAUDE_EFFORT", DEFAULT_CLAUDE_EFFORT),
-                      ("codex_model", "TAUCETI_AUTHORING_CODEX_MODEL", ""),
-                      ("codex_effort", "TAUCETI_AUTHORING_CODEX_EFFORT", "")):
+    # A model named in fleet.toml wins (so switching is an edit and a reconcile); else the model `up`
+    # wrote into the config; else this version's default.
+    for k, var, key, d in (("claude_model", "TAUCETI_AUTHORING_CLAUDE_MODEL", "claude", DEFAULT_CLAUDE_MODEL),
+                           ("claude_effort", "TAUCETI_AUTHORING_CLAUDE_EFFORT", "claude_effort", DEFAULT_CLAUDE_EFFORT),
+                           ("codex_model", "TAUCETI_AUTHORING_CODEX_MODEL", "codex", ""),
+                           ("codex_effort", "TAUCETI_AUTHORING_CODEX_EFFORT", "codex_effort", "")):
         if not getattr(a, k, None):
             m = re.search(rf'^{var}\s*=\s*"([^"]*)"', t, re.M)
-            setattr(a, k, (m.group(1) if m else "") or d)
+            setattr(a, k, setting("models", key) or (m.group(1) if m else "") or d)
     return a
 
 
