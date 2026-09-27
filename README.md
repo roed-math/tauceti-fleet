@@ -57,7 +57,7 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `up.sandbox` | `bubble` (egress-denied containers) or `host` | `init` writes `bubble` |
 | `up.pace` | the worker's pacing curve, `time%:budget%` points | the worker's own curve |
 | `up.claude`, `up.codex` | Claude authors, and `auto` authors (Codex first, then Claude) | 2 and 2; 1 and 0 in pilot mode |
-| `gate.mutations_per_hour`, `gate.reads_per_hour` | fleet-wide GitHub budgets, rolling hour | 40 and 600 |
+| `gate.mutations_per_hour`, `gate.reads_per_hour` | fleet-wide GitHub budgets, rolling hour; the reconcile after each round applies a change | 40 and 600 |
 | `models.claude`, `models.claude_effort` | the Claude model for every Claude round | `claude-opus-5-5`, `high` |
 | `progress.repo`, `progress.ref`, `progress.strategy` | which TauCetiProgress the progress rounds run, and how it picks a roadmap | the worker's pinned upstream |
 

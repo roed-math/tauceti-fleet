@@ -1911,8 +1911,12 @@ def _shape_from_config(a: argparse.Namespace) -> argparse.Namespace:
     a.pilot = 'TAUCETI_REACTIONS = "0"' in t
     a.sandbox = "bubble" if 'sandbox = "bubble"' in t else "host"
     a.pace = os.environ.get("TAUCETI_PACE", "") or (re.search(r'^pace\s*=\s*"([^"]+)"', t, re.M) or [None, ""])[1]
-    m = re.search(r'TAUCETI_GATE_MUTATIONS_PER_HOUR\s*=\s*"(\d+)"', t); a.mutations_per_hour = int(m.group(1)) if m else 40
-    m = re.search(r'TAUCETI_GATE_READS_PER_HOUR\s*=\s*"(\d+)"', t); a.reads_per_hour = int(m.group(1)) if m else 600
+    # The gate budgets follow the settings file when it names them, so raising one is an edit to
+    # fleet.toml and a reconcile, with no `up` (which would also re-apply every other default).
+    m = re.search(r'TAUCETI_GATE_MUTATIONS_PER_HOUR\s*=\s*"(\d+)"', t)
+    a.mutations_per_hour = int(setting("gate", "mutations_per_hour") or (m.group(1) if m else 40))
+    m = re.search(r'TAUCETI_GATE_READS_PER_HOUR\s*=\s*"(\d+)"', t)
+    a.reads_per_hour = int(setting("gate", "reads_per_hour") or (m.group(1) if m else 600))
     # The models are the config's, not this version's defaults: a reconcile must not undo the model
     # the owner chose with `up`.
     for k, var, d in (("claude_model", "TAUCETI_AUTHORING_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
