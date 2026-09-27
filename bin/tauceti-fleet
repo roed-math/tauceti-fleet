@@ -365,11 +365,19 @@ def wid(kind: str, i: int | None = None) -> str:
 def fleet_specs(a: argparse.Namespace) -> list[dict]:
     specs: list[dict] = []
     authors_on = getattr(a, "authors_enabled", True)
+    # While the authors have nothing to author (see authors_idle), only the first stays on, as the
+    # probe that notices when targets open up again; the others' slots go to fixing.
+    authors_active = getattr(a, "authors_active", None)
+    author_rank = [0]
 
     def add(wid: str, agent: str, only: str, **extra):
         # Authors stay in the config but disabled while upstream's backpressure rule (>= 8 open PRs of
         # mine) would make them decline every round anyway; keeping the definition keeps the checkout.
         enabled = authors_on if only == "roadmap" else True
+        if only == "roadmap":
+            author_rank[0] += 1
+            if authors_active is not None and author_rank[0] > authors_active:
+                enabled = False
         spec = {"id": wid, "enabled": enabled, "agent": agent, "only": only, "sandbox": extra.pop("sandbox", a.sandbox)}
         if a.pace:
             spec["pace"] = a.pace
@@ -435,6 +443,22 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
     # on a cadence (see `periodic`), from the reconcile hook and the live view, under the id
     # PERIODIC_WID, which holds a login chain like any worker.
     return specs
+
+
+# What an author's round says when there is nothing it may author: the target list offers nothing and
+# the account's open PRs leave no room outside it, or authoring is blocked outright.
+_AUTHOR_IDLE_RE = re.compile(r"nothing to author|not authoring outside the list|declined by an author|"
+                             r"no open targets|claimed by another worker", re.I)
+
+
+def authors_idle(statuses: dict[str, dict]) -> bool:
+    """Every ENABLED author's latest round ended with nothing to author (and it is waiting to retry).
+    Disabled authors are not asked: while idle, only the probe runs, and its next real round (a target
+    opens up, a PR merges and makes room) ends idleness at the following reconcile."""
+    authors = [st for wid, st in statuses.items()
+               if re.fullmatch(rf"{re.escape(NAME)}-[cx]\d+", wid) and st.get("state") not in (None, "disabled", "stopped")]
+    return bool(authors) and all(st.get("state") == "backoff" and _AUTHOR_IDLE_RE.search(str(st.get("failure_reason") or ""))
+                                 for st in authors)
 
 
 def reviewers_for(active_authors_and_fixers: int, max_reviewers: int = 2) -> int:
@@ -1808,9 +1832,16 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
             return 0
         want_fix = fixers_for(mine_open, backlog, a.max_fixers)
         authors_on = mine_open < MAX_OPEN_PRS_BACKPRESSURE
+        idle = authors_on and authors_idle(worker_status())
         a.authors_enabled = authors_on
+        # Authors with nothing to author (the list offers nothing and our open PRs leave no room outside
+        # it): keep one as a probe and turn the rest into fixing capacity for our own waiting PRs, which
+        # are what would open the list up again (owner's ruling, 2026-09-27).
+        a.authors_active = 1 if idle else None
+        if idle:
+            want_fix = max(want_fix, min(a.max_fixers, backlog))
         a.fixers = want_fix
-        active = want_fix + ((a.claude + a.codex) if authors_on else 0)
+        active = want_fix + ((1 if idle else a.claude + a.codex) if authors_on else 0)
         a.reviewers = reviewers_for(active, getattr(a, "max_reviewers", 2))
         dry = bool(getattr(a, "dry_run", False))
         specs = lease_logins(fleet_specs(a), persist=not dry)
@@ -1821,7 +1852,8 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
                 print(note)
         verdict = ("would change" if dry else "updated") if changed else "unchanged"
         line = (f"reconcile: mine_open={mine_open} awaiting-author={backlog} [{source}] → "
-                f"authors {'on' if authors_on else 'off (backpressure ≥ 8)'}, fixers {want_fix}, reviewers {a.reviewers}; "
+                f"authors {('idle: 1 probe' if idle else 'on') if authors_on else 'off (backpressure ≥ 8)'}, "
+                f"fixers {want_fix}, reviewers {a.reviewers}; "
                 f"config {verdict}")
         if deferred:
             line += f"; deferred (mid-round): {', '.join(deferred)}"
