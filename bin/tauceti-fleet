@@ -162,8 +162,11 @@ def worker_env() -> dict[str, str]:
     # workers' budgets, so they must use the workers' NUMBERS: read them from the fleet config the
     # wrapper wrote (a hard-coded 600 here once made `gate status` print
     # 702/600 and refused the wrapper's own reads while the workers still had headroom).
+    # The fleet's configured numbers win over the shell's: an old `export` in a login profile must not
+    # make the wrapper count against a different budget than the workers (2026-09-27: the view showed
+    # 1200 after the fleet had been raised to 1500).
     for var, default in (("TAUCETI_GATE_MUTATIONS_PER_HOUR", "40"), ("TAUCETI_GATE_READS_PER_HOUR", "600")):
-        env.setdefault(var, _config_env(var) or default)
+        env[var] = setting("gate", var.split("_GATE_")[1].lower()) or _config_env(var) or env.get(var) or default
     return env
 
 
