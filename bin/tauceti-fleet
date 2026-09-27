@@ -459,11 +459,18 @@ def authors_idle(statuses: dict[str, dict]) -> bool:
     surveying, backing off — is still idle; only a round in progress says otherwise."""
     cfg = CONFIG.read_text() if CONFIG.is_file() else ""
     off = set(re.findall(r'^id\s*=\s*"([^"]+)"\s*\nenabled\s*=\s*false', cfg, re.M))
-    authors = [st for wid, st in statuses.items()
+    # The round-done hook runs before the loop records the round it just finished, so the hook's own
+    # author still reads "running": for it, the round's exit code says whether it was busy (75 = no
+    # progress). Without this, every author's own hook re-enabled every author.
+    hook_wid, hook_rc = os.environ.get("TAUCETI_ROUND_WID", ""), os.environ.get("TAUCETI_ROUND_RC", "")
+
+    def idle(wid: str, st: dict) -> bool:
+        between = hook_rc == "75" if wid == hook_wid else st.get("state") != "running"
+        return between and bool(_AUTHOR_IDLE_RE.search(str(st.get("failure_reason") or "")))
+
+    authors = [(wid, st) for wid, st in statuses.items()
                if re.fullmatch(rf"{re.escape(NAME)}-[cx]\d+", wid) and wid not in off]
-    return bool(authors) and all(st.get("state") != "running"
-                                 and _AUTHOR_IDLE_RE.search(str(st.get("failure_reason") or ""))
-                                 for st in authors)
+    return bool(authors) and all(idle(wid, st) for wid, st in authors)
 
 
 def reviewers_for(active_authors_and_fixers: int, max_reviewers: int = 2) -> int:
