@@ -1028,8 +1028,10 @@ def targets_undecided() -> list[tuple[str, str]]:
     except (Exception, SystemExit):
         return []
     status = {it.slug: it.status for items in t.areas.values() for it in items}
+    # Declines still waiting on a decision: not settled by the curator (done, or handed back).
     declined = {f.stem.split("-", 3)[-1] for folder in (INCIDENTS, INCIDENTS / "acked") if folder.is_dir()
-                for f in folder.glob("declined-roadmap-*.json")}
+                for f in folder.glob("declined-roadmap-*.json")
+                if read_json(f).get("curator") not in ("landed", "not-landed")}
     out = []
     for note in newest["undecided"]:
         m = re.match(r"`([^`]+)`", str(note))
