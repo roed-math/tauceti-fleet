@@ -1512,14 +1512,24 @@ def build_view(progress: Progress, console=None):
     t = Table(title=None, expand=True, pad_edge=False)
     for col in ("worker", "agent", "health", "phase / target", "last log line", "act", "next"):
         t.add_column(col, overflow="ellipsis", no_wrap=True, ratio=3 if col == "last log line" else None)
+    cfg_text = CONFIG.read_text() if CONFIG.is_file() else ""
+    disabled = set(re.findall(r'^id\s*=\s*"([^"]+)"\s*\nenabled\s*=\s*false', cfg_text, re.M))
+    # Why the reconcile turned authors off: the account's open-PR count (freshest survey) at the
+    # project's cap, or else the idle-author rule (one probe author, the rest's slots to fixing).
+    newest = max((s_ for s_ in statuses.values() if isinstance(s_.get("mine_open"), int)),
+                 key=lambda s_: s_.get("survey_at") or 0, default={})
+    off_reason = "backpressure" if (newest.get("mine_open") or 0) >= MAX_OPEN_PRS_BACKPRESSURE else "authors idle"
     for w in ids:
         st = statuses.get(w, {})
         label, style = health(st)
-        if not st and re.search(rf'^id\s*=\s*"{re.escape(w)}"\s*\nenabled\s*=\s*false', CONFIG.read_text() if CONFIG.is_file() else "", re.M):
-            label, style = "disabled (backpressure)", "dim"
         phase = st.get("phase") or ""
         target = st.get("target") or ""
         what = f"{phase} {target}".strip() or (st.get("detail") or "")
+        if w in disabled:
+            # Turned off by the reconcile, not failed: the manager stops it with SIGTERM (rc=143), and
+            # its status file still describes the last loop.
+            label, style = f"disabled ({off_reason})", "dim"
+            what = "turned off by the reconcile"
         agent = st.get("agent", "") or ("claude" if re.fullmatch(rf"{re.escape(NAME)}-(c\d+|fix\d*[13579])", w) else "auto")
         m = re.search(r"provider=(\w+)", st.get("detail") or "") if agent == "auto" else None
         if m and st.get("state") in ("running", "surveying"):
