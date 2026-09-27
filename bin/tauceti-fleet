@@ -1148,14 +1148,37 @@ def periodic_enabled(stage: str) -> bool:
     return stage == "curate" or (periodic_dir() / f"{stage}.enabled").is_file()
 
 
+# An author's decline ("main already has this") leaves its target skipped until the curator settles
+# it, and on a stale list most eligible targets get declined in turn: waiting out the six-hour cadence
+# left the whole fleet idle (2026-09-27). A decline newer than the last curate run makes it due, at
+# most this often.
+CURATE_ON_DECLINE_GAP = 20 * 60
+
+
+def _decline_since(t: float) -> bool:
+    """A live authoring decline recorded after `t`. By the decline's own time (`last_at`), not the file's:
+    the curator annotates records it cannot settle, and must not re-trigger itself by doing so."""
+    for f in INCIDENTS.glob("declined-roadmap-*.json") if INCIDENTS.is_dir() else []:
+        at = str(read_json(f).get("last_at") or "")
+        try:
+            if datetime.strptime(at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() > t:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def periodic_due(stage: str) -> bool:
     if not periodic_enabled(stage):
         return False
     last = periodic_dir() / f"{stage}.last"
     try:
-        return time.time() - last.stat().st_mtime >= PERIODIC[stage]
+        at = last.stat().st_mtime
     except OSError:
         return True
+    if time.time() - at >= PERIODIC[stage]:
+        return True
+    return stage == "curate" and time.time() - at >= CURATE_ON_DECLINE_GAP and _decline_since(at)
 
 
 def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
@@ -1224,6 +1247,9 @@ def run_periodic(stage: str, *, quiet: bool = True, force: bool = False) -> str:
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f"{stage}-{datetime.now():%Y%m%d-%H%M%S}.log"
     (periodic_dir() / f"{stage}.last").touch()
+    # The round's own attempt gap is the worker's second line of defence against over-running; the
+    # wrapper has just decided this run is due (by the clock or by a decline), so clear it.
+    (WORKTREE / "state" / PERIODIC_WID / f"{stage}-attempt-ts").unlink(missing_ok=True)
     argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", stage, "--worker-id", PERIODIC_WID,
             "--author-model", periodic_env().get("TAUCETI_AUTHORING_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
             "--author-effort", periodic_env().get("TAUCETI_AUTHORING_CLAUDE_EFFORT", "high"),
