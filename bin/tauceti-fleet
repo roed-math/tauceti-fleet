@@ -1224,6 +1224,24 @@ def _ours_closed_since() -> bool:
     return isinstance(now, int) and isinstance(then, int) and now < then
 
 
+def _blocker_closed() -> bool:
+    """A target held because its author found it blocked on an open PR, whose PR is no longer in the
+    fleet's (fresh) open-PR listing: it merged or closed, so the curator can hand the target back.
+    Local only: the listing the workers already share."""
+    listing = next(iter(sorted((GATE_DIR / "cache").glob("open_prs-*.json"))), None) if (GATE_DIR / "cache").is_dir() else None
+    c = read_json(listing) if listing else {}
+    if not isinstance(c.get("fetched_at"), (int, float)) or time.time() - c["fetched_at"] > 900:
+        return False
+    open_numbers = {pr.get("number") for pr in c.get("prs") or []}
+    for folder in (INCIDENTS, INCIDENTS / "acked"):
+        for f in folder.glob("declined-roadmap-*.json") if folder.is_dir() else []:
+            rec = read_json(f)
+            n = rec.get("blocked_on")
+            if isinstance(n, int) and rec.get("curator") not in ("landed", "not-landed") and n not in open_numbers:
+                return True
+    return False
+
+
 def periodic_due(stage: str) -> bool:
     if not periodic_enabled(stage):
         return False
@@ -1234,7 +1252,7 @@ def periodic_due(stage: str) -> bool:
         return True
     if time.time() - at >= PERIODIC[stage]:
         return True
-    return stage == "curate" and time.time() - at >= CURATE_ON_DECLINE_GAP and (_decline_since(at) or _ours_closed_since())
+    return stage == "curate" and time.time() - at >= CURATE_ON_DECLINE_GAP and (_decline_since(at) or _ours_closed_since() or _blocker_closed())
 
 
 def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
