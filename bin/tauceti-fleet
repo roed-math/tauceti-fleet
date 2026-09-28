@@ -1208,6 +1208,22 @@ def _decline_since(t: float) -> bool:
     return False
 
 
+def _mine_open_now() -> int | None:
+    """Our open-PR count from the freshest worker survey (status files), or None."""
+    best = max((read_json(f) for f in STATE.glob("*.json")) if STATE.is_dir() else [],
+               key=lambda d: d.get("survey_at") or 0, default={})
+    v = best.get("mine_open")
+    return v if isinstance(v, int) else None
+
+
+def _ours_closed_since() -> bool:
+    """One of our PRs merged or closed since the last curate run (our open count went down). A merged
+    target PR is done, and until the curator writes it into the list the view counts its item as
+    available (2026-09-27: four merged items shown as available for over an hour)."""
+    now, then = _mine_open_now(), read_json(periodic_dir() / "curate.mine_open").get("n")
+    return isinstance(now, int) and isinstance(then, int) and now < then
+
+
 def periodic_due(stage: str) -> bool:
     if not periodic_enabled(stage):
         return False
@@ -1218,7 +1234,7 @@ def periodic_due(stage: str) -> bool:
         return True
     if time.time() - at >= PERIODIC[stage]:
         return True
-    return stage == "curate" and time.time() - at >= CURATE_ON_DECLINE_GAP and _decline_since(at)
+    return stage == "curate" and time.time() - at >= CURATE_ON_DECLINE_GAP and (_decline_since(at) or _ours_closed_since())
 
 
 def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
@@ -1287,6 +1303,8 @@ def run_periodic(stage: str, *, quiet: bool = True, force: bool = False) -> str:
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f"{stage}-{datetime.now():%Y%m%d-%H%M%S}.log"
     (periodic_dir() / f"{stage}.last").touch()
+    if stage == "curate":  # what "our open count went down since the last run" is measured against
+        (periodic_dir() / "curate.mine_open").write_text(json.dumps({"n": _mine_open_now()}))
     # The round's own attempt gap is the worker's second line of defence against over-running; the
     # wrapper has just decided this run is due (by the clock or by a decline), so clear it.
     (WORKTREE / "state" / PERIODIC_WID / f"{stage}-attempt-ts").unlink(missing_ok=True)
