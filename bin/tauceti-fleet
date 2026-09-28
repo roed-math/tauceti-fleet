@@ -2309,10 +2309,10 @@ def cmd_restart(a: argparse.Namespace) -> int:
         st = statuses.get(wid, {})
         if a.when_idle and mid_round(st):
             restart_when_idle(wid)
-            print(f"{wid}: mid-round ({st.get('phase')} {st.get('target', '')[:24]}) — will restart when this round ends")
+            print(f"{wid}: mid-round ({st.get('phase') or ''} {(st.get('target') or '')[:24]}) — will restart when this round ends")
             continue
         if mid_round(st) and not a.force:
-            print(f"{wid}: mid-round ({st.get('phase')} {st.get('target', '')[:24]}) — skipped; --force to restart anyway, --when-idle to queue it")
+            print(f"{wid}: mid-round ({st.get('phase') or ''} {(st.get('target') or '')[:24]}) — skipped; --force to restart anyway, --when-idle to queue it")
             continue
         r = tauceti("workers", "--config", str(CONFIG), "restart", wid, capture=True)
         print(f"{wid}: {'restarted' if r.returncode == 0 else 'restart failed: ' + (r.stderr or r.stdout).strip()[-120:]}")
