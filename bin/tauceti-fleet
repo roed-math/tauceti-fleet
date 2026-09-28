@@ -1502,6 +1502,65 @@ def cmd_attention(a: argparse.Namespace) -> int:
     return 0
 
 
+# Quarantines that are the permanent, expected state of this fleet rather than a fault: the review
+# engine's archive push to TauCetiData (maintainers only; reviews post and count regardless, the records
+# stay local). Shown nowhere; any other quarantine is still shown.
+EXPECTED_QUARANTINES = {"sync:taucetiproject/taucetidata"}
+
+
+def _gate_part_for_view(part: str) -> str:
+    """One `gate status` fact as the view shows it: expected quarantines dropped, the login named as gh's."""
+    if part.startswith("quarantined:"):
+        rest = [q.strip() for q in part[len("quarantined:"):].split(",") if q.strip()]
+        rest = [q for q in rest if q.lower() not in EXPECTED_QUARANTINES]
+        return f"quarantined: {', '.join(rest)}" if rest else ""
+    if part.startswith("login "):
+        return "gh login: " + part[len("login "):]
+    return part
+
+
+def target_list_summary() -> str:
+    """The target list at a glance, from local data only: the list file, the fleet's shared open-PR
+    listing (which the workers refresh each minute they survey; an open PR's marker puts its item in
+    flight) and the authors' decline records (a declined target is held until the curator settles it).
+    Available = what an author could take now; unavailable = open items that wait on prerequisites,
+    or are held."""
+    try:
+        t = load_targets(TARGETS)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - a view line, not a check
+        return f"unreadable ({exc})"
+    listed = {(a, it.slug) for a, items in t.areas.items() for it in items}
+    inflight: set = set()
+    note = ""
+    listing = next(iter(sorted((GATE_DIR / "cache").glob("open_prs-*.json"))), None) if (GATE_DIR / "cache").is_dir() else None
+    if listing is not None:
+        c = read_json(listing)
+        for pr in c.get("prs") or []:
+            inflight.update(target_marker_ids(pr.get("body") or ""))
+        at = c.get("fetched_at")
+        if isinstance(at, (int, float)) and time.time() - at > 900:
+            note = f" (open PRs as of {age(at)} ago)"
+    live = overlay_live(t, inflight & listed, set())
+    held = set()
+    for folder in (INCIDENTS, INCIDENTS / "acked"):
+        for f in folder.glob("declined-roadmap-*.json") if folder.is_dir() else []:
+            rec = read_json(f)
+            tgt = rec.get("target")
+            if isinstance(tgt, str) and "/" in tgt and rec.get("curator") not in ("landed", "not-landed"):
+                held.add(tgt.split("/", 1)[1])
+    status = [(a, it) for a, items in live.areas.items() for it in items]
+    done = sum(1 for _, it in status if it.status == "done")
+    flight = sum(1 for _, it in status if it.status == "inflight")
+    eligible = {it.slug for a in live.areas for it in eligible_items(live, a)}
+    available = len(eligible - held)
+    open_n = sum(1 for _, it in status if it.status == "open")
+    held_n = len({s for s in held if s in eligible})
+    waiting = open_n - len(eligible)
+    unavailable = waiting + held_n
+    return (f"{done} done · {flight} in flight · {available} available · {unavailable} unavailable "
+            f"({waiting} wait on prerequisites, {held_n} held by a decline){note}")
+
+
 def build_view(progress: Progress, console=None):
     from rich.console import Group
     from rich.panel import Panel
@@ -1576,6 +1635,7 @@ def build_view(progress: Progress, console=None):
         raw = (g.stdout.strip().splitlines() or [g.stderr.strip()])[-1]
         # One fact per line: "gate: RUNNING; mutations 0/20 per min, 0/40 per h; reads ...; push ...; login ...; publications ..."
         parts = [part.strip() for part in raw.replace("gate: ", "", 1).split(";") if part.strip()]
+        parts = [q for q in (_gate_part_for_view(x) for x in parts) if q]
         # The ledger lists every parked publication; after a bad afternoon that is dozens of lines and
         # pushes the events panel off the screen. Keep the newest three and a count.
         parked = [x for x in parts if x.startswith("parked:")]
@@ -1600,7 +1660,8 @@ def build_view(progress: Progress, console=None):
         p.add_row("my open PRs", f"{d.get('mine_open', 0)} of {d.get('open_total', 0)} open — " + ", ".join(f"{k} {v}" for k, v in sorted(lab.items())))
         claims = d.get("claims") or []
         p.add_row("claims held", ", ".join(claims) if claims else "none")
-    if d.get("error"):
+    p.add_row("target list", Text(target_list_summary(), overflow="fold"))
+    if progress.remote_ok and d.get("error"):
         p.add_row(Text("progress", style="yellow"), Text(f"partial: {d['error']}", style="yellow"))
     p.add_row("gate", Text(gate_line, style="red" if "HALTED" in gate_line else "yellow" if "COOLDOWN" in gate_line else "", overflow="fold"))
     if halts:
@@ -1625,7 +1686,8 @@ def build_view(progress: Progress, console=None):
     p.add_row("usage", usage_text())
     p.add_row("credentials", Text.assemble(*[(t + "   ", st) for t, st in progress.creds]))
     p.add_row("mathlib pool", Text(pool_line(), overflow="fold"))
-    p.add_row("refreshed", f"{age(progress.at)} ago (every {progress.ttl // 60} min)")
+    if progress.remote_ok:  # the GitHub panel; without --refresh it never runs, so there is nothing to date
+        p.add_row("refreshed", f"{age(progress.at)} ago (every {progress.ttl // 60} min)")
 
     header = Text.assemble(
         (f" {datetime.now():%Y-%m-%d %H:%M:%S} ", "bold"),
