@@ -1852,7 +1852,7 @@ def cmd_up(a: argparse.Namespace) -> int:
         for wid, note in zip(todo, pool.map(preseed, todo)):
             print(f"checkout {wid}: {note}")
     # Shape the fleet to the backlog before the first start: authors off under backpressure, fixers
-    # sized to awaiting-author. From here on every finished round re-runs this through the hook.
+    # sized to the fix backlog. From here on every finished round re-runs this through the hook.
     reconcile(a, apply=False, quiet=False)
     if a.dry_run:
         print("dry run: not starting the manager")
@@ -1906,32 +1906,42 @@ MAX_OPEN_PRS_SETTING = _setting_int("authoring", "max_open_prs")
 MAX_OPEN_PRS_BACKPRESSURE = MAX_OPEN_PRS_SETTING or 8
 
 
-def fixers_for(mine_open: int, awaiting_author: int, max_fixers: int = 3) -> int:
-    """How many fix workers the backlog deserves. While mine_open >= MAX_OPEN_PRS_BACKPRESSURE
-    authoring cannot happen (the worker's backpressure rule), so every worker slot should fix:
-    max_fixers. Below that the awaiting-author count decides: 6 or more -> 2, fewer -> 1. Never more
-    fixers than there are PRs to
-    fix (an idle fixer still surveys each round), never fewer than 1. Fixers share the fleet-wide
-    mutation budget, so the count changes who spends it, not how much GitHub traffic there is."""
-    if mine_open >= MAX_OPEN_PRS_BACKPRESSURE:
+# A backlog this large gets every fixer even while authors run. It was the old backpressure point, so
+# raising authoring.max_open_prs does not also take away the third fixer that point used to bring.
+FULL_FIX_BACKLOG = 8
+# The status labels a fix worker has work on: review findings (fix) and red builds (fix-ci).
+FIX_LABELS = {"awaiting-author", "ci-failed"}
+
+
+def fixers_for(mine_open: int, backlog: int, max_fixers: int = 3) -> int:
+    """How many fix workers the backlog (my PRs in FIX_LABELS) deserves. While mine_open >=
+    MAX_OPEN_PRS_BACKPRESSURE authoring cannot happen (the worker's backpressure rule), so every worker
+    slot should fix: max_fixers; the same once the backlog reaches FULL_FIX_BACKLOG. Below that: 6 or
+    more -> 2, fewer -> 1. Never more fixers than there are PRs to fix (an idle fixer still surveys
+    each round), never fewer than 1. Fixers share the fleet-wide mutation budget, so the count changes
+    who spends it, not how much GitHub traffic there is."""
+    if mine_open >= MAX_OPEN_PRS_BACKPRESSURE or backlog >= FULL_FIX_BACKLOG:
         want = max_fixers
-    elif awaiting_author >= 6:
+    elif backlog >= 6:
         want = 2
     else:
         want = 1
-    return max(1, min(want, max_fixers, awaiting_author))
+    return max(1, min(want, max_fixers, backlog))
 
 
 def fleet_backlog(max_age_s: int = 7200) -> tuple[int | None, int | None, str]:
-    """(mine_open, mine_awaiting_author, source): the freshest counts any worker's last survey left in
-    its status file, if younger than max_age_s; else one gated read of my open PRs; else (None, None)."""
+    """(mine_open, fix backlog, source): the freshest counts any worker's last survey left in its
+    status file, if younger than max_age_s; else one gated read of my open PRs; else (None, None).
+    The backlog is `mine_needs_fix` (awaiting-author or ci-failed); a status file written before
+    workers reported it falls back to `mine_awaiting_author`."""
     best = None
     if STATE.is_dir():
         for f in STATE.glob("*.json"):
             d = read_json(f)
             at = d.get("survey_at")
             if at and d.get("mine_open") is not None and (best is None or at > best[0]):
-                best = (at, int(d["mine_open"]), int(d.get("mine_awaiting_author") or 0), f.stem)
+                backlog = d.get("mine_needs_fix", d.get("mine_awaiting_author"))
+                best = (at, int(d["mine_open"]), int(backlog or 0), f.stem)
     if best and time.time() - best[0] < max_age_s:
         return best[1], best[2], f"status of {best[3]} ({age(best[0])} ago)"
     p = subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "admit", "api_read", "pr-list", TAUCETI],
@@ -1946,7 +1956,7 @@ def fleet_backlog(max_age_s: int = 7200) -> tuple[int | None, int | None, str]:
     if q.returncode != 0:
         return None, None, f"gh pr list failed: {q.stderr.strip()[-120:]}"
     prs = json.loads(q.stdout or "[]")
-    backlog = sum(1 for pr in prs if any(lb.get("name") == "awaiting-author" for lb in pr.get("labels") or []))
+    backlog = sum(1 for pr in prs if FIX_LABELS & {lb.get("name") for lb in pr.get("labels") or []})
     return len(prs), backlog, "one gated read"
 
 
@@ -1987,8 +1997,8 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
             if note:
                 print(note)
         verdict = ("would change" if dry else "updated") if changed else "unchanged"
-        line = (f"reconcile: mine_open={mine_open} awaiting-author={backlog} [{source}] → "
-                f"authors {('idle: 1 probe' if idle else 'on') if authors_on else 'off (backpressure ≥ 8)'}, "
+        line = (f"reconcile: mine_open={mine_open} needs-fix={backlog} [{source}] → "
+                f"authors {('idle: 1 probe' if idle else 'on') if authors_on else f'off (backpressure ≥ {MAX_OPEN_PRS_BACKPRESSURE})'}, "
                 f"fixers {want_fix}, reviewers {a.reviewers}; "
                 f"config {verdict}")
         if deferred:
