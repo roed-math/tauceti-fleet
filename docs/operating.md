@@ -10,10 +10,11 @@ reconcile reads the counts that round's survey left behind, so it costs no GitHu
 reshapes the fleet:
 
 - **Authors** (`<name>-c*` pinned to Claude, `<name>-x*` running `auto`) are enabled only while the
-  fleet's account has fewer than 8 open PRs in scope. At 8 or more the worker's own backpressure rule
-  would make them decline every round, so they stay defined but disabled.
+  fleet's account has fewer than `authoring.max_open_prs` open PRs in scope (the worker's default is
+  8). At that many or more the worker's own backpressure rule would make them decline every round, so
+  they stay defined but disabled.
 - **Fixers** (`<name>-fix*`) run fix, fix-ci and rebase. There are 3 while authoring is blocked,
-  otherwise 2 with 6 or 7 PRs awaiting the author and 1 below that, never more than there are PRs to
+  otherwise 2 with 6 or more PRs awaiting the author and 1 below that, never more than there are PRs to
   fix. Odd-numbered fixers are pinned to Claude; even-numbered ones run `auto`.
 - **Reviewers** (`<name>-rev*`) run `auto`: 2 once two or more authors and fixers are active, else 1.
   Reviewing other people's PRs is what the fleet owes the project for the reviews its own PRs get.

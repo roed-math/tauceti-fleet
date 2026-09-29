@@ -374,8 +374,9 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
     author_rank = [0]
 
     def add(wid: str, agent: str, only: str, **extra):
-        # Authors stay in the config but disabled while upstream's backpressure rule (>= 8 open PRs of
-        # mine) would make them decline every round anyway; keeping the definition keeps the checkout.
+        # Authors stay in the config but disabled while the worker's backpressure rule (>=
+        # MAX_OPEN_PRS_BACKPRESSURE open PRs of mine) would make them decline every round anyway;
+        # keeping the definition keeps the checkout.
         enabled = authors_on if only == "roadmap" else True
         if only == "roadmap":
             author_rank[0] += 1
@@ -413,6 +414,8 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             "TAUCETI_GATE_REQUIRED": "1",
             "TAUCETI_GATE_MUTATIONS_PER_HOUR": str(a.mutations_per_hour),
             "TAUCETI_GATE_READS_PER_HOUR": str(a.reads_per_hour),
+            # Authoring backpressure, only when fleet.toml overrides the worker's default.
+            **({"TAUCETI_MAX_OPEN_PRS": str(MAX_OPEN_PRS_SETTING)} if MAX_OPEN_PRS_SETTING else {}),
             # Pilot mode interacts less on GitHub: no reactions, no automatic stuck-review issues.
             "TAUCETI_REACTIONS": "0" if a.pilot else "1",
             "TAUCETI_STUCK_ISSUES": "0" if a.pilot else "1",
@@ -1896,13 +1899,18 @@ def write_config(specs: list[dict], statuses: dict[str, dict] | None = None,
     return changed, switched, deferred
 
 
-MAX_OPEN_PRS_BACKPRESSURE = 8  # upstream's fixed rule: an author declines while >= 8 of my PRs are open
+# The worker's backpressure rule: an author declines while this many of my PRs are open. The worker's
+# own default is 8; `authoring.max_open_prs` overrides it, and then every worker is given the same
+# number as $TAUCETI_MAX_OPEN_PRS so the reconcile and the workers agree on when authoring can happen.
+MAX_OPEN_PRS_SETTING = _setting_int("authoring", "max_open_prs")
+MAX_OPEN_PRS_BACKPRESSURE = MAX_OPEN_PRS_SETTING or 8
 
 
 def fixers_for(mine_open: int, awaiting_author: int, max_fixers: int = 3) -> int:
-    """How many fix workers the backlog deserves. While mine_open >= 8 authoring cannot happen
-    (upstream's backpressure rule), so every worker slot should fix: max_fixers. Below that the
-    awaiting-author count decides: 6 or 7 -> 2, fewer -> 1. Never more fixers than there are PRs to
+    """How many fix workers the backlog deserves. While mine_open >= MAX_OPEN_PRS_BACKPRESSURE
+    authoring cannot happen (the worker's backpressure rule), so every worker slot should fix:
+    max_fixers. Below that the awaiting-author count decides: 6 or more -> 2, fewer -> 1. Never more
+    fixers than there are PRs to
     fix (an idle fixer still surveys each round), never fewer than 1. Fixers share the fleet-wide
     mutation budget, so the count changes who spends it, not how much GitHub traffic there is."""
     if mine_open >= MAX_OPEN_PRS_BACKPRESSURE:
@@ -1944,8 +1952,9 @@ def fleet_backlog(max_age_s: int = 7200) -> tuple[int | None, int | None, str]:
 
 def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
     """Set the fleet's shape from the backlog: authors enabled only when authoring can happen
-    (mine_open < 8), fixers by fixers_for (3 while authoring is impossible, else by backlog). Under a
-    lock, idempotent: the config is rewritten and applied only when the shape changed. Counts come
+    (mine_open < MAX_OPEN_PRS_BACKPRESSURE), fixers by fixers_for (3 while authoring is impossible,
+    else by backlog). Under a lock, idempotent: the config is rewritten and applied only when the
+    shape changed. Counts come
     from the workers' own status files; a GitHub read happens only when those are stale."""
     import fcntl
 
@@ -2457,6 +2466,10 @@ sandbox = "bubble"
 mutations_per_hour = 40
 reads_per_hour = 600
 
+[authoring]
+# Authors stop while github_login has this many open PRs in scope; unset = the worker's default, 8.
+# max_open_prs = 8
+
 [models]
 # claude = "claude-opus-5-5"
 # claude_effort = "high"
@@ -2521,7 +2534,7 @@ def main() -> int:
     up.add_argument("--claude-effort", default=DEFAULT_CLAUDE_EFFORT)
     up.add_argument("--codex-model", default="")
     up.add_argument("--codex-effort", default="")
-    up.add_argument("--max-fixers", type=int, default=3, help="fixers while authoring is impossible (mine_open >= 8); fewer as the backlog shrinks")
+    up.add_argument("--max-fixers", type=int, default=3, help=f"fixers while authoring is impossible (mine_open >= {MAX_OPEN_PRS_BACKPRESSURE}); fewer as the backlog shrinks")
     up.add_argument("--no-watch", action="store_true", help="start and return instead of opening the live view")
     up.add_argument("--dry-run", action="store_true", help="write and validate the config, pre-seed checkouts, but do not start")
     up.set_defaults(fn=cmd_up)
@@ -2552,7 +2565,7 @@ def main() -> int:
     r.set_defaults(fn=cmd_round)
     rc_ = sub.add_parser("reconcile", help="shape the fleet to the backlog (authors on/off, fixer count); runs after every round via the hook")
     for _p in (rc_,):
-        _p.add_argument("--max-fixers", type=int, default=3, help="fixers while authoring is impossible (mine_open >= 8)")
+        _p.add_argument("--max-fixers", type=int, default=3, help=f"fixers while authoring is impossible (mine_open >= {MAX_OPEN_PRS_BACKPRESSURE})")
         _p.add_argument("--max-reviewers", type=int, default=2)
         _p.add_argument("--quiet", action="store_true", help="print only when the shape changes (the hook uses this)")
         _p.add_argument("--dry-run", action="store_true")
