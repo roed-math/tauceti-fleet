@@ -75,10 +75,13 @@ without a chain share `~/.claude`, and `logins` says so.
 
 The live view shows a `needs you` badge and panel; `tauceti-fleet attention` prints them in full.
 
-- **A round declined to act.** A fix or rebase round whose agent found nothing to do, usually
-  because main already has what the PR adds, files an incident with the agent's last words and the
-  PRs it named as subsuming this one. Closing a PR is always a human act. `--lookup` resolves the
-  named PRs; `--ack PR` or `--ack all` archives the incident once handled.
+- **A round declined to act, and the decide stage handed it to you.** A fix or rebase round whose
+  agent could not act files an incident with the agent's last words and the PRs it named. The decide
+  stage (below) rules on it first, and only two rulings reach this list: `roadmap`, with a drafted
+  roadmap change for you to file, and `escalate`, with its analysis and any recommendation, such as
+  closing the PR, and the evidence. Closing a PR is always a human act. `--lookup` resolves the named
+  PRs; `--ack PR` or `--ack all` archives the incident once handled. A decline the stage has not
+  ruled on within 2 hours is listed too.
 - **A review exchange hit its cap**, or a review errored three times without a verdict. The worker
   stops spending on that PR until you look.
 - **A target-list item whose PR closed without a recorded verdict.** The curator cannot tell whether
@@ -89,8 +92,9 @@ A worker in a long backoff can be restarted between rounds with `tauceti-fleet r
 
 ## The periodic rounds
 
-Two stages are not about the fleet's own PRs and run on a cadence rather than in a loop, as one-shot
-rounds under the id `<name>-periodic`, started by the reconcile hook or the live view when due.
+Three stages are not about one of the fleet's own PRs and run on a cadence rather than in a loop, as
+one-shot rounds under the id `<name>-periodic`, started by the reconcile hook or the live view when
+due. One runs at a time.
 
 - **curate**, every 6 hours, keeps the target list true. It checks each in-flight item's PR: merged
   marks it done, closed with a recorded subsumption verdict marks it done and names the PR that
@@ -103,6 +107,24 @@ rounds under the id `<name>-periodic`, started by the reconcile hook or the live
   hours; TauCetiProgress itself waits 8 hours after the last landed report. `progress.strategy =
   "rotate"`, with a TauCetiProgress that supports it, reports the stalest roadmap first instead of
   the busiest.
+- **decide**, on unless `decide.enabled = false`, rules on declined rounds. It runs within about 10
+  minutes of a new decline, and every 6 hours while a ruling waits on something. Without a model it
+  settles declines that events have overtaken: the PR merged, closed or has a new head. It notes an
+  authoring decline with no target. It turns a `wait` into a `retry` once what it waited on has
+  merged or reached an open PR. It puts the rest to the model (the curator's model), with the PR, its
+  scoreboard and threads, the fixer's account, the open PRs, the target list and the roadmap and
+  rubric checkouts. The model rules one of these, and the worker's code checks each ruling before
+  acting on it:
+  - `retry`: a fixer tries again, and the ruling's note tells it what is new. Allowed once per head.
+  - `wait`: on open PRs or items already in the target list.
+  - `prerequisite`: the missing roadmap milestone is added at the top of its area in the target
+    list, so the authors write it next, and the PR waits for it. The scope rubric accepts a
+    prerequisite stage that is in an open PR.
+  - `roadmap`: a drafted change, in `<fleet home>/gate/decisions/`, for you to file. Agents never
+    open TauCetiRoadmap PRs.
+  - `escalate`: anything else, including a recommendation to close the PR.
+
+  The stage writes only the fleet's own records and the target list, never to TauCeti.
 
 ```bash
 tauceti-fleet periodic

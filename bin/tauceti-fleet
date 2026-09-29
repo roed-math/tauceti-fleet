@@ -1043,6 +1043,8 @@ def attention_items() -> list[dict]:
     for p in sorted(INCIDENTS.glob("*.json")):
         d = read_json(p)
         if d.get("kind") and d.get("kind") != "targets-updated":
+            if awaiting_decide(d):
+                continue  # the decide stage rules on it shortly; see pending_decide()
             d["_path"] = p
             items.append(d)
     items.sort(key=lambda d: str(d.get("last_at") or ""))
@@ -1052,6 +1054,35 @@ def attention_items() -> list[dict]:
                       "last_at": undecided[0][0], "summary": "\n".join(n for _t, n in undecided),
                       "slugs": [n.split("`")[1] for _t, n in undecided if n.count("`") >= 2]})
     return items
+
+
+# A decline the decide stage has not ruled on within this long is shown to the owner anyway: a stage
+# that is failing must not turn declines back into the silent outcome the attention list exists to end.
+DECIDE_GRACE = 2 * 3600
+
+
+def _decidable(d: dict) -> bool:
+    """A decline of the kind the decide stage rules on (a PR stage's, or an authoring one with no target;
+    an authoring decline naming a target is the curator's)."""
+    return d.get("kind") == "declined" and (
+        (d.get("stage") in ("fix", "fix-ci", "rebase") and isinstance(d.get("pr"), int))
+        or (d.get("stage") == "roadmap" and not d.get("target")))
+
+
+def awaiting_decide(d: dict) -> bool:
+    """A live decline the decide stage has yet to rule on, and still within its grace period."""
+    if not (periodic_enabled("decide") and _decidable(d)) or d.get("decision"):
+        return False
+    try:
+        at = datetime.strptime(str(d.get("last_at") or ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return False
+    return time.time() - at < DECIDE_GRACE
+
+
+def pending_decide() -> int:
+    """How many live declines the decide stage has yet to rule on (within its grace period)."""
+    return sum(1 for p in INCIDENTS.glob("declined-*.json") if awaiting_decide(read_json(p))) if INCIDENTS.is_dir() else 0
 
 
 def targets_undecided() -> list[tuple[str, str]]:
@@ -1103,6 +1134,10 @@ def attention_line(d: dict, width: int = 150) -> str:
         slugs = d.get("slugs") or []
         return (f"target list: {len(slugs)} item(s) await your decision: " + ", ".join(slugs))[:width]
     what = d.get("summary") if kind == "declined" else (d.get("detail") or d.get("reason") or kind)
+    if d.get("decision"):
+        # The decide stage ruled and handed it on: its ruling is the line, not the fixer's account.
+        tag = f"[{d['decision']}{': ' + str(d['recommend']) if d.get('recommend') else ''}] "
+        what = d.get("decision_note") or what
     what = " ".join(str(what or "").split())
     head = f"{pr} {d.get('stage') or kind} {d.get('worker', '-')} {when}Z {tag}"
     return (head + what)[:width]
@@ -1170,7 +1205,9 @@ PERIODIC_WID = wid("periodic")
 # `progress` is tried every 2 h, not every 8: the planner itself requires 8 h since the last LANDED
 # report (project-wide), and a runner on the same period would drift out of phase with it and land a
 # report every 16 h. A not-due attempt costs the survey's reads and one `due` call.
-PERIODIC = {"curate": 6 * 3600, "progress": 2 * 3600}  # stage -> seconds between runs
+# `decide` rules on declined rounds (the worker's decide.py); it also runs soon after each new decline,
+# see periodic_due.
+PERIODIC = {"curate": 6 * 3600, "progress": 2 * 3600, "decide": 6 * 3600}  # stage -> seconds between runs
 # Which TauCetiProgress the progress rounds run, and how it picks a roadmap. Empty = the worker's own
 # pinned upstream and its default strategy. A fork must keep upstream's file formats, since
 # TauCetiRoadmap's merge gate is pinned to upstream.
@@ -1186,9 +1223,13 @@ def periodic_dir() -> Path:
 
 
 def periodic_enabled(stage: str) -> bool:
-    """`curate` is always on. `progress` is opt-in (`tauceti-fleet periodic --enable progress`): it
-    publishes pull requests to TauCetiRoadmap, so it is switched on deliberately. Rotation through
-    the roadmaps (rather than busiest-first) comes from the pinned fork, see PROGRESS_REF."""
+    """`curate` is always on, and `decide` unless `decide.enabled = false` in fleet.toml: both write
+    only the fleet's own records and target list. `progress` is opt-in (`tauceti-fleet periodic
+    --enable progress`): it publishes pull requests to TauCetiRoadmap, so it is switched on
+    deliberately. Rotation through the roadmaps (rather than busiest-first) comes from the pinned fork,
+    see PROGRESS_REF."""
+    if stage == "decide":
+        return setting("decide", "enabled", "true").lower() not in ("false", "0", "no")
     return stage == "curate" or (periodic_dir() / f"{stage}.enabled").is_file()
 
 
@@ -1246,16 +1287,50 @@ def _blocker_closed() -> bool:
     return False
 
 
+# A decline the decide stage should rule on makes it due this soon after its last run: soon enough that
+# a fixer's decline is settled within the quarter hour, rarely enough that a burst of them is one round.
+DECIDE_ON_DECLINE_GAP = 10 * 60
+
+
+def _decide_work() -> tuple[bool, float, bool]:
+    """(any decline awaiting a ruling, the newest one's time, any `wait` ruling to re-check). Local."""
+    newest, pending, waits = 0.0, False, False
+    for p in INCIDENTS.glob("declined-*.json") if INCIDENTS.is_dir() else []:
+        d = read_json(p)
+        if _decidable(d) and not d.get("decision"):
+            pending = True
+            try:
+                newest = max(newest, datetime.strptime(str(d.get("last_at") or ""), "%Y-%m-%dT%H:%M:%SZ")
+                             .replace(tzinfo=timezone.utc).timestamp())
+            except ValueError:
+                pass
+    for p in (INCIDENTS / "acked").glob("declined-*.json") if (INCIDENTS / "acked").is_dir() else []:
+        if read_json(p).get("decision") == "wait":
+            waits = True
+            break
+    return pending, newest, waits
+
+
 def periodic_due(stage: str) -> bool:
     if not periodic_enabled(stage):
         return False
     last = periodic_dir() / f"{stage}.last"
+    if stage == "decide":
+        # Nothing to rule on and nothing waiting: not even the cadence runs it.
+        pending, newest, waits = _decide_work()
+        if not (pending or waits):
+            return False
     try:
         at = last.stat().st_mtime
     except OSError:
         return True
     if time.time() - at >= PERIODIC[stage]:
         return True
+    if stage == "decide":
+        # A new decline, or (for a waiting ruling) our open-PR count moved: a prerequisite PR opened,
+        # or a blocker merged. The round itself finds out which; this only says it is worth a look.
+        moved = _mine_open_now() != read_json(periodic_dir() / "decide.mine_open").get("n")
+        return time.time() - at >= DECIDE_ON_DECLINE_GAP and ((pending and newest > at) or (waits and moved))
     return stage == "curate" and time.time() - at >= CURATE_ON_DECLINE_GAP and (_decline_since(at) or _ours_closed_since() or _blocker_closed())
 
 
@@ -1325,8 +1400,8 @@ def run_periodic(stage: str, *, quiet: bool = True, force: bool = False) -> str:
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f"{stage}-{datetime.now():%Y%m%d-%H%M%S}.log"
     (periodic_dir() / f"{stage}.last").touch()
-    if stage == "curate":  # what "our open count went down since the last run" is measured against
-        (periodic_dir() / "curate.mine_open").write_text(json.dumps({"n": _mine_open_now()}))
+    if stage in ("curate", "decide"):  # what "our open count moved since the last run" is measured against
+        (periodic_dir() / f"{stage}.mine_open").write_text(json.dumps({"n": _mine_open_now()}))
     # The round's own attempt gap is the worker's second line of defence against over-running; the
     # wrapper has just decided this run is due (by the clock or by a decline), so clear it.
     (WORKTREE / "state" / PERIODIC_WID / f"{stage}-attempt-ts").unlink(missing_ok=True)
@@ -1412,7 +1487,8 @@ def cmd_periodic(a: argparse.Namespace) -> int:
     for stage, gap in PERIODIC.items():
         last = periodic_dir() / f"{stage}.last"
         when = f"last run {age(last.stat().st_mtime)} ago" if last.exists() else "never run"
-        state = "disabled (tauceti-fleet periodic --enable progress)" if not periodic_enabled(stage) else ("DUE" if periodic_due(stage) else "not due")
+        off = "decide.enabled = false in fleet.toml" if stage == "decide" else "tauceti-fleet periodic --enable progress"
+        state = f"disabled ({off})" if not periodic_enabled(stage) else ("DUE" if periodic_due(stage) else "not due")
         print(f"  {stage:9s} every {gap // 3600} h — {when}; {state}")
     print(f"logs: {STATE / 'logs' / PERIODIC_WID}/   login chain: {login_dir(PERIODIC_WID) or 'shared ~/.claude'}")
     return 0
@@ -1503,6 +1579,10 @@ def cmd_attention(a: argparse.Namespace) -> int:
                 n += 1
         print(f"acknowledged {n} item(s) → {ACKED}")
         return 0
+    waiting = pending_decide()
+    if waiting:
+        print(f"({waiting} decline(s) await the decide stage and are not listed; any it has not ruled on within "
+              f"{DECIDE_GRACE // 3600} h is listed here)\n")
     if not items:
         print("nothing needs you.")
         return 0
@@ -1511,6 +1591,13 @@ def cmd_attention(a: argparse.Namespace) -> int:
         print(f"== {pr}  ({d.get('kind')} · {d.get('stage') or ''} · {d.get('worker', '-')} · {d.get('last_at')}"
               f"{' · seen ' + str(d['count']) + 'x' if int(d.get('count') or 0) > 1 else ''})"
               + ("  [the agent's words read as: close this PR]" if d.get("close_hint") else ""))
+        if d.get("decision"):
+            print(f"   ruling ({d.get('decided_at', '')}): {d['decision']}")
+            for label, key in (("recommends", "recommend"), ("evidence", "evidence"), ("note", "decision_note"),
+                               ("proposal", "proposal")):
+                if d.get(key):
+                    print(f"   {label}: {d[key]}")
+            print("   the fixer's account:")
         body = d.get("summary") or d.get("detail") or d.get("reason") or ""
         for line in str(body).splitlines():
             print("   " + line)
@@ -1660,9 +1747,11 @@ def build_view(progress: Progress, console=None):
         if ps["running"]:
             label, style, what = "running", "green", f"{stage} round in progress"
         elif not ps["enabled"]:
-            label, style, what = "disabled", "dim", f"tauceti-fleet periodic --enable {stage}"
+            label, style, what = "disabled", "dim", ("decide.enabled = false in fleet.toml" if stage == "decide"
+                                                     else f"tauceti-fleet periodic --enable {stage}")
         else:
-            label, style, what = "idle", "dim", f"every {PERIODIC[stage] // 3600} h"
+            label, style, what = "idle", "dim", (f"after a decline, else every {PERIODIC[stage] // 3600} h" if stage == "decide"
+                                                 else f"every {PERIODIC[stage] // 3600} h")
         nxt = "running" if ps["running"] else ("—" if not ps["enabled"] else ("due" if ps["next_at"] is None or ps["next_at"] <= time.time() else until(ps["next_at"])))
         t.add_row(f"periodic:{stage}", "claude", Text(label, style=style), what[:60], ps["last_line"][:120],
                   age(ps["last_at"]) if ps["last_at"] else "never", nxt)
@@ -1717,6 +1806,9 @@ def build_view(progress: Progress, console=None):
             lines.append(f"\n… {len(needs) - 6} more")
         lines.append("\n(tauceti-fleet attention for the full text; --ack <PR> once handled)", style="dim")
         p.add_row(Text("needs you", style="bold red"), lines)
+    waiting = pending_decide()
+    if waiting:
+        p.add_row("decide", Text(f"{waiting} decline(s) await a ruling", style="dim"))
     if not progress.creds or time.time() - getattr(progress, "creds_at", 0) > 300:
         try:
             progress.creds = credential_lines()
