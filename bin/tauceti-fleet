@@ -1334,10 +1334,23 @@ def periodic_due(stage: str) -> bool:
     return stage == "curate" and time.time() - at >= CURATE_ON_DECLINE_GAP and (_decline_since(at) or _ours_closed_since() or _blocker_closed())
 
 
+# What a managed worker's own process carries and a periodic round must not inherit: a round started
+# from a worker's round-done hook runs in that worker's environment, and on 2026-09-29 the first
+# decide rounds wrote their progress into gq2-rev2's status file (the view showed a reviewer "running
+# decide"). The login chain is the dangerous one: a round renewing another worker's leased chain
+# revokes the token that worker's round holds.
+_WORKER_ONLY_ENV = ("TAUCETI_RUNTIME_STATUS", "TAUCETI_MANAGED", "TAUCETI_LOG_FILE", "TAUCETI_PARENT_PIPE_FD",
+                    "TAUCETI_ROUND_RC", "TAUCETI_ROUND_WID", "TAUCETI_PUBLICATION_ID", "TAUCETI_CLAIM_HELD",
+                    "TAUCETI_CLAIM_KEY", "TAUCETI_PUSH_REF", "TAUCETI_PUSH_EXPECT", "TAUCETI_PUSH_REMOTE",
+                    "CLAUDE_CONFIG_DIR")
+
+
 def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
     """The environment of a periodic round: what a worker gets (gate, budgets, models, its login
     chain), without a manager. The login chain is leased under PERIODIC_WID like any worker's."""
     env = worker_env()
+    for var in _WORKER_ONLY_ENV:
+        env.pop(var, None)
     env.update({
         "TAUCETI_WORKER_ID": PERIODIC_WID,
         "TAUCETI_ROADMAP_TARGETS": str(TARGETS),
