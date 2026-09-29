@@ -416,6 +416,7 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             "TAUCETI_GATE_READS_PER_HOUR": str(a.reads_per_hour),
             # Authoring backpressure, only when fleet.toml overrides the worker's default.
             **({"TAUCETI_MAX_OPEN_PRS": str(MAX_OPEN_PRS_SETTING)} if MAX_OPEN_PRS_SETTING else {}),
+            **({"TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_MAX_OPEN_SETTING)} if FALLBACK_MAX_OPEN_SETTING else {}),
             # Pilot mode interacts less on GitHub: no reactions, no automatic stuck-review issues.
             "TAUCETI_REACTIONS": "0" if a.pilot else "1",
             "TAUCETI_STUCK_ISSUES": "0" if a.pilot else "1",
@@ -1904,6 +1905,10 @@ def write_config(specs: list[dict], statuses: dict[str, dict] | None = None,
 # number as $TAUCETI_MAX_OPEN_PRS so the reconcile and the workers agree on when authoring can happen.
 MAX_OPEN_PRS_SETTING = _setting_int("authoring", "max_open_prs")
 MAX_OPEN_PRS_BACKPRESSURE = MAX_OPEN_PRS_SETTING or 8
+# How many of my PRs may be open while an author with nothing on the target list authors outside it
+# (the worker's $TAUCETI_TARGETS_FALLBACK_MAX_OPEN, default 6). Only the worker reads it; the reconcile
+# learns the outcome from the authors' "not authoring outside the list" rounds.
+FALLBACK_MAX_OPEN_SETTING = _setting_int("authoring", "fallback_max_open")
 
 
 # A backlog this large gets every fixer even while authors run. It was the old backpressure point, so
@@ -2479,6 +2484,9 @@ reads_per_hour = 600
 [authoring]
 # Authors stop while github_login has this many open PRs in scope; unset = the worker's default, 8.
 # max_open_prs = 8
+# An author with nothing on the target list authors outside it only while at most this many PRs
+# are open; unset = the worker's default, 6.
+# fallback_max_open = 6
 
 [models]
 # claude = "claude-opus-5-5"
