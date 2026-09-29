@@ -1367,6 +1367,9 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
         "TAUCETI_TARGETS_REPO": _config_env("TAUCETI_TARGETS_REPO") or _targets_repo() or "",
         # Progress reports: the fork's planner, rotating, remembering its choices between runs.
         "TAUCETI_PROGRESS_STATE": _config_env("TAUCETI_PROGRESS_STATE") or str(periodic_dir() / "progress-rotation.json"),
+        # The decide stage may close the account's own subsumed PRs only when the operator says so.
+        "TAUCETI_DECIDE_CLOSE": "1" if _setting_bool("decide", "close") else "0",
+        "TAUCETI_DECIDE_MAX_CLOSES_PER_DAY": setting("decide", "max_closes_per_day", "3"),
     })
     for var, value in (("TAUCETI_PROGRESS_REPO", PROGRESS_REPO), ("TAUCETI_PROGRESS_REF", PROGRESS_REF),
                        ("TAUCETI_PROGRESS_STRATEGY", PROGRESS_STRATEGY)):
@@ -1560,10 +1563,61 @@ def cmd_targets(a: argparse.Namespace) -> int:
     return 0
 
 
+def _roadmap_change(action: str, pr: int) -> int:
+    """`tauceti roadmap-change ACTION PR` in the foreground, as the periodic worker (its login chain,
+    the gate), holding the periodic lock so no periodic round renews that chain meanwhile."""
+    import fcntl
+
+    lock = open(periodic_dir() / "run.lock", "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("a periodic round is running; waiting for it to finish …", flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        return subprocess.run([PYTHON, "-m", "tauceti_worker", "roadmap-change", action, str(pr)],
+                              cwd=WORKTREE, env=periodic_env()).returncode
+    finally:
+        lock.close()
+
+
+def recent_rulings(hours: int = 24) -> list[dict]:
+    """The decide stage's rulings in the last `hours` that needed nobody (closed, retry, wait, stale,
+    noted), newest first: shown so that none of them, a close above all, is a silent outcome."""
+    cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
+    out = []
+    for p in ACKED.glob("declined-*.json") if ACKED.is_dir() else []:
+        d = read_json(p)
+        try:
+            at = datetime.strptime(str(d.get("decided_at") or ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+        if at >= cutoff and d.get("decision"):
+            out.append(d)
+    return sorted(out, key=lambda d: str(d.get("decided_at")), reverse=True)
+
+
 def cmd_attention(a: argparse.Namespace) -> int:
     """List what needs the owner (full agent text, what subsumed the PR, transcript path), or
     acknowledge items. --lookup resolves each named PR through the gate and caches the answer in
-    the incident file, so the second listing is free."""
+    the incident file, so the second listing is free. --file-roadmap / --open-roadmap file a
+    decide-stage roadmap proposal as a TauCetiRoadmap PR."""
+    if getattr(a, "file_roadmap", None):
+        pr = a.file_roadmap
+        rc = _roadmap_change("prepare", pr)
+        if rc != 0:
+            return rc
+        if not sys.stdin.isatty():
+            print(f"\nRead the change above; to open it: tauceti-fleet attention --open-roadmap {pr}")
+            return 0
+        answer = input(f"\nOpen this as a pull request on TauCetiProject/TauCetiRoadmap as {EXPECT_LOGIN or 'this account'}? [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            print(f"not opened; the branch stays prepared (tauceti-fleet attention --open-roadmap {pr} opens it)")
+            return 0
+        return _roadmap_change("open", pr)
+    if getattr(a, "open_roadmap", None):
+        rc = _roadmap_change("show", a.open_roadmap)
+        return rc if rc != 0 else _roadmap_change("open", a.open_roadmap)
     items = attention_items()
     if getattr(a, "retry", None):
         # After an infrastructure fix: give the PR its review-error budget back in every worker
@@ -1596,6 +1650,13 @@ def cmd_attention(a: argparse.Namespace) -> int:
     if waiting:
         print(f"({waiting} decline(s) await the decide stage and are not listed; any it has not ruled on within "
               f"{DECIDE_GRACE // 3600} h is listed here)\n")
+    recent = recent_rulings()
+    if recent:
+        print("Ruled by the decide stage in the last 24 h (nothing needed from you):")
+        for d in recent:
+            what = d.get("roadmap_pr") or ", ".join(d.get("close_evidence") or []) or d.get("decision_note") or ""
+            print(f"   #{d.get('pr') or '-'} {d['decision']:9s} {str(d.get('decided_at'))[5:16]}  {' '.join(str(what).split())[:120]}")
+        print()
     if not items:
         print("nothing needs you.")
         return 0
@@ -1610,6 +1671,8 @@ def cmd_attention(a: argparse.Namespace) -> int:
                                ("proposal", "proposal")):
                 if d.get(key):
                     print(f"   {label}: {d[key]}")
+            if d["decision"] == "roadmap" and d.get("pr"):
+                print(f"   to file it: tauceti-fleet attention --file-roadmap {d['pr']}")
             print("   the fixer's account:")
         body = d.get("summary") or d.get("detail") or d.get("reason") or ""
         for line in str(body).splitlines():
@@ -1817,11 +1880,22 @@ def build_view(progress: Progress, console=None):
             lines.append(attention_line(d, 140), style="bold red" if d.get("close_hint") else "yellow")
         if len(needs) > 6:
             lines.append(f"\n… {len(needs) - 6} more")
-        lines.append("\n(tauceti-fleet attention for the full text; --ack <PR> once handled)", style="dim")
+        hint = "tauceti-fleet attention for the full text; --ack <PR> once handled"
+        if any(d.get("decision") == "roadmap" for d in needs):
+            hint += "; --file-roadmap <PR> to file a drafted roadmap change"
+        lines.append(f"\n({hint})", style="dim")
         p.add_row(Text("needs you", style="bold red"), lines)
-    waiting = pending_decide()
-    if waiting:
-        p.add_row("decide", Text(f"{waiting} decline(s) await a ruling", style="dim"))
+    waiting, recent = pending_decide(), recent_rulings()
+    if waiting or recent:
+        counts = {}
+        for d in recent:
+            counts[d["decision"]] = counts.get(d["decision"], 0) + 1
+        closed = [f"#{d['pr']}" for d in recent if d["decision"] == "closed"]
+        parts = ([f"{waiting} awaiting a ruling"] if waiting else []) + (
+            ["24 h: " + ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))] if counts else [])
+        if closed:
+            parts.append("closed " + " ".join(closed))
+        p.add_row("decide", Text("; ".join(parts), style="bold" if closed else "dim", overflow="fold"))
     if not progress.creds or time.time() - getattr(progress, "creds_at", 0) > 300:
         try:
             progress.creds = credential_lines()
@@ -2593,6 +2667,13 @@ reads_per_hour = 600
 # are open; unset = the worker's default, 6.
 # fallback_max_open = 6
 
+[decide]
+# The stage that rules on declined rounds. `close = true` lets it close the account's own PRs that
+# main has subsumed, on evidence it checks, at most max_closes_per_day a day.
+# enabled = true
+# close = false
+# max_closes_per_day = 3
+
 [models]
 # claude = "claude-opus-5-5"
 # claude_effort = "high"
@@ -2708,6 +2789,10 @@ def main() -> int:
     at.add_argument("--ack", metavar="PR|all", help="acknowledge (archive) the item(s) for this PR number, or all")
     at.add_argument("--lookup", action="store_true", help="resolve the PRs an item names (state, merge date, title) through the gate; cached in the item")
     at.add_argument("--retry", metavar="PR", help="after an infrastructure fix: reset this PR's review-error budget in every worker and archive its review-stuck item")
+    at.add_argument("--file-roadmap", metavar="PR", type=int,
+                    help="have an agent apply this PR's drafted roadmap change on a branch, show you the diff, and on your yes open it as a TauCetiRoadmap PR")
+    at.add_argument("--open-roadmap", metavar="PR", type=int,
+                    help="open the change --file-roadmap prepared for this PR (shown again first), without asking")
     at.set_defaults(fn=cmd_attention)
     pe = sub.add_parser("periodic", help="the cadenced one-shot rounds (curate every 6 h, progress tried every 2 h): show, or run one now")
     pe.add_argument("--now", choices=tuple(PERIODIC), help="run this stage now, in the foreground")

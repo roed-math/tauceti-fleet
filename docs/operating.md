@@ -78,10 +78,13 @@ The live view shows a `needs you` badge and panel; `tauceti-fleet attention` pri
 - **A round declined to act, and the decide stage handed it to you.** A fix or rebase round whose
   agent could not act files an incident with the agent's last words and the PRs it named. The decide
   stage (below) rules on it first, and only two rulings reach this list: `roadmap`, with a drafted
-  roadmap change for you to file, and `escalate`, with its analysis and any recommendation, such as
-  closing the PR, and the evidence. Closing a PR is always a human act. `--lookup` resolves the named
-  PRs; `--ack PR` or `--ack all` archives the incident once handled. A decline the stage has not
-  ruled on within 2 hours is listed too.
+  roadmap change, and `escalate`, with its analysis, any recommendation and the evidence.
+  `--file-roadmap PR` files a drafted change. An agent applies it to the roadmap's README on a
+  branch, and you read the diff. On your yes the change is opened as a TauCetiRoadmap PR from the
+  account's fork (`--open-roadmap PR` does this without asking). The TauCeti PR then waits for it.
+  `--lookup` resolves the named PRs; `--ack PR` or `--ack all` archives the incident once handled. A
+  decline the stage has not ruled on within 2 hours is listed too. So are the stage's rulings from
+  the last 24 hours, closes included, though they need nothing from you.
 - **A review exchange hit its cap**, or a review errored three times without a verdict. The worker
   stops spending on that PR until you look.
 - **A target-list item whose PR closed without a recorded verdict.** The curator cannot tell whether
@@ -120,11 +123,16 @@ due. One runs at a time.
   - `prerequisite`: the missing roadmap milestone is added at the top of its area in the target
     list, so the authors write it next, and the PR waits for it. The scope rubric accepts a
     prerequisite stage that is in an open PR.
-  - `roadmap`: a drafted change, in `<fleet home>/gate/decisions/`, for you to file. Agents never
-    open TauCetiRoadmap PRs.
+  - `close`, when `decide.close = true`: closes the PR as subsumed and posts the evidence as a
+    comment. The PR must be the account's own and carry no hold label. Every merged PR it names must
+    have merged, and every declaration it names must be on main. At most `decide.max_closes_per_day`
+    (default 3) close each day. If any check fails, the ruling becomes an escalation.
+  - `roadmap`: a drafted change, in `<fleet home>/gate/decisions/`. You file it with `attention
+    --file-roadmap`, since agents never open TauCetiRoadmap PRs on their own. Once that roadmap PR
+    merges, the TauCeti PR's fixer is told to cite it on the scope finding.
   - `escalate`: anything else, including a recommendation to close the PR.
 
-  The stage writes only the fleet's own records and the target list, never to TauCeti.
+  Besides a close, the stage writes only the fleet's own records and the target list.
 
 ```bash
 tauceti-fleet periodic
