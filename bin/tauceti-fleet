@@ -1563,7 +1563,7 @@ def cmd_targets(a: argparse.Namespace) -> int:
     return 0
 
 
-def _roadmap_change(action: str, pr: int) -> int:
+def _roadmap_change(action: str, pr: int, *extra: str) -> int:
     """`tauceti roadmap-change ACTION PR` in the foreground, as the periodic worker (its login chain,
     the gate), holding the periodic lock so no periodic round renews that chain meanwhile."""
     import fcntl
@@ -1575,7 +1575,7 @@ def _roadmap_change(action: str, pr: int) -> int:
         print("a periodic round is running; waiting for it to finish …", flush=True)
         fcntl.flock(lock, fcntl.LOCK_EX)
     try:
-        return subprocess.run([PYTHON, "-m", "tauceti_worker", "roadmap-change", action, str(pr)],
+        return subprocess.run([PYTHON, "-m", "tauceti_worker", "roadmap-change", action, str(pr), *extra],
                               cwd=WORKTREE, env=periodic_env()).returncode
     finally:
         lock.close()
@@ -1604,7 +1604,7 @@ def cmd_attention(a: argparse.Namespace) -> int:
     decide-stage roadmap proposal as a TauCetiRoadmap PR."""
     if getattr(a, "file_roadmap", None):
         pr = a.file_roadmap
-        rc = _roadmap_change("prepare", pr)
+        rc = _roadmap_change("prepare", pr, *(["--fresh"] if getattr(a, "fresh", False) else []))
         if rc != 0:
             return rc
         if not sys.stdin.isatty():
@@ -2793,6 +2793,8 @@ def main() -> int:
     at.add_argument("--retry", metavar="PR", help="after an infrastructure fix: reset this PR's review-error budget in every worker and archive its review-stuck item")
     at.add_argument("--file-roadmap", metavar="PR", type=int,
                     help="have an agent apply this PR's drafted roadmap change on a branch, show you the diff, and on your yes open it as a TauCetiRoadmap PR")
+    at.add_argument("--fresh", action="store_true",
+                    help="with --file-roadmap: redo the change even if an earlier attempt stopped part-way (by default it is finished)")
     at.add_argument("--show-roadmap", metavar="PR", type=int,
                     help="show the change --file-roadmap prepared for this PR again, without opening it")
     at.add_argument("--open-roadmap", metavar="PR", type=int,
