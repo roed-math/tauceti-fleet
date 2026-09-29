@@ -1615,6 +1615,8 @@ def cmd_attention(a: argparse.Namespace) -> int:
             print(f"not opened; the branch stays prepared (tauceti-fleet attention --open-roadmap {pr} opens it)")
             return 0
         return _roadmap_change("open", pr)
+    if getattr(a, "show_roadmap", None):
+        return _roadmap_change("show", a.show_roadmap)
     if getattr(a, "open_roadmap", None):
         rc = _roadmap_change("show", a.open_roadmap)
         return rc if rc != 0 else _roadmap_change("open", a.open_roadmap)
@@ -2791,6 +2793,8 @@ def main() -> int:
     at.add_argument("--retry", metavar="PR", help="after an infrastructure fix: reset this PR's review-error budget in every worker and archive its review-stuck item")
     at.add_argument("--file-roadmap", metavar="PR", type=int,
                     help="have an agent apply this PR's drafted roadmap change on a branch, show you the diff, and on your yes open it as a TauCetiRoadmap PR")
+    at.add_argument("--show-roadmap", metavar="PR", type=int,
+                    help="show the change --file-roadmap prepared for this PR again, without opening it")
     at.add_argument("--open-roadmap", metavar="PR", type=int,
                     help="open the change --file-roadmap prepared for this PR (shown again first), without asking")
     at.set_defaults(fn=cmd_attention)
