@@ -2014,6 +2014,7 @@ def cmd_watch(a: argparse.Namespace) -> int:
                     try:
                         freshen_logins(quiet=True)
                         ensure_periodic(quiet=True)
+                        ensure_auth_proxy_alive(quiet=True)
                     except Exception as exc:
                         _watchdog_note(f"login keeper: {exc}")
         except KeyboardInterrupt:
@@ -2248,6 +2249,7 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
             freshen_logins(quiet)
         ensure_pool_warm(quiet, start=not getattr(a, "dry_run", False))
         ensure_cache_proxy_alive(quiet, start=not getattr(a, "dry_run", False))
+        ensure_auth_proxy_alive(quiet, start=not getattr(a, "dry_run", False))
         if not getattr(a, "dry_run", False):
             ensure_periodic(quiet)
             # A round that ended before publishing anything (the agent declined, the build broke) leaves
@@ -2497,6 +2499,65 @@ def ensure_cache_proxy_alive(quiet: bool, *, start: bool = True) -> None:
     FLEET_HOME.mkdir(parents=True, exist_ok=True)
     with open(FLEET_HOME / "watchdog.log", "a") as f:
         f.write(f"{line} → {result}\n{(r1.stderr + r2.stderr).strip()}\n")
+    print(f"{line} → {result}")
+
+
+# At most one auth-proxy restart per this many seconds: if a restart does not bring the listener back
+# (incus itself down, say), restarting it after every round would only add noise.
+AUTH_PROXY_RESTART_GAP = 600
+
+
+def auth_proxy_deaf() -> str | None:
+    """Is bubble's GitHub auth proxy (the containers' git/gh route, :7654 on the incus bridge) running
+    but unreachable? Seen 2026-09-30: an unattended openssl upgrade restarted incusd, which rebuilt
+    `incusbr0` under a new interface index; the proxy's socket stayed bound (SO_BINDTODEVICE) to the old
+    one, so every bubble round failed its first `git clone` with "Failed to connect to 10.128.128.1
+    port 7654" for six hours while systemd reported the unit active. bubble trusts the proxy's pid, not
+    its socket, so nothing restarted it. The test is the one bubble itself applies to its artifact
+    cache: a TCP connect, from the host, to the endpoint the daemon published. None when it answers or
+    when there is nothing to probe (no endpoint published yet: bubble starts the proxy on demand)."""
+    import socket
+
+    try:
+        endpoint = json.loads((HOME / ".bubble" / "auth-proxy.endpoint").read_text())
+        host, port = endpoint["tcp"]["host"], int(endpoint["tcp"]["port"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    try:
+        socket.create_connection((host, port), timeout=3).close()
+        return None
+    except OSError as exc:
+        return f"nothing answers on {host}:{port} ({exc})"
+
+
+def ensure_auth_proxy_alive(quiet: bool, *, start: bool = True) -> None:
+    """Restart bubble's auth proxy when `auth_proxy_deaf` says so, at most once per
+    AUTH_PROXY_RESTART_GAP. Called from reconcile (after every round) and the live view's keeper.
+    `bubble gh proxy start` reinstalls and restarts the service (systemd or launchd), and the new
+    daemon binds the bridge as it is now. Logged to <fleet>/watchdog.log."""
+    why = auth_proxy_deaf()
+    if not why:
+        return
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} auth proxy deaf: {why}"
+    if not start:
+        print(f"{line}; a live run would restart it")
+        return
+    stamp = FLEET_HOME / "auth-proxy.restarted"
+    try:
+        if time.time() - stamp.stat().st_mtime < AUTH_PROXY_RESTART_GAP:
+            if not quiet:
+                print(f"{line}; restarted {age(stamp.stat().st_mtime)} ago, not again yet")
+            return
+    except OSError:
+        pass
+    FLEET_HOME.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    bubble = shutil.which("bubble") or str(HOME / ".local" / "bin" / "bubble")
+    r = subprocess.run([bubble, "gh", "proxy", "start"], capture_output=True, text=True, timeout=180)
+    after = auth_proxy_deaf()
+    result = f"restarted (rc={r.returncode}); " + (f"still deaf: {after}" if after else "answering again")
+    with open(FLEET_HOME / "watchdog.log", "a") as f:
+        f.write(f"{line} → {result}\n{(r.stdout + r.stderr).strip()}\n")
     print(f"{line} → {result}")
 
 
