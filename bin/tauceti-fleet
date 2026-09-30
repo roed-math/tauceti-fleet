@@ -8,6 +8,7 @@
     tauceti-fleet attention [--ack PR]   # rounds whose agent declined to act (a PR to close?), until acknowledged
     tauceti-fleet restart ID...          # restart workers between rounds (clears a long backoff)
     tauceti-fleet periodic [--now STAGE] # the cadenced curate/progress rounds
+    tauceti-fleet review PR               # review one PR now, as the periodic worker
     tauceti-fleet watch | status | down | logs ID [-f] | reconcile | targets
 
 A fleet lives in one directory, its HOME ($TAUCETI_FLEET_HOME, default ~/.tauceti-fleet): `fleet.toml`
@@ -2315,6 +2316,40 @@ def cmd_round(a: argparse.Namespace) -> int:
     return rc
 
 
+def cmd_review(a: argparse.Namespace) -> int:
+    """One review round on one PR, now, in the foreground: for a PR that should not wait its turn among
+    the reviewers' random picks. It runs as the periodic worker (its leased login chain, the gate, the
+    fleet's sandbox and pacing), holding the periodic lock so no periodic round shares that chain, and
+    logs beside the periodic rounds. The review engine's own rules still apply: a peer holding the head,
+    a previous reviewer's first-refusal window, or a PR not yet reviewable means no review this time."""
+    import fcntl
+
+    lock = open(periodic_dir() / "run.lock", "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("a periodic round is running; waiting for it to finish …", flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    env = periodic_env()
+    argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", "review", "--pr", str(a.pr),
+            "--worker-id", PERIODIC_WID, "--agent", a.agent]
+    if setting("up", "sandbox", "bubble") == "bubble":
+        argv.append("--bubble")
+    logs = STATE / "logs" / PERIODIC_WID
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"review-{a.pr}-{datetime.now():%Y%m%d-%H%M%S}.log"
+    print(f"review: {' '.join(argv[2:])}\nlog: {log}", flush=True)
+    try:
+        with open(log, "a") as out, subprocess.Popen(argv, cwd=WORKTREE, env=env, stdout=subprocess.PIPE,
+                                                     stderr=subprocess.STDOUT, text=True) as proc:
+            for line in proc.stdout:
+                out.write(line); out.flush()
+                sys.stdout.write(line); sys.stdout.flush()
+        return proc.returncode
+    finally:
+        lock.close()
+
+
 def pool_dir() -> Path:
     return Path(os.environ.get("TAUCETI_MATHLIB_POOL") or (HOME / ".cache" / "mathlib"))
 
@@ -2781,6 +2816,11 @@ def main() -> int:
     gt = sub.add_parser("gate", help="pass-through to `tauceti gate ...` (status, report, resume, halt)")
     gt.add_argument("args", nargs=argparse.REMAINDER)
     gt.set_defaults(fn=lambda a: tauceti("gate", *a.args).returncode)
+    rv = sub.add_parser("review", help="review one PR now, as the periodic worker (for a PR that should not wait its turn)")
+    rv.add_argument("pr", type=int)
+    rv.add_argument("--agent", choices=("codex", "claude", "auto"), default="codex",
+                    help="the review provider (default codex, which the fleet's reviewers try first)")
+    rv.set_defaults(fn=cmd_review)
     r = sub.add_parser("round", help="run ONE round in the foreground with the pilot's environment, then print the gate report")
     r.add_argument("--worker-id", default=None, help="default: the first Claude author")
     r.add_argument("--only", default="roadmap")
