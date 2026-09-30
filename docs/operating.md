@@ -81,7 +81,8 @@ The live view shows a `needs you` badge and panel; `tauceti-fleet attention` pri
   roadmap change, and `escalate`, with its analysis, any recommendation and the evidence.
   `--file-roadmap PR` files a drafted change. An agent applies it to the roadmap's README on a
   branch, and you read the diff. On your yes the change is opened as a TauCetiRoadmap PR from the
-  account's fork (`--open-roadmap PR` does this without asking; `--show-roadmap PR` shows it again). The agent may also edit the roadmap's `Suggested.lean`, which is then built as TauCetiRoadmap's CI builds it. The TauCeti PR then waits for the roadmap PR.
+  account's fork (`--open-roadmap PR` does this without asking; `--show-roadmap PR` shows it again). The agent may also edit the roadmap's `Suggested.lean`, which is then built as TauCetiRoadmap's CI builds it, together with every `Suggested.lean` that imports it. The TauCeti PR then waits for the roadmap PR.
+  A proposal may name up to three roadmaps. That happens when a name one roadmap pins is used by another, for example a declaration `#check`ed by a consumer's `Suggested.lean`, which cannot be renamed in either alone without breaking the other's build. The change is then one PR touching each of them, and it may touch only the roadmaps the proposal names.
   `--lookup` resolves the named PRs; `--ack PR` or `--ack all` archives the incident once handled. A
   decline the stage has not ruled on within 2 hours is listed too. So are the stage's rulings from
   the last 24 hours, closes included, though they need nothing from you.
