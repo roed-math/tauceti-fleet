@@ -1932,7 +1932,31 @@ def build_view(progress: Progress, console=None):
     ev.add_column(style="dim"); ev.add_column(overflow="ellipsis", no_wrap=True)
     for w, line in recent_events(n_events):
         ev.add_row(w, line)
-    return Group(top, Panel(ev, title=f"recent events (last {n_events})", border_style="dim"))
+    return TerminalSafe(Group(top, Panel(ev, title=f"recent events (last {n_events})", border_style="dim")))
+
+
+# Characters Rich counts as zero-width but a terminal may not: the emoji presentation selector turns
+# `♻` (one cell to Rich) into a two-cell glyph in tmux 3.6. The view fills the screen to the last cell,
+# so one such character in a log line wraps that line, the pane scrolls by a row, and the header is gone
+# for as long as the line is shown (2026-09-29: reviewers log scoreboard rows carrying "♻️").
+_WIDTH_UNSAFE_RE = re.compile("[︎️‍]")
+
+
+class TerminalSafe:
+    """A renderable that removes _WIDTH_UNSAFE_RE characters from what another one renders, after
+    Rich has laid it out, so every line is as wide on the terminal as Rich measured it."""
+
+    def __init__(self, renderable):
+        self.renderable = renderable
+
+    def __rich_console__(self, console, options):
+        from rich.segment import Segment
+
+        for seg in console.render(self.renderable, options):
+            if seg.text and not seg.control and _WIDTH_UNSAFE_RE.search(seg.text):
+                yield Segment(_WIDTH_UNSAFE_RE.sub("", seg.text), seg.style)
+            else:
+                yield seg
 
 
 def cmd_watch(a: argparse.Namespace) -> int:
