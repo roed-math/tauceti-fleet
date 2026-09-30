@@ -93,9 +93,45 @@ The live view shows a `needs you` badge and panel; `tauceti-fleet attention` pri
 A worker in a long backoff can be restarted between rounds with `tauceti-fleet restart ID`, or
 `--when-idle` to queue it for the end of the current round.
 
+## The progress-report worker
+
+`<name>-prog1`, off until `enabled = true` under `[progress]`, writes roadmaps' STATUS.md and
+PROGRESS.md reports through TauCetiProgress, as pull requests to TauCetiRoadmap that its merge gate
+lands without a human; each landing is announced on Zulip. It is a worker, not a periodic round: it
+looks for work all the time and writes a report as soon as a roadmap qualifies. With N the PRs merged
+into a roadmap's window and T the days since its last report landed, a roadmap qualifies when N > 0
+and either it has been declared complete (archived under `Completed/`) or N + T > 10
+(`progress.threshold`). A roadmap never reported qualifies with its first PR. The merge gate allows
+one report per roadmap per 6 hours, and the planner respects that. Among the qualifying roadmaps the
+one with the most PRs is written. Another operator's open report holds its roadmap for 8 hours, so
+the worker does not duplicate it; after that it is treated as stuck.
+
+This needs a TauCetiProgress build with the `threshold` strategy: set `progress.repo` and
+`progress.ref` to one (roed-math/TauCetiProgress, branch `feat/threshold-strategy`, until it is
+upstream).
+
+Between reports the worker only polls, cheaply: it plans again when the published documentation, or
+TauCetiRoadmap's `main`, has moved, or when the last plan's "next qualifies at" has passed, and at
+least hourly. The live view's `reports` line shows what it is landing and its last assessment.
+
+It sees each report of its own through to landing, following the rules a hand-run lander learned
+landing 29 reports on 2026-09-27. The gate lands a report by compare-and-swap, so each landing leaves
+every other open report behind `main`. The worker brings a report up to date, but only while `main`
+builds. It asks the gate again, at most twice, when the gate has been quiet for 20 minutes after a
+green build. It ignores the gate's first-pass "build not completed" and any refusal about an earlier
+head. It files a `progress-stuck` item under `attention` for anything that needs you: a build that
+fails on an up-to-date report while `main` builds, or a refusal that survives the re-asks. At most
+`progress.max_open` (2) of its reports are open at once.
+
+Before a report is opened, the writing model is given the library's source at the window's end to
+check each layer's state against. It must run `tauceti-progress check` and fix what that reports:
+the prompt's word limits and headings, documentation links copied from the supplied material and
+still resolving, and no layer the previous report assessed turned `unassessed`. A report that still
+fails after one repair pass is not opened.
+
 ## The periodic rounds
 
-Three stages are not about one of the fleet's own PRs and run on a cadence rather than in a loop, as
+Two stages are not about one of the fleet's own PRs and run on a cadence rather than in a loop, as
 one-shot rounds under the id `<name>-periodic`, started by the reconcile hook or the live view when
 due. One runs at a time.
 
@@ -105,11 +141,6 @@ due. One runs at a time.
   looks for the milestone's declarations on main, and asks the model; only an explicit verdict with
   named evidence marks an item "landed elsewhere". When the list is tracked in git it commits the
   change, and pushes it when the fleet's account can push to that repository.
-- **progress**, off until `tauceti-fleet periodic --enable progress`, writes one roadmap's STATUS.md
-  and PROGRESS.md report through TauCetiProgress, as a PR to TauCetiRoadmap. It is tried every 2
-  hours; TauCetiProgress itself waits 8 hours after the last landed report. `progress.strategy =
-  "rotate"`, with a TauCetiProgress that supports it, reports the stalest roadmap first instead of
-  the busiest.
 - **decide**, on unless `decide.enabled = false`, rules on declined rounds. It runs within about 10
   minutes of a new decline, and every 6 hours while a ruling waits on something. Without a model it
   settles declines that events have overtaken: the PR merged, closed or has a new head. It notes an

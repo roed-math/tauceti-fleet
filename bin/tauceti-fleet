@@ -7,7 +7,7 @@
     tauceti-fleet logins                 # the Claude login pool: chains, leases, missing sign-ins
     tauceti-fleet attention [--ack PR]   # rounds whose agent declined to act (a PR to close?), until acknowledged
     tauceti-fleet restart ID...          # restart workers between rounds (clears a long backoff)
-    tauceti-fleet periodic [--now STAGE] # the cadenced curate/progress rounds
+    tauceti-fleet periodic [--now STAGE] # the cadenced curate/decide rounds
     tauceti-fleet review PR               # review one PR now, as the periodic worker
     tauceti-fleet watch | status | down | logs ID [-f] | reconcile | targets
 
@@ -446,10 +446,19 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             add(wid("fix", i), "auto", "fix,fix-ci,rebase")
     for i in range(1, a.reviewers + 1):
         add(wid("rev", i), "auto", "review")
-    # The two host-side kinds — the roadmap progress reports and the target-list curator — are not
-    # workers: a loop that surveys every 90 s to find "not due" is waste. They run as one-shot rounds
-    # on a cadence (see `periodic`), from the reconcile hook and the live view, under the id
-    # PERIODIC_WID, which holds a login chain like any worker.
+    # The progress-report worker (opt-in: `[progress] enabled = true`, since it publishes to
+    # TauCetiRoadmap). Not periodic: it looks for work all the time, writing a roadmap's report as soon
+    # as the roadmap qualifies (TauCetiProgress's `threshold` strategy) and seeing each report land.
+    # Its polls are local and cached (the worker's reporting.due), so a loop costs little. Host-side
+    # like every progress round, and pinned to Claude, as the periodic progress round was.
+    if progress_worker_enabled():
+        add(wid("prog", 1), "claude", "progress", sandbox="host",
+            author_model=a.claude_model, author_effort=a.claude_effort)
+        specs[-1]["env"].update(progress_env())
+    # The target-list curator and the decide stage are not workers: a loop that surveys every 90 s to
+    # find "not due" is waste. They run as one-shot rounds on a cadence (see `periodic`), from the
+    # reconcile hook and the live view, under the id PERIODIC_WID, which holds a login chain like any
+    # worker.
     return specs
 
 
@@ -1196,25 +1205,54 @@ def _verdicts() -> dict[int, dict]:
 # ----------------------------------------------------------------------------- periodic rounds
 #
 # Two stages of the worker are not about the fleet's own PRs and want a cadence, not a loop: the
-# roadmap progress reports (TauCetiProgress, one report per run, about every 8 h) and the target-list
-# curator (every 6 h). Each runs as ONE `tauceti work` round on the host — no manager, no survey
-# polling in between — started in the background by the reconcile hook (after every round of the
-# fleet) or by the live view, whichever comes first once the stage is due. One at a time, under a
-# lock; the round's own due-check (attempt gap counters) is the second line of defence.
+# target-list curator (every 6 h) and the decide stage. Each runs as ONE `tauceti work` round on the
+# host — no manager, no survey polling in between — started in the background by the reconcile hook
+# (after every round of the fleet) or by the live view, whichever comes first once the stage is due.
+# One at a time, under a lock; the round's own due-check (attempt gap counters) is the second line of
+# defence. Progress reports were a third until 2026-09-30; they are a worker now (fleet_specs).
 
 PERIODIC_WID = wid("periodic")
-# `progress` is tried every 2 h, not every 8: the planner itself requires 8 h since the last LANDED
-# report (project-wide), and a runner on the same period would drift out of phase with it and land a
-# report every 16 h. A not-due attempt costs the survey's reads and one `due` call.
 # `decide` rules on declined rounds (the worker's decide.py); it also runs soon after each new decline,
 # see periodic_due.
-PERIODIC = {"curate": 6 * 3600, "progress": 2 * 3600, "decide": 6 * 3600}  # stage -> seconds between runs
-# Which TauCetiProgress the progress rounds run, and how it picks a roadmap. Empty = the worker's own
-# pinned upstream and its default strategy. A fork must keep upstream's file formats, since
-# TauCetiRoadmap's merge gate is pinned to upstream.
+PERIODIC = {"curate": 6 * 3600, "decide": 6 * 3600}  # stage -> seconds between runs
+# Which TauCetiProgress the progress worker runs, and how it picks a roadmap. `threshold` (the default
+# here) needs a build that has it; empty repo/ref = the worker's own pinned upstream. A fork must keep
+# upstream's file formats, since TauCetiRoadmap's merge gate is pinned to upstream.
 PROGRESS_REPO = setting("progress", "repo")
 PROGRESS_REF = setting("progress", "ref")
-PROGRESS_STRATEGY = setting("progress", "strategy")
+PROGRESS_STRATEGY = setting("progress", "strategy", "threshold")
+
+
+def progress_worker_enabled() -> bool:
+    """`[progress] enabled = true` in fleet.toml. Off by default: the worker opens pull requests on
+    TauCetiRoadmap that its merge gate lands without a human, and each is announced on Zulip."""
+    return _setting_bool("progress", "enabled")
+
+
+def progress_env() -> dict[str, str]:
+    """The progress worker's TauCetiProgress: which build, which strategy, and its knobs."""
+    env = {"TAUCETI_PROGRESS_STRATEGY": PROGRESS_STRATEGY}
+    for var, value in (("TAUCETI_PROGRESS_REPO", PROGRESS_REPO), ("TAUCETI_PROGRESS_REF", PROGRESS_REF),
+                       ("TAUCETI_PROGRESS_THRESHOLD", setting("progress", "threshold")),
+                       ("TAUCETI_PROGRESS_MAX_OPEN", setting("progress", "max_open"))):
+        if value:
+            env[var] = value
+    return env
+
+
+def progress_worker_line() -> str:
+    """The progress worker's reports for the view: what is landing, then its last assessment (from its
+    own state files: reporting.py writes landing.json and scan.json)."""
+    d = WORKTREE / "state" / wid("prog", 1) / "progress"
+    land, scan = read_json(d / "landing.json"), read_json(d / "scan.json")
+    parts = []
+    prs = land.get("prs") or {}
+    if prs:
+        parts.append("landing " + ", ".join(f"#{n} {r.get('area')}" for n, r in sorted(prs.items())))
+    if scan.get("summary"):
+        when = f" ({age(scan['at'])} ago)" if isinstance(scan.get("at"), (int, float)) else ""
+        parts.append(f"{scan['summary']}{when}")
+    return "; ".join(parts) or "no assessment yet"
 
 
 def periodic_dir() -> Path:
@@ -1225,13 +1263,10 @@ def periodic_dir() -> Path:
 
 def periodic_enabled(stage: str) -> bool:
     """`curate` is always on, and `decide` unless `decide.enabled = false` in fleet.toml: both write
-    only the fleet's own records and target list. `progress` is opt-in (`tauceti-fleet periodic
-    --enable progress`): it publishes pull requests to TauCetiRoadmap, so it is switched on
-    deliberately. Rotation through the roadmaps (rather than busiest-first) comes from the pinned fork,
-    see PROGRESS_REF."""
+    only the fleet's own records and target list."""
     if stage == "decide":
         return setting("decide", "enabled", "true").lower() not in ("false", "0", "no")
-    return stage == "curate" or (periodic_dir() / f"{stage}.enabled").is_file()
+    return stage == "curate"
 
 
 # An author's decline ("main already has this") leaves its target skipped until the curator settles
@@ -1366,17 +1401,10 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
         "TAUCETI_TARGETS_PUSH": _config_env("TAUCETI_TARGETS_PUSH") or "1",
         # The one repository the gate lets the curator push to: the target list's own.
         "TAUCETI_TARGETS_REPO": _config_env("TAUCETI_TARGETS_REPO") or _targets_repo() or "",
-        # Progress reports: the fork's planner, rotating, remembering its choices between runs.
-        "TAUCETI_PROGRESS_STATE": _config_env("TAUCETI_PROGRESS_STATE") or str(periodic_dir() / "progress-rotation.json"),
         # The decide stage may close the account's own subsumed PRs only when the operator says so.
         "TAUCETI_DECIDE_CLOSE": "1" if _setting_bool("decide", "close") else "0",
         "TAUCETI_DECIDE_MAX_CLOSES_PER_DAY": setting("decide", "max_closes_per_day", "3"),
     })
-    for var, value in (("TAUCETI_PROGRESS_REPO", PROGRESS_REPO), ("TAUCETI_PROGRESS_REF", PROGRESS_REF),
-                       ("TAUCETI_PROGRESS_STRATEGY", PROGRESS_STRATEGY)):
-        value = _config_env(var) or value
-        if value:
-            env[var] = value
     # The same pacing curve as the managed workers, which get theirs as `pace = ...` in the config.
     # Without it the worker's default curve applies, and that one allows nothing at all early in a
     # usage window: the first curate round (2026-09-21) ended with "no model under pace right now".
@@ -1471,13 +1499,13 @@ def periodic_status(stage: str) -> dict:
 
 
 def cmd_periodic(a: argparse.Namespace) -> int:
-    """Show the cadence, or run a stage now (`--now curate|progress`, in the foreground)."""
-    if a.enable:
-        (periodic_dir() / f"{a.enable}.enabled").touch()
-        print(f"{a.enable}: enabled")
-    if a.disable:
-        (periodic_dir() / f"{a.disable}.enabled").unlink(missing_ok=True)
-        print(f"{a.disable}: disabled")
+    """Show the cadence, or run a stage now (`--now curate|decide`, in the foreground)."""
+    if a.enable or a.disable:
+        # Progress reports were a periodic stage switched by a marker file until 2026-09-30.
+        print(f"progress reports are a worker now ({wid('prog', 1)}): set `enabled = "
+              f"{'true' if a.enable else 'false'}` under [progress] in {SETTINGS_FILE}, then run "
+              f"`tauceti-fleet reconcile`", file=sys.stderr)
+        return 2
     if a.now:
         env = periodic_env(a)
         argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", a.now, "--worker-id", PERIODIC_WID,
@@ -1504,8 +1532,7 @@ def cmd_periodic(a: argparse.Namespace) -> int:
     for stage, gap in PERIODIC.items():
         last = periodic_dir() / f"{stage}.last"
         when = f"last run {age(last.stat().st_mtime)} ago" if last.exists() else "never run"
-        off = "decide.enabled = false in fleet.toml" if stage == "decide" else "tauceti-fleet periodic --enable progress"
-        state = f"disabled ({off})" if not periodic_enabled(stage) else ("DUE" if periodic_due(stage) else "not due")
+        state = "disabled (decide.enabled = false in fleet.toml)" if not periodic_enabled(stage) else ("DUE" if periodic_due(stage) else "not due")
         print(f"  {stage:9s} every {gap // 3600} h — {when}; {state}")
     print(f"logs: {STATE / 'logs' / PERIODIC_WID}/   login chain: {login_dir(PERIODIC_WID) or 'shared ~/.claude'}")
     return 0
@@ -1826,8 +1853,7 @@ def build_view(progress: Progress, console=None):
         if ps["running"]:
             label, style, what = "running", "green", f"{stage} round in progress"
         elif not ps["enabled"]:
-            label, style, what = "disabled", "dim", ("decide.enabled = false in fleet.toml" if stage == "decide"
-                                                     else f"tauceti-fleet periodic --enable {stage}")
+            label, style, what = "disabled", "dim", "decide.enabled = false in fleet.toml"
         else:
             label, style, what = "idle", "dim", (f"after a decline, else every {PERIODIC[stage] // 3600} h" if stage == "decide"
                                                  else f"every {PERIODIC[stage] // 3600} h")
@@ -1869,6 +1895,8 @@ def build_view(progress: Progress, console=None):
         claims = d.get("claims") or []
         p.add_row("claims held", ", ".join(claims) if claims else "none")
     p.add_row("target list", Text(target_list_summary(), overflow="fold"))
+    if progress_worker_enabled():
+        p.add_row("reports", Text(progress_worker_line(), overflow="fold"))
     if progress.remote_ok and d.get("error"):
         p.add_row(Text("progress", style="yellow"), Text(f"partial: {d['error']}", style="yellow"))
     p.add_row("gate", Text(gate_line, style="red" if "HALTED" in gate_line else "yellow" if "COOLDOWN" in gate_line else "", overflow="fold"))
@@ -2740,10 +2768,16 @@ reads_per_hour = 600
 # claude_effort = "high"
 
 [progress]
-# Which TauCetiProgress the progress rounds run; empty = the worker's pinned upstream.
+# The progress-report worker (<name>-prog1): off unless enabled. It writes a roadmap's STATUS.md /
+# PROGRESS.md report as soon as the roadmap qualifies (new PRs, and declared complete or N + T >
+# `threshold`, N PRs in its window and T days since its last report) and sees each report land.
+# enabled = true
+# Which TauCetiProgress it runs; the threshold strategy needs a build that has it.
 # repo = "owner/TauCetiProgress"
 # ref = "<full sha>"
-# strategy = "rotate"
+# strategy = "threshold"
+# threshold = 10
+# max_open = 2
 """
 
 
@@ -2864,10 +2898,10 @@ def main() -> int:
     at.add_argument("--open-roadmap", metavar="PR", type=int,
                     help="open the change --file-roadmap prepared for this PR (shown again first), without asking")
     at.set_defaults(fn=cmd_attention)
-    pe = sub.add_parser("periodic", help="the cadenced one-shot rounds (curate every 6 h, progress tried every 2 h): show, or run one now")
+    pe = sub.add_parser("periodic", help="the cadenced one-shot rounds (curate every 6 h, decide after declines): show, or run one now")
     pe.add_argument("--now", choices=tuple(PERIODIC), help="run this stage now, in the foreground")
-    pe.add_argument("--enable", choices=("progress",), help="turn the progress-report cadence on")
-    pe.add_argument("--disable", choices=("progress",), help="turn the progress-report cadence off")
+    pe.add_argument("--enable", choices=("progress",), help=argparse.SUPPRESS)  # progress is a worker now
+    pe.add_argument("--disable", choices=("progress",), help=argparse.SUPPRESS)
     pe.add_argument("--claude-model", default=None)
     pe.add_argument("--claude-effort", default=None)
     pe.set_defaults(fn=cmd_periodic)

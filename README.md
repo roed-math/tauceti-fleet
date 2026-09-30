@@ -63,7 +63,9 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `decide.enabled` | the decide stage, which rules on declined rounds (see docs/operating.md) | `true` |
 | `decide.close`, `decide.max_closes_per_day` | let the decide stage close the account's own PRs that main has subsumed, and how many a day | `false`, 3 |
 | `models.claude`, `models.claude_effort` | the Claude model for every Claude round; the reconcile applies a change | `claude-opus-5-5`, `high` |
-| `progress.repo`, `progress.ref`, `progress.strategy` | which TauCetiProgress the progress rounds run, and how it picks a roadmap | the worker's pinned upstream |
+| `progress.enabled` | the progress-report worker `<name>-prog1` (see docs/operating.md); it publishes to TauCetiRoadmap, so it is off until you turn it on | `false` |
+| `progress.repo`, `progress.ref`, `progress.strategy` | which TauCetiProgress it runs, and how it picks a roadmap | the worker's pinned upstream; `threshold` |
+| `progress.threshold`, `progress.max_open` | the N + T a roadmap must exceed, and how many of its reports may be open at once | 10, 2 |
 
 A flag of `up` overrides the matching setting for that run. For one-off runs the environment
 overrides settings too: `TAUCETI_FLEET_NAME`, `TAUCETI_FLEET_TARGETS`, `TAUCETI_EXPECT_LOGIN`,
@@ -81,7 +83,7 @@ interpreter that has `rich`, for the live view.
 | `logins` | the Claude login pool: chains, leases, sign-ins still missing |
 | `attention [--ack PR\|all] [--lookup]` | what needs you: rounds whose agent declined to act (a PR to close?), capped review exchanges |
 | `targets [--apply]` | audit the list's in-flight items against their PRs |
-| `periodic [--now STAGE] [--enable/--disable progress]` | the cadenced curate and progress rounds |
+| `periodic [--now STAGE]` | the cadenced curate and decide rounds |
 | `restart ID… [--when-idle] [--force]` | restart workers between rounds |
 | `reconcile [--dry-run]` | reshape the fleet from the backlog now (it runs after every round anyway) |
 | `round` | one supervised round in the foreground, then the gate report |
