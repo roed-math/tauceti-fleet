@@ -48,6 +48,7 @@ except ImportError:
     # No interpreter with rich: only the live view needs it; every other command still works.
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -1584,11 +1585,61 @@ def cmd_targets(a: argparse.Namespace) -> int:
         print(f"{area:24s} {slug:{width}s} #{pr} {state:7s} → {verdict}")
     print(f"\n{len(edits)} of {len(rows)} in-flight item(s) would be marked done" + ("" if a.apply else " (pass --apply)"))
     if a.apply and edits:
-        for old, new in edits.items():
-            text = text.replace(old, new, 1)
-        TARGETS.write_text(text)
-        print(f"applied to {TARGETS} — review the diff, commit it, and copy it to the fleet host's target file")
+        # Under the list's lock, against the list as it is now: the PR reads above took a while, and
+        # a curator (this fleet's or another's sharing the file) may have written it meanwhile.
+        with targets_lock():
+            text = TARGETS.read_text()
+            done = [old for old in edits if old in text]
+            for old in done:
+                text = text.replace(old, edits[old], 1)
+            TARGETS.write_text(text)
+        rest = len(edits) - len(done)
+        print(f"applied {len(done)} to {TARGETS}" + (f"; {rest} line(s) had changed meanwhile and were left" if rest else "")
+              + " — review the diff and commit it")
     return 0
+
+
+@contextlib.contextmanager
+def targets_lock():
+    """The target list's lock, the one the worker's curate and decide stages take: `.<name>.lock`
+    beside the list, opened read-only (enough for flock, and works on another user's lock file)."""
+    import fcntl
+
+    fd = os.open(TARGETS.parent / f".{TARGETS.name}.lock", os.O_RDONLY | os.O_CREAT, 0o664)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def targets_problem() -> str:
+    """Why this user could not keep the target list, or "". The curator writes the list in place,
+    takes a lock file beside it, and commits and pushes it when it is in a git repository. A list
+    several fleet users share lives in a clone one of them (or a third account) owns, so git must
+    trust it (safe.directory), it must create files the others can write (core.sharedRepository),
+    and the list and its directory must be writable here."""
+    d = TARGETS.parent
+    p = subprocess.run(["git", "-C", str(d), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if p.returncode != 0 and "dubious ownership" in p.stderr:
+        m = re.search(r"safe\.directory (\S+)", p.stderr)
+        top = m.group(1) if m else str(d)
+        return (f"git refuses {top}, which another user owns, so the curator could neither commit nor sync the "
+                f"target list: run `git config --global --add safe.directory {top}` as this user")
+    if p.returncode == 0:
+        top = Path(p.stdout.strip())
+        if top.stat().st_uid != os.getuid():
+            shared = subprocess.run(["git", "-C", str(top), "config", "--get", "core.sharedRepository"],
+                                    capture_output=True, text=True).stdout.strip().lower()
+            if shared not in ("group", "true", "1", "all", "world", "everybody") and not re.fullmatch(r"0?[0-7]{3,4}", shared):
+                return (f"{top} belongs to another user and git there creates files only their owner can write: "
+                        f"set `git -C {top} config core.sharedRepository group` (and make it group-writable)")
+    if not os.access(TARGETS, os.W_OK):
+        return f"{TARGETS} is not writable by this user, so the curator could not keep it (a shared list needs group write)"
+    lock = d / f".{TARGETS.name}.lock"
+    if not (os.access(lock, os.R_OK) if lock.exists() else os.access(d, os.W_OK)):
+        return f"this user cannot take the target list's lock {lock} (its directory needs group write)"
+    return ""
 
 
 def _roadmap_change(action: str, pr: int, *extra: str) -> int:
@@ -2029,6 +2080,8 @@ def cmd_up(a: argparse.Namespace) -> int:
         die(f"worktree not found: {WORKTREE}")
     if not TARGETS.is_file():
         die(f"target file not found: {TARGETS}")
+    if problem := targets_problem():
+        die(problem)
     if a.pilot:
         # The pilot's shape: one Claude author and no Codex author unless the owner says otherwise
         # on the command line; reconcile then sets fixers and reviewers from the backlog.

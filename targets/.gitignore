@@ -1,0 +1,2 @@
+# The lock the curator and `tauceti-fleet targets --apply` take beside each list.
+.*.lock
