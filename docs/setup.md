@@ -73,6 +73,10 @@ sudo loginctl enable-linger fleetuser
 `incus-admin` is equivalent to root on the host, so give it only to fleet accounts. Lingering keeps
 the user's systemd manager, which runs bubble's daemons, alive with nobody logged in.
 
+If you install the user's `authorized_keys` as root, give `~/.ssh` back to the user afterwards
+(`sudo chown fleetuser:fleetuser ~fleetuser/.ssh`): bubble writes its SSH configuration there each
+time it creates a container.
+
 ## 3. The user's own setup (as the fleet user)
 
 A `sudo -iu` shell has no systemd session variables. Add this to `~/.profile`, where it does nothing
@@ -221,7 +225,8 @@ fleets, or be shared on purpose.
   port = 7665
   ```
 
-  Containers learn the ports from the endpoint files the daemons write, so nothing else changes.
+  A third user takes 7673, 7674 and 7675, and so on. Containers learn the ports from the endpoint
+  files the daemons write, so nothing else changes.
 - **The GitHub budget, if the fleets act as one account.** Each fleet's gate counts only its own
   requests, so two fleets as one account spend twice the budget you meant to allow. Split the
   account's budget between them in `gate.mutations_per_hour` and `gate.reads_per_hour` (40 writes
