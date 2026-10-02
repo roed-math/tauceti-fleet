@@ -62,13 +62,41 @@ sudo ufw allow in on incusbr0 && sudo ufw route allow in on incusbr0 && sudo ufw
 sudo adduser fleetuser
 ```
 
+Give the user Incus through `incus-user`, the group `incus`, not `incus-admin`:
+
 ```bash
-sudo adduser fleetuser incus-admin
+sudo adduser fleetuser incus
 ```
 
 ```bash
 sudo loginctl enable-linger fleetuser
 ```
+
+`incus-admin` is equivalent to root on the host: its members can start a privileged container with
+the host's filesystem mounted. A fleet user should not be, because not every round runs in a
+container. The curate, decide and progress rounds run their agent on the host, as this user, so an
+agent misled by something it read could use `incus` to become root. Membership of `incus` instead
+gives the user a project of its own, `user-<uid>`, which Incus creates the first time the user runs
+`incus`. It is confined to the user's own uid, to disk paths under the user's home, and to a bridge
+of its own, `incusbr-<uid>`, which is everything bubble needs: bubble's `fleet` branch finds that
+bridge itself, and maps the user onto the container's user in place of the project's default
+mapping. Privileged containers are refused, and the project cannot lift its own restrictions.
+Separate bridges also keep each fleet's containers away from the others'.
+
+The user's bridge exists once the user has run `incus` once. As the user:
+
+```bash
+incus project list
+```
+
+Then, as a sudoer, the firewall rules section 1 gave `incusbr0`, for that bridge (here uid 1007):
+
+```bash
+sudo ufw allow in on incusbr-1007 && sudo ufw route allow in on incusbr-1007 && sudo ufw route allow out on incusbr-1007
+```
+
+Without them a container on the bridge gets no address, and bubble waits on its network until the
+round times out.
 
 bubble maps the user's own uid and gid onto the container's user, so that what it mounts in (its
 shared git store among it) belongs to that user inside. Incus allows that only for ids root has
@@ -84,8 +112,9 @@ while no other fleet on the host is mid-round; bubble's auth proxy recovers by i
 kim-em/bubble#344, and otherwise needs `systemctl --user restart bubble-auth-proxy.service` as each
 fleet user.
 
-`incus-admin` is equivalent to root on the host, so give it only to fleet accounts. Lingering keeps
-the user's systemd manager, which runs bubble's daemons, alive with nobody logged in.
+Lingering keeps the user's systemd manager, which runs bubble's daemons, alive with nobody logged
+in. That manager keeps the groups it started with: after changing a user's groups, restart it with
+`sudo systemctl restart user@$(id -u fleetuser).service`.
 
 If you install the user's `authorized_keys` as root, give `~/.ssh` back to the user afterwards
 (`sudo chown fleetuser:fleetuser ~fleetuser/.ssh`): bubble writes its SSH configuration there each
@@ -229,13 +258,15 @@ Each fleet user needs everything in sections 2 to 4. Then a few things must diff
 fleets, or be shared on purpose.
 
 - **The fleet name.** Worker ids, and the Incus containers named after them
-  (`tauceti-worker-<id>`), are prefixed with `fleet.name`. Membership of `incus-admin` lets every
-  fleet user see and delete every user's containers, so the names are what keeps the fleets apart:
-  choose names that are not prefixes of each other, such as `gq2` and `gqm`.
-- **bubble's ports.** Each user's bubble runs a relay (port 7653), an auth proxy (7654) and an
-  artifact cache (7655) on the host. Every user after the first moves all three, in
-  `~/.bubble/config.toml`, before its first round. The file already has a `[relay]` section; change
-  its port and add the other two:
+  (`tauceti-worker-<id>`), are prefixed with `fleet.name`, so choose names that are not prefixes of
+  each other, such as `gq2` and `gqm`. Users in `incus` (section 2) each see only their own project,
+  so their containers cannot collide. Users in `incus-admin` share the `default` project and can
+  see and delete each other's containers, so there the names are all that keeps the fleets apart.
+- **bubble's ports, for users who share `incusbr0`.** Each user's bubble runs a relay (port 7653),
+  an auth proxy (7654) and an artifact cache (7655), listening on the address of the user's bridge.
+  Users in `incus` have bridges of their own and need nothing here. Users in `incus-admin` all listen
+  on `incusbr0`, so every one after the first moves all three, in `~/.bubble/config.toml`, before its
+  first round. The file already has a `[relay]` section; change its port and add the other two:
 
   ```toml
   [relay]

@@ -68,6 +68,11 @@ say why: "host uid … not mapped", then "dubious ownership" for each Lake depen
 pre-populate. Root has not delegated this user's ids to Incus, so the shared git store mounted into
 the container belongs to nobody there. See docs/setup.md, section 2; `up` refuses to start without it.
 
+**Rounds hang at "Waiting for network…", or bubble's image build cannot resolve github.com, for a
+user in `incus`.** The user's containers are on its own bridge, `incusbr-<uid>`, and the host
+firewall drops their traffic there, DHCP included, so they never get an address. Add the bridge's
+rules (docs/setup.md, section 2).
+
 ## Pushes and commits
 
 **Pushes refused with a message about workflows.** The GitHub token lacks the `workflow` scope, and

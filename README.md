@@ -24,6 +24,8 @@ only fleet-specific files here are the target lists.
 ## What you need
 
 - **A host.** Ubuntu with Incus, so that every round runs in an egress-denied container (bubble).
+  Each fleet runs as its own Unix user, which needs no sudo and, through `incus-user`, is not
+  root-equivalent either.
   Ten workers run on 32 cores and 96 GB of memory. Disk runs out first: about 20 GB per worker
   checkout, plus the Mathlib cache. macOS works without the sandbox
   (`up.sandbox = "host"`), which is fine for trying it and not for leaving it unattended.
@@ -133,8 +135,10 @@ interpreter that has `rich`, for the live view.
 - **TauCetiWorker**, branch `feat/roadmap-targets-v2` of
   [roed-math/TauCetiWorker](https://github.com/roed-math/TauCetiWorker). Target lists, the GitHub
   gate, the curate stage, and the sandbox fixes the fleet relies on are there and not yet upstream.
-- **bubble** with five fixes still open upstream (kim-em/bubble#340 to #344). Branch `fleet` of
-  [roed-math/bubble](https://github.com/roed-math/bubble) combines them. Without #342 the sandbox's
+- **bubble** with fixes not yet upstream. Branch `fleet` of
+  [roed-math/bubble](https://github.com/roed-math/bubble) combines them: five open upstream
+  (kim-em/bubble#340 to #344), and two that let bubble run for a user confined by `incus-user`
+  rather than root-equivalent `incus-admin` (docs/setup.md, section 2). Without #342 the sandbox's
   cache proxy wedges after 256 connections; without #343 reviews of PRs with more than 100 comments
   fail; without #344 the auth proxy goes deaf whenever Incus restarts (an unattended upgrade will do
   it) until it is restarted by hand.
