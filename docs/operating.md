@@ -90,6 +90,9 @@ The live view shows a `needs you` badge and panel; `tauceti-fleet attention` pri
   stops spending on that PR until you look.
 - **A target-list item whose PR closed without a recorded verdict.** The curator cannot tell whether
   the work landed elsewhere, so it asks: mark it `[ ]` to re-author or `[x]` if done.
+- **A target list that diverged from its repository** (`targets-diverged`): a curation committed
+  here conflicts with one pushed elsewhere. See
+  [target-lists.md](target-lists.md#sharing-a-list).
 
 A worker in a long backoff can be restarted between rounds with `tauceti-fleet restart ID`, or
 `--when-idle` to queue it for the end of the current round.
@@ -140,8 +143,10 @@ due. One runs at a time.
   marks it done, closed with a recorded subsumption verdict marks it done and names the PR that
   subsumed it, closed without one is left for you. For the items the authors would take next it also
   looks for the milestone's declarations on main, and asks the model; only an explicit verdict with
-  named evidence marks an item "landed elsewhere". When the list is tracked in git it commits the
-  change, and pushes it when the fleet's account can push to that repository.
+  named evidence marks an item "landed elsewhere". When the list is tracked in git it pulls before
+  reading it, commits the change, and pushes it when the fleet's account can push to that
+  repository, so several fleets or hosts can share one list
+  ([target-lists.md](target-lists.md#sharing-a-list)).
 - **decide**, on unless `decide.enabled = false`, rules on declined rounds. It runs within about 10
   minutes of a new decline, and every 6 hours while a ruling waits on something. Without a model it
   settles declines that events have overtaken: the PR merged, closed or has a new head. It notes an

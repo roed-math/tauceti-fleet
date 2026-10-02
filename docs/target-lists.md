@@ -50,6 +50,31 @@ Mark an item `[~]` with `in flight: #N` when you open a PR for it by hand. The f
 record their claims themselves, and the live view counts an item done as soon as a merged PR carries
 its marker.
 
+## Sharing a list
+
+A list can be shared in two ways, and the two combine.
+
+- **Through its repository, between hosts.** When the list is tracked in git, the curator commits
+  each change and pushes it to the list's `origin`. Before it reads the list it fetches and rebases
+  onto the upstream, so it starts from what the other hosts curated, and a push rejected because
+  someone pushed first is retried after the same sync.
+- **As one file, between fleets on one host.** Every fleet's `fleet.targets` names the same file, in
+  a clone their users share; [setup.md](setup.md#sharing-one-target-list) sets one up.
+
+Everything that writes the list (the curate and decide rounds of every fleet, and
+`tauceti-fleet targets --apply`) takes the lock `.<name>.lock` beside it, then writes its edit merged
+three ways with the list as it is at that moment. Edits to different items both land. Edits to the
+same or adjacent lines are not written, and the next round starts from the new list. The list's
+repository should ignore `.*.lock`, as this one does.
+
+Two cases are left to you:
+
+- A clone with uncommitted changes, such as a hand edit, is never rebased. Commit the edit; the
+  next curation pushes it.
+- A local commit that conflicts with the upstream is left in place, and `tauceti-fleet attention`
+  lists it as `targets-diverged`. In the clone, `git pull --rebase`, settle the list by hand, and
+  `git push`.
+
 ## Writing a good list
 
 - Take milestones from what the roadmap READMEs actually state, not from what you wish they said.

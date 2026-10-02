@@ -10,15 +10,50 @@ keeps a pool of Claude logins that renew themselves, runs everything through a s
 budget, and shows a live view.
 
 ```
-bin/tauceti-fleet     the tool
-targets/              target lists; each fleet points at one of them
-docs/setup.md         installing a host, and each user on it
-docs/operating.md     what the fleet does on its own, and what needs you
-docs/target-lists.md  writing a target list
+bin/tauceti-fleet        the tool
+targets/                 target lists; each fleet points at one of them
+docs/setup.md            installing a host, each user on it, and several fleets on one host
+docs/operating.md        what the fleet does on its own, and what needs you
+docs/target-lists.md     writing a target list, and sharing one
+docs/troubleshooting.md  symptoms, what causes them, and the fix
 ```
 
 Everything about one particular fleet lives in its **settings file**, outside this repository. The
 only fleet-specific files here are the target lists.
+
+## What you need
+
+- **A host.** Ubuntu with Incus, so that every round runs in an egress-denied container (bubble).
+  Ten workers run on 32 cores and 96 GB of memory. Disk runs out first: about 20 GB per worker
+  checkout, plus the Mathlib cache. macOS works without the sandbox
+  (`up.sandbox = "host"`), which is fine for trying it and not for leaving it unattended.
+- **A GitHub account for the fleet, and only for the fleet.** Every request goes through a budget
+  (the gate) because automated volume is what GitHub's abuse detection looks for, and an account
+  can be suspended for it. Never sign the fleet in as a person.
+- **A Claude subscription.** The fleet signs it in several times, once per login chain, and spends
+  it. A **Codex** subscription is optional: `auto` workers use Codex while it has room and Claude
+  otherwise.
+- **A target list**: the milestones you want, from the roadmaps in
+  [TauCetiRoadmap](https://github.com/TauCetiProject/TauCetiRoadmap). See
+  [docs/target-lists.md](docs/target-lists.md), or start from the one in `targets/`.
+
+## How a fleet works
+
+- **Workers** are long-running loops, each a TauCetiWorker process with a role. **Authors** take the
+  next eligible milestone on the target list and open a PR for it. **Fixers** answer review, repair
+  CI and rebase the fleet's own PRs. **Reviewers** review other people's PRs, which is what the fleet
+  owes the project for the reviews its PRs get.
+- After every round the worker calls `tauceti-fleet reconcile`, which **reshapes the fleet** from the
+  backlog: more fixers when many PRs need work, no authors while too many PRs are open.
+- Every GitHub request, from the workers and from the agents inside their rounds, passes **the gate**:
+  rolling-hour budgets for reads and writes, and a halt on any identity but the fleet's account.
+- Workers **claim** what they work on in a repository shared by every fleet in the project
+  (`TauCetiProject/tauceti-claims`), so fleets, yours and other people's, never duplicate a PR or a
+  fix.
+- Claude renews its access tokens by revoking the old ones, so the fleet keeps a **pool of logins**,
+  one per concurrently running worker, and renews them itself.
+- Periodic rounds keep the **target list true** (the curator) and rule on rounds whose agent declined
+  to act (the decide stage). What needs you is collected in one place: `tauceti-fleet attention`.
 
 ## Quick start
 
@@ -48,7 +83,7 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | setting | meaning | default |
 |---|---|---|
 | `fleet.name` | short lowercase word; worker ids are `<name>-c1`, `<name>-fix1`, `<name>-rev1`, … | required |
-| `fleet.targets` | the target list the authors work through | required |
+| `fleet.targets` | the target list the authors work through; several fleets may share one (docs/setup.md) | required |
 | `fleet.github_login` | the GitHub account every worker must act as; any other identity halts the worker | required |
 | `fleet.claim_repo` | the project-wide claim namespace; every fleet must agree on it | `TauCetiProject/tauceti-claims` |
 | `paths.worker` | a TauCetiWorker checkout (see Requirements) | `~/TauCetiWorker-v2` |
@@ -98,10 +133,11 @@ interpreter that has `rich`, for the live view.
 - **TauCetiWorker**, branch `feat/roadmap-targets-v2` of
   [roed-math/TauCetiWorker](https://github.com/roed-math/TauCetiWorker). Target lists, the GitHub
   gate, the curate stage, and the sandbox fixes the fleet relies on are there and not yet upstream.
-- **bubble** with four fixes still open upstream (kim-em/bubble#340, #341, #342, #343). Branch
-  `fleet` of [roed-math/bubble](https://github.com/roed-math/bubble) combines them. Without #342 the
-  sandbox's cache proxy wedges after 256 connections; without #343 reviews of PRs with more than 100
-  comments fail.
+- **bubble** with five fixes still open upstream (kim-em/bubble#340 to #344). Branch `fleet` of
+  [roed-math/bubble](https://github.com/roed-math/bubble) combines them. Without #342 the sandbox's
+  cache proxy wedges after 256 connections; without #343 reviews of PRs with more than 100 comments
+  fail; without #344 the auth proxy goes deaf whenever Incus restarts (an unattended upgrade will do
+  it) until it is restarted by hand.
 - **Claude Code** 2.1.280 or newer for Opus 5.5, on the host and inside bubble's images (the `fleet`
   branch pins it). **Codex** is optional; without it the `auto` workers run on Claude.
 - **A GitHub account for the fleet**, used by no person. [docs/setup.md](docs/setup.md) explains why.

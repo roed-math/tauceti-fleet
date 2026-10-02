@@ -91,6 +91,9 @@ Tools under the user's home:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+uv installs into `~/.local/bin` and adds it to `~/.profile`. Log in again, or `. ~/.profile`, before
+going on: the tool, `bubble` and the worker's preflight (which looks for `uvx`) all expect it on PATH.
+
 ```bash
 curl -sS https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y
 ```
@@ -135,6 +138,13 @@ ln -sf ~/tauceti-fleet/bin/tauceti-fleet ~/.local/bin/tauceti-fleet
 The `uv tool install` of the upstream worker is only there to give the tool an interpreter with
 `rich` for the live view; the fleet always runs the checkout in `~/TauCetiWorker-v2`.
 
+A commit identity for the fleet. The agents commit inside their containers, which inherit it, and
+without one every commit fails with "Committer identity unknown":
+
+```bash
+git config --global user.name "Fleet Bot" && git config --global user.email bot@example.org
+```
+
 Logins, once each, at the keyboard. `gh` as the fleet's GitHub account, over HTTPS, with the
 `workflow` scope:
 
@@ -142,18 +152,16 @@ Logins, once each, at the keyboard. `gh` as the fleet's GitHub account, over HTT
 gh auth login -h github.com -s workflow -p https
 ```
 
+Codex is optional; without it the `auto` workers run on Claude:
+
 ```bash
 codex login
 ```
 
 Claude signs in once per login chain, after `init`: `tauceti-fleet logins` prints the lines.
 
-If the curator should push the target list it edits, give the clone of this repository a commit
-identity and a remote the fleet's account can push to:
-
-```bash
-git -C ~/tauceti-fleet config user.name "Fleet Bot" && git -C ~/tauceti-fleet config user.email bot@example.org
-```
+The curator commits the target list it edits and pushes it to the list's `origin`, so the fleet's
+account must be able to push there. If it cannot, the commits stay local and nothing else breaks.
 
 ## 4. Create the fleet
 
@@ -166,7 +174,9 @@ tauceti-fleet logins
 ```
 
 Run each printed `CLAUDE_CONFIG_DIR=… claude auth login` line and sign in with the subscription the
-workers spend. Six chains cover every shape; the pool is described in
+workers spend. Each prints a URL to open in a browser and asks for the code it shows, so this needs
+you at a terminal on the host (an `ssh` session is fine). `logins` asks for one chain per worker the
+largest shape can run at once, seven at most; the pool is described in
 [operating.md](operating.md#the-claude-login-pool).
 
 Before the fleet, check the pieces offline, then run one supervised round:
@@ -188,14 +198,22 @@ round's log and any pull request it opened as you would a colleague's. Then `tau
 
 ## Several fleets on one host
 
-Each fleet user needs everything in sections 2 to 4, and three things must differ between fleets.
+Each fleet user needs everything in sections 2 to 4. Then a few things must differ between the
+fleets, or be shared on purpose.
 
-- **The fleet name.** Worker ids, and the Incus containers named after them, are prefixed with
-  `fleet.name`, so two fleets with different names never touch each other's containers.
-- **bubble's ports.** Each user's bubble runs an auth proxy (port 7654) and an artifact cache (port
-  7655) on the host. A second user must move both, in `~/.bubble/config.toml`:
+- **The fleet name.** Worker ids, and the Incus containers named after them
+  (`tauceti-worker-<id>`), are prefixed with `fleet.name`. Membership of `incus-admin` lets every
+  fleet user see and delete every user's containers, so the names are what keeps the fleets apart:
+  choose names that are not prefixes of each other, such as `gq2` and `gqm`.
+- **bubble's ports.** Each user's bubble runs a relay (port 7653), an auth proxy (7654) and an
+  artifact cache (7655) on the host. Every user after the first moves all three, in
+  `~/.bubble/config.toml`, before its first round. The file already has a `[relay]` section; change
+  its port and add the other two:
 
   ```toml
+  [relay]
+  port = 7663
+
   [auth_proxy]
   port = 7664
 
@@ -203,14 +221,65 @@ Each fleet user needs everything in sections 2 to 4, and three things must diffe
   port = 7665
   ```
 
-- **The GitHub budget, if both fleets use the same GitHub account.** Each fleet counts its own
-  requests, so two fleets as one account spend twice the budget you meant to allow. Either give each
-  fleet half (`gate.mutations_per_hour`, `gate.reads_per_hour`), or give each fleet its own account.
+  Containers learn the ports from the endpoint files the daemons write, so nothing else changes.
+- **The GitHub budget, if the fleets act as one account.** Each fleet's gate counts only its own
+  requests, so two fleets as one account spend twice the budget you meant to allow. Split the
+  account's budget between them in `gate.mutations_per_hour` and `gate.reads_per_hour` (40 writes
+  and 1,500 reads an hour, say, as 30 + 1,100 and 10 + 400), or give each fleet its own account. The
+  open-PR limits under `[authoring]` count the account's PRs, so they already hold for both together.
+- **One progress-report worker per account.** Turn `progress.enabled` on in one fleet only.
+- **Claude logins.** Each user signs in its own pool. Two fleets may spend the same subscription,
+  but they share its usage window.
 
-Two fleets on one host have not been run side by side yet; watch the first rounds of the second.
+The two fleets' workers never duplicate each other's work: they claim it in the project-wide claim
+repository, as fleets on different hosts do.
 
-Each user should sign in its own Claude login pool. Two fleets can spend the same Claude
-subscription, but they share its usage window.
+### Sharing one target list
+
+Fleets that work toward the same goal can follow one list file, so that a milestone one fleet's
+curator marks done is done for both at once.
+
+1. A directory every fleet user can write through a group they all belong to. The home of an
+   account whose group they are members of works, if that group can enter it (`chmod 750` is
+   enough). A sudoer adds each fleet user to the group once:
+
+   ```bash
+   sudo adduser fleetuser shared
+   ```
+
+   Then, as that account (here `shared`), the directory, owned by the group and handing the group on
+   to everything created in it:
+
+   ```bash
+   umask 002 && mkdir -p ~/fleet && chgrp shared ~/fleet && chmod 2775 ~/fleet
+   ```
+
+2. A clone of the list's repository there, group-writable, with git told to keep it so:
+
+   ```bash
+   git clone https://github.com/YOU/tauceti-fleet.git /home/shared/fleet/tauceti-fleet
+   ```
+
+   ```bash
+   cd /home/shared/fleet/tauceti-fleet && git config core.sharedRepository group && chmod -R g+rwX . && find . -type d -exec chmod g+s {} +
+   ```
+
+3. As each fleet user, tell git to trust the clone. git refuses a repository another user owns,
+   and the curator could then neither commit nor sync the list:
+
+   ```bash
+   git config --global --add safe.directory /home/shared/fleet/tauceti-fleet
+   ```
+
+4. Point every fleet's `fleet.targets` at the list in that clone. `up` refuses to start a fleet that
+   could not keep the list: refused by git, not group-shared, or not writable.
+
+Whoever writes the list (the curate and decide rounds of any of the fleets, or
+`tauceti-fleet targets --apply`) takes a lock beside it and merges its edit with whatever changed
+since it read the list; [target-lists.md](target-lists.md#sharing-a-list) has the details.
+
+Watch the first rounds of the second fleet: `tauceti-fleet gate status` in each, and `incus list`
+to see both fleets' containers by name.
 
 ## macOS
 
