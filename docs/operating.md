@@ -125,7 +125,13 @@ builds. It asks the gate again, at most twice, when the gate has been quiet for 
 green build. It ignores the gate's first-pass "build not completed" and any refusal about an earlier
 head. It files a `progress-stuck` item under `attention` for anything that needs you: a build that
 fails on an up-to-date report while `main` builds, or a refusal that survives the re-asks. At most
-`progress.max_open` (2) of its reports are open at once.
+`progress.max_open` (2) of the account's reports are open at once.
+
+Several fleets acting as one account may each run a progress worker. They never write the same
+report: choosing and writing happen under a claim each worker holds in turn. Each sees through only
+the reports it opened, so the re-ask and escalation rules above apply once per report; a report no
+worker has landed for 8 hours, opened by hand or left by a stopped fleet, is adopted by whichever
+worker looks next.
 
 Before a report is opened, the writing model is given the library's source at the window's end to
 check each layer's state against. It must run `tauceti-progress check` and fix what that reports:

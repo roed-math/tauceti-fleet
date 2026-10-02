@@ -227,7 +227,10 @@ fleets, or be shared on purpose.
   account's budget between them in `gate.mutations_per_hour` and `gate.reads_per_hour` (40 writes
   and 1,500 reads an hour, say, as 30 + 1,100 and 10 + 400), or give each fleet its own account. The
   open-PR limits under `[authoring]` count the account's PRs, so they already hold for both together.
-- **One progress-report worker per account.** Turn `progress.enabled` on in one fleet only.
+- **Progress reports.** Any of the fleets may run a progress-report worker. They take turns choosing
+  and writing a report, each sees through only the reports it opened, and `progress.max_open`
+  counts the account's open reports, so a second worker adds no load on TauCetiRoadmap's merge gate.
+  What it adds is a reporter that keeps working while the other fleet is stopped or out of quota.
 - **Claude logins.** Each user signs in its own pool. Two fleets may spend the same subscription,
   but they share its usage window.
 
