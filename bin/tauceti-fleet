@@ -2710,12 +2710,15 @@ def cmd_logins(a: argparse.Namespace) -> int:
         else:
             state = "SHARED ~/.claude — a renewal by any other worker revokes this one's in-flight token"
         print(f"  {wid:9s} {s_['agent']:6s} {state}")
-    # How many chains the fleet can use at once: every Claude-capable worker the shape allows to run
-    # together (Claude authors, every fixer and reviewer, all `auto`), not the number running now.
-    need = getattr(shape, "claude", 0) + getattr(a, "max_fixers", 3) + getattr(a, "max_reviewers", 2) + 1  # + periodic
+    # How many chains the fleet can use at once: every Claude-capable worker the shape defines (Claude
+    # and `auto` authors, every fixer and reviewer, the progress worker), whether or not it runs now,
+    # plus the periodic rounds. Counted from the specs themselves: a sum of shape settings left out
+    # the `auto` authors, which run on Claude whenever Codex is spent, and the progress worker.
+    capable = [s_ for s_ in specs if s_["agent"] in ("claude", "auto")]
+    need = len(capable) + 1
     have = len(slots)
-    print(f"\n{have} chain(s) for up to {need} concurrent Claude-capable workers "
-          f"({getattr(shape, 'claude', 0)} Claude author(s) + {getattr(a, 'max_fixers', 3)} fixers + {getattr(a, 'max_reviewers', 2)} reviewers).")
+    print(f"\n{have} chain(s) for up to {need} Claude-capable workers at once "
+          f"({len(capable)} workers that can run Claude, and the periodic rounds).")
     if have < need:
         print("Create the missing ones (each opens a browser sign-in; the same Claude account is fine, any order):")
         taken = {d.name for d in slots}

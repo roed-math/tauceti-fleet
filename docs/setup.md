@@ -156,11 +156,19 @@ Logins, once each, at the keyboard. `gh` as the fleet's GitHub account, over HTT
 gh auth login -h github.com -s workflow -p https
 ```
 
+Choose the web browser login and answer yes to authenticating Git. Over `ssh` it prints a code to
+enter at `https://github.com/login/device`; sign in there as the fleet's account, not your own, since
+whichever account the browser is signed in to is the one gh gets.
+
 Codex is optional; without it the `auto` workers run on Claude:
 
 ```bash
-codex login
+codex login --device-auth
 ```
+
+`--device-auth` prints a URL and a code to enter in any browser, so it works over `ssh`; plain
+`codex login` waits for a browser on the host itself. One login per fleet user is enough: Codex is
+not pooled, and the fleet renews it.
 
 Claude signs in once per login chain, after `init`: `tauceti-fleet logins` prints the lines.
 
@@ -179,9 +187,10 @@ tauceti-fleet logins
 
 Run each printed `CLAUDE_CONFIG_DIR=… claude auth login` line and sign in with the subscription the
 workers spend. Each prints a URL to open in a browser and asks for the code it shows, so this needs
-you at a terminal on the host (an `ssh` session is fine). `logins` asks for one chain per worker the
-largest shape can run at once, seven at most; the pool is described in
-[operating.md](operating.md#the-claude-login-pool).
+you at a terminal on the host (an `ssh` session is fine). `logins` asks for one chain per worker that
+can run Claude, and one for the periodic rounds: 11 for the full shape with a progress worker, fewer
+in pilot mode. Run it again after changing the shape, since a bigger fleet needs more. The pool is
+described in [operating.md](operating.md#the-claude-login-pool).
 
 Before the fleet, check the pieces offline, then run one supervised round:
 
