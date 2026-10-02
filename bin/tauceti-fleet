@@ -441,10 +441,12 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
     # its subscription running dry instead of parking. Reviewers run `auto` for the same reason. An
     # `auto` worker may not take --author-model; its models come from TAUCETI_AUTHORING_* above.
     for i in range(1, a.fixers + 1):
+        # Fixers read the target list too: they take the PRs serving it first (worker c31c588).
         if i % 2 == 1:
-            add(wid("fix", i), "claude", "fix,fix-ci,rebase", author_model=a.claude_model, author_effort=a.claude_effort)
+            add(wid("fix", i), "claude", "fix,fix-ci,rebase", roadmap_targets=str(TARGETS),
+                author_model=a.claude_model, author_effort=a.claude_effort)
         else:
-            add(wid("fix", i), "auto", "fix,fix-ci,rebase")
+            add(wid("fix", i), "auto", "fix,fix-ci,rebase", roadmap_targets=str(TARGETS))
     for i in range(1, a.reviewers + 1):
         add(wid("rev", i), "auto", "review")
     # The progress-report worker (opt-in: `[progress] enabled = true`, since it publishes to
@@ -2416,7 +2418,10 @@ def _shape_from_config(a: argparse.Namespace) -> argparse.Namespace:
     a.fixers = sum(1 for i in ids if re.fullmatch(rf"{re.escape(NAME)}-fix\d+", i))
     a.pilot = 'TAUCETI_REACTIONS = "0"' in t
     a.sandbox = "bubble" if 'sandbox = "bubble"' in t else "host"
-    a.pace = os.environ.get("TAUCETI_PACE", "") or (re.search(r'^pace\s*=\s*"([^"]+)"', t, re.M) or [None, ""])[1]
+    # The pace follows the settings file, as the budgets and models do, so changing it is an edit to
+    # fleet.toml and a reconcile; $TAUCETI_PACE still overrides it for a one-off run.
+    a.pace = (os.environ.get("TAUCETI_PACE", "") or setting("up", "pace")
+              or (re.search(r'^pace\s*=\s*"([^"]+)"', t, re.M) or [None, ""])[1])
     # The gate budgets follow the settings file when it names them, so raising one is an edit to
     # fleet.toml and a reconcile, with no `up` (which would also re-apply every other default).
     m = re.search(r'TAUCETI_GATE_MUTATIONS_PER_HOUR\s*=\s*"(\d+)"', t)

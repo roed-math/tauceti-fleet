@@ -13,7 +13,9 @@ reshapes the fleet:
   fleet's account has fewer than `authoring.max_open_prs` open PRs in scope (the worker's default is
   8). At that many or more the worker's own backpressure rule would make them decline every round, so
   they stay defined but disabled.
-- **Fixers** (`<name>-fix*`) run fix, fix-ci and rebase. They are sized by the fix backlog: the
+- **Fixers** (`<name>-fix*`) run fix, fix-ci and rebase, taking the PRs that serve the target list
+  first: a PR whose marker names an item of the list, or one the list marks `in flight`. Only when
+  none of those needs work do they turn to the account's other PRs. They are sized by the fix backlog: the
   account's PRs labelled `awaiting-author` or `ci-failed`. There are 3 while authoring is blocked or
   the backlog is 8 or more, otherwise 2 with a backlog of 6 or 7 and 1 below that, never more than
   there are PRs to fix. Odd-numbered fixers are pinned to Claude; even-numbered ones run `auto`.
