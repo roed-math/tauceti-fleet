@@ -448,7 +448,9 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
         else:
             add(wid("fix", i), "auto", "fix,fix-ci,rebase", roadmap_targets=str(TARGETS))
     for i in range(1, a.reviewers + 1):
-        add(wid("rev", i), "auto", "review")
+        # Reviewers read the list too: among the account's own PRs they take those serving it first
+        # (worker 51c9754); the balance between our PRs and other people's is unchanged.
+        add(wid("rev", i), "auto", "review", roadmap_targets=str(TARGETS))
     # The progress-report worker (opt-in: `[progress] enabled = true`, since it publishes to
     # TauCetiRoadmap). Not periodic: it looks for work all the time, writing a roadmap's report as soon
     # as the roadmap qualifies (TauCetiProgress's `threshold` strategy) and seeing each report land.

@@ -21,6 +21,8 @@ reshapes the fleet:
   there are PRs to fix. Odd-numbered fixers are pinned to Claude; even-numbered ones run `auto`.
 - **Reviewers** (`<name>-rev*`) run `auto`: 2 once two or more authors and fixers are active, else 1.
   Reviewing other people's PRs is what the fleet owes the project for the reviews its own PRs get.
+  When a reviewer does take one of the account's own PRs, it takes those serving the target list
+  first; how often it reviews the account's own PRs rather than other people's is unchanged.
 
 An `auto` worker uses Codex while Codex's usage window has room and Claude otherwise, so that half
 of the fleet never parks when one subscription runs dry.
