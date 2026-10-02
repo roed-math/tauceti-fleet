@@ -727,9 +727,35 @@ def _gh_status() -> tuple[str, str]:
     return f"gh: {m.group(1)}" + ("" if scopes else " (no `workflow` scope: gh auth refresh -s workflow)"), "green" if scopes else "yellow"
 
 
+def operator_claude_users() -> list[str] | None:
+    """The enabled Claude-capable workers, and the periodic runner, that hold no login chain and so
+    sign in with the operator's ~/.claude; None when there is no fleet config to tell from."""
+    if not CONFIG.is_file():
+        return None
+    leases = read_leases()
+    users = []
+    for wid, body in parse_blocks(CONFIG.read_text()).items():
+        agent = re.search(r'^agent\s*=\s*"([^"]+)"', body, re.M)
+        enabled = not re.search(r"^enabled\s*=\s*false", body, re.M)
+        if enabled and agent and agent.group(1) in ("claude", "auto") and login_dir(wid, leases) is None:
+            users.append(wid)
+    if login_dir(PERIODIC_WID, leases) is None:
+        users.append(PERIODIC_WID)
+    return users
+
+
 def credential_lines() -> list[tuple[str, str]]:
     pool = _login_pool_line()
-    return [_claude_operator_expiry(), *([pool] if pool else []), _codex_operator_expiry(), _gh_status()]
+    users = None if IS_MAC else operator_claude_users()
+    if users == []:
+        # Every Claude worker and the periodic rounds sign in with a chain of their own, so ~/.claude
+        # is never read; telling the owner to log in there would only invite a shared login.
+        claude = ("claude: ~/.claude unused (every worker holds a login chain)", "green")
+    else:
+        claude = _claude_operator_expiry()
+        if users:
+            claude = (f"{claude[0]} (used by {', '.join(users)})", claude[1])
+    return [claude, *([pool] if pool else []), _codex_operator_expiry(), _gh_status()]
 
 
 # ----------------------------------------------------------------------------- subscription usage
