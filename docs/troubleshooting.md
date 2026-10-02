@@ -62,6 +62,12 @@ Current worker prompts fetch them after merging; update the worker checkout.
 **"gh pr list failed (GitHub API?)".** GitHub timed out (HTTP 504) on a large query. It is transient,
 and the worker splits the query and retries.
 
+**Every sandboxed round fails within a minute: Lake cannot fetch Mathlib, "Repository mismatch:
+leanprover-community/mathlib4 != TauCetiProject/TauCeti".** The first lines of the round's agent log
+say why: "host uid … not mapped", then "dubious ownership" for each Lake dependency bubble tried to
+pre-populate. Root has not delegated this user's ids to Incus, so the shared git store mounted into
+the container belongs to nobody there. See docs/setup.md, section 2; `up` refuses to start without it.
+
 ## Pushes and commits
 
 **Pushes refused with a message about workflows.** The GitHub token lacks the `workflow` scope, and

@@ -70,6 +70,20 @@ sudo adduser fleetuser incus-admin
 sudo loginctl enable-linger fleetuser
 ```
 
+bubble maps the user's own uid and gid onto the container's user, so that what it mounts in (its
+shared git store among it) belongs to that user inside. Incus allows that only for ids root has
+delegated:
+
+```bash
+echo "root:$(id -u fleetuser):1" | sudo tee -a /etc/subuid && echo "root:$(id -g fleetuser):1" | sudo tee -a /etc/subgid && sudo systemctl restart incus
+```
+
+Without it bubble only prints a warning, and every round fails later, in Lake ("Repository mismatch:
+leanprover-community/mathlib4"). `up` checks for it. The restart rebuilds Incus's bridge, so do it
+while no other fleet on the host is mid-round; bubble's auth proxy recovers by itself with
+kim-em/bubble#344, and otherwise needs `systemctl --user restart bubble-auth-proxy.service` as each
+fleet user.
+
 `incus-admin` is equivalent to root on the host, so give it only to fleet accounts. Lingering keeps
 the user's systemd manager, which runs bubble's daemons, alive with nobody logged in.
 

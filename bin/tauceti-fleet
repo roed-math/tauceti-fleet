@@ -1642,6 +1642,41 @@ def targets_lock():
         os.close(fd)
 
 
+def _subid_covers(text: str, ident: int) -> bool:
+    """Does an /etc/subuid or /etc/subgid text delegate `ident` to root (a `root:<start>:<count>` line
+    whose range contains it)?"""
+    for line in text.splitlines():
+        parts = line.strip().split(":")
+        if len(parts) == 3 and parts[0] in ("root", "0") and parts[1].isdigit() and parts[2].isdigit():
+            if int(parts[1]) <= ident < int(parts[1]) + int(parts[2]):
+                return True
+    return False
+
+
+def idmap_problem() -> str:
+    """Why bubble could not map this user into its containers, or "". bubble maps the operator's uid
+    and gid onto the container's user (raw.idmap) so that what it mounts in, the shared git store
+    among it, belongs to that user there. Incus allows that only for ids root has delegated in
+    /etc/subuid and /etc/subgid. Without it bubble only warns, git in the container refuses every
+    Lake dependency as "dubious ownership", and each round dies fetching Mathlib through the git proxy
+    with "Repository mismatch" (the second fleet user on mimir, 2026-10-01)."""
+    if IS_MAC:
+        return ""
+    missing = []
+    for path, ident in (("/etc/subuid", os.getuid()), ("/etc/subgid", os.getgid())):
+        try:
+            text = Path(path).read_text()
+        except OSError:
+            return ""  # cannot tell; bubble will say so itself
+        if not _subid_covers(text, ident):
+            missing.append(f"echo 'root:{ident}:1' | sudo tee -a {path}")
+    if not missing:
+        return ""
+    return ("Incus may not map this user into bubble's containers, so every sandboxed round would fail. "
+            "As a sudoer: " + " && ".join(missing) + " && sudo systemctl restart incus "
+            "(the restart rebuilds the bridge; see docs/setup.md, section 2)")
+
+
 def targets_problem() -> str:
     """Why this user could not keep the target list, or "". The curator writes the list in place,
     takes a lock file beside it, and commits and pushes it when it is in a git repository. A list
@@ -2123,6 +2158,8 @@ def cmd_up(a: argparse.Namespace) -> int:
     a.sandbox = a.sandbox or "host"
     if a.sandbox == "bubble" and shutil.which("bubble") is None:
         die("--sandbox bubble requested but `bubble` is not on PATH; install it or pass --sandbox host (host mode leaves the wrappers as a convention, not a control — see docs/gate.md)")
+    if a.sandbox == "bubble" and (problem := idmap_problem()):
+        die(problem)
     if a.mutations_per_hour <= 0 or a.reads_per_hour <= 0:
         die("the gate budgets must be positive (gate.mutations_per_hour and gate.reads_per_hour in fleet.toml)")
     GATE_DIR.mkdir(parents=True, exist_ok=True)
