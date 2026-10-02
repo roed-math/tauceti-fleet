@@ -2678,9 +2678,15 @@ def cmd_logins(a: argparse.Namespace) -> int:
     a new sign-in."""
     if CONFIG.is_file():
         shape = _shape_from_config(a)
-    else:  # no fleet yet: describe the pilot's default shape
-        shape = argparse.Namespace(claude=1, codex=0, fixers=a.max_fixers, reviewers=a.max_reviewers, sandbox="bubble",
-                                   pace="", pilot=True, mutations_per_hour=40, reads_per_hour=600,
+    else:
+        # No fleet yet: the shape `up` will start from the settings, as `up` reads them (pilot mode is
+        # one Claude author and no `auto` one; otherwise up.claude and up.codex, default 2 and 2).
+        # Describing the pilot's shape regardless asked a fleet set to full mode for too few sign-ins.
+        pilot = _setting_bool("up", "pilot")
+        shape = argparse.Namespace(claude=_setting_int("up", "claude") if _setting_int("up", "claude") is not None else (1 if pilot else 2),
+                                   codex=_setting_int("up", "codex") if _setting_int("up", "codex") is not None else (0 if pilot else 2),
+                                   fixers=a.max_fixers, reviewers=a.max_reviewers, sandbox=setting("up", "sandbox", "bubble"),
+                                   pace="", pilot=pilot, mutations_per_hour=40, reads_per_hour=600,
                                    claude_model=DEFAULT_CLAUDE_MODEL, claude_effort=DEFAULT_CLAUDE_EFFORT, codex_model="", codex_effort="")
     specs = fleet_specs(shape)
     slots, leases = login_slots(), read_leases()
