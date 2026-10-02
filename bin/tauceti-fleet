@@ -589,13 +589,16 @@ def donor_for(new_wid: str) -> Path | None:
     return best
 
 
-def preseed(wid: str) -> str:
+def preseed(wid: str, dry_run: bool = False) -> str:
     co = checkout_dir(wid)
     if (co / ".git").is_dir():
         return "present"
     donor = donor_for(wid)
     if donor is None:
         return "no donor (worker will clone + fetch caches itself)"
+    if dry_run:
+        # A copy is ~18 GB on a filesystem without reflinks, so a dry run only says what it would do.
+        return f"would copy from {donor.parent.name}"
     co.parent.mkdir(parents=True, exist_ok=True)
     free0 = shutil.disk_usage(HOME).free
     t0 = time.time()
@@ -2138,7 +2141,7 @@ def cmd_up(a: argparse.Namespace) -> int:
     from concurrent.futures import ThreadPoolExecutor
     todo = [s["id"] for s in specs if s["only"] != "review"]
     with ThreadPoolExecutor(max_workers=3) as pool:
-        for wid, note in zip(todo, pool.map(preseed, todo)):
+        for wid, note in zip(todo, pool.map(lambda wid: preseed(wid, dry_run=a.dry_run), todo)):
             print(f"checkout {wid}: {note}")
     # Shape the fleet to the backlog before the first start: authors off under backpressure, fixers
     # sized to the fix backlog. From here on every finished round re-runs this through the hook.
@@ -2499,9 +2502,25 @@ def needed_revs(max_age_s: int = 1800) -> dict[str, list[str]]:
     return needed
 
 
+def artifact_cache_port() -> int:
+    """The port this user's bubble artifact cache listens on: from the endpoint the daemon publishes,
+    else bubble's config, else bubble's default 7655. Each fleet user on a host has its own
+    (docs/setup.md, "Several fleets on one host"), so another user's port says nothing about ours."""
+    try:
+        return int(json.loads((HOME / ".bubble" / "artifact-cache.endpoint").read_text())["tcp"]["port"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        import tomllib
+
+        return int(tomllib.loads((HOME / ".bubble" / "config.toml").read_text()).get("artifact_cache", {}).get("port", 7655))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 7655
+
+
 def cache_proxy_wedged() -> str | None:
-    """Is bubble's artifact-cache daemon (the container-side Mathlib/TauCeti cache proxy on :7655)
-    wedged? Seen 2026-09-20 twice: main thread parked on a futex with no handler threads, every
+    """Is bubble's artifact-cache daemon (the container-side Mathlib/TauCeti cache proxy, :7655 unless
+    configured otherwise) wedged? Seen 2026-09-20 twice: main thread parked on a futex with no handler threads, every
     container's `curl` waiting forever on an ESTABLISHED connection that is never answered, and
     `bubble cache status` still saying "running" because the pid is alive. The first time it also
     left 130 half-closed client sockets; the second time only 38, which is why the count alone is not
@@ -2516,7 +2535,9 @@ def cache_proxy_wedged() -> str | None:
         out = subprocess.run(["ss", "-tan"], capture_output=True, text=True, timeout=15).stdout
     except Exception:
         return None
-    lines = [line for line in out.splitlines()[1:] if ":7655" in line]
+    port = artifact_cache_port()
+    # The daemon's side of each connection: local address on our port (column 4 of `ss -tan`).
+    lines = [line for line in out.splitlines()[1:] if len(f := line.split()) >= 4 and f[3].endswith(f":{port}")]
     close_wait = sum(1 for line in lines if line.startswith("CLOSE-WAIT"))
     established = sum(1 for line in lines if line.startswith("ESTAB"))
     log = HOME / ".bubble" / "artifact-cache.log"
@@ -2527,9 +2548,9 @@ def cache_proxy_wedged() -> str | None:
     if silent_s <= 600:
         return None
     if close_wait >= 50:
-        return f"{close_wait} half-closed client sockets on :7655 and no log line for {age(time.time() - silent_s)}"
+        return f"{close_wait} half-closed client sockets on :{port} and no log line for {age(time.time() - silent_s)}"
     if established >= 10:
-        return f"{established} client connections open on :7655 and no log line for {age(time.time() - silent_s)}"
+        return f"{established} client connections open on :{port} and no log line for {age(time.time() - silent_s)}"
     return None
 
 
