@@ -1496,6 +1496,8 @@ def run_periodic(stage: str, *, quiet: bool = True, force: bool = False) -> str:
 
 def ensure_periodic(quiet: bool) -> None:
     """Called from the reconcile hook and the live view: start whichever periodic stage is due."""
+    if draining():
+        return
     for stage in PERIODIC:
         note = run_periodic(stage, quiet=quiet)
         if note and "already running" in note:
@@ -2058,6 +2060,7 @@ def build_view(progress: Progress, console=None):
         (f" {datetime.now():%Y-%m-%d %H:%M:%S} ", "bold"),
         (f" workers {healthy}/{len(enabled_ids)} healthy{f' ({len(ids) - len(enabled_ids)} off)' if len(enabled_ids) < len(ids) else ''} ",
          "green" if healthy == len(enabled_ids) and enabled_ids else "yellow"),
+        *([(" DRAINING (each worker stops when its round ends) ", "yellow")] if draining() else []),
         (f" manager {'up' if mgr_alive else 'not seen'} ", "green" if mgr_alive else "red"),
         (f" disk free {free_gb:.0f} GB ", "red" if free_gb < 40 else "yellow" if free_gb < 80 else "green"),
         *([(f" needs you {len(needs)} ", "bold red")] if needs else []),
@@ -2140,6 +2143,9 @@ def cmd_watch(a: argparse.Namespace) -> int:
 
 
 def cmd_up(a: argparse.Namespace) -> int:
+    if draining() and not a.dry_run:
+        DRAINING.unlink()
+        print("up: ending the drain")
     if not (WORKTREE / "tauceti_worker").is_dir():
         die(f"worktree not found: {WORKTREE}")
     if not TARGETS.is_file():
@@ -2327,6 +2333,8 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
     from the workers' own status files; a GitHub read happens only when those are stale."""
     import fcntl
 
+    if draining():
+        return 0 if getattr(a, "dry_run", False) else drain_step(quiet)
     FLEET_HOME.mkdir(parents=True, exist_ok=True)
     with open(FLEET_HOME / "reconcile.lock", "a+") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
@@ -2858,7 +2866,62 @@ def cmd_warm_pool(a: argparse.Namespace) -> int:
     return 0
 
 
+DRAINING = FLEET_HOME / "draining"
+
+
+def draining() -> bool:
+    """`down --drain` is under way: until `up`, the reconcile only winds the fleet down."""
+    return DRAINING.is_file()
+
+
+def drain_step(quiet: bool) -> int:
+    """One step of `down --drain`, run by `down --drain` itself and then by the reconcile after each
+    round. Every worker between rounds is disabled, so the manager stops it; a worker mid-round keeps
+    its block (the same deferral write_config applies) and is disabled by the reconcile its own
+    round-done hook runs. Once no block is left enabled, the manager is stopped.
+
+    Only the `enabled` line of each block changes. Leases are left alone: releasing a mid-round
+    worker's login chain would let the free-chain renewal rotate it, which revokes that worker's
+    token in the middle of the round the drain exists to protect. No periodic round starts while
+    draining (ensure_periodic)."""
+    import fcntl
+
+    with open(FLEET_HOME / "reconcile.lock", "a+") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        old_text = CONFIG.read_text() if CONFIG.is_file() else ""
+        statuses, hook = worker_status(), os.environ.get("TAUCETI_ROUND_WID")
+        blocks, stopped, mid = [], [], []
+        for wid, blk in parse_blocks(old_text).items():
+            off = re.sub(r"(?m)^enabled\s*=\s*true\s*$", "enabled = false", blk)
+            if off != blk and wid != hook and mid_round(statuses.get(wid, {})):
+                blocks.append(blk)
+                mid.append(wid)
+            else:
+                blocks.append(off)
+                if off != blk:
+                    stopped.append(wid)
+        text = TOML_HEADER + "\n" + "\n".join(blocks)
+        if text != old_text:
+            CONFIG.write_text(text)
+        if not mid:
+            print("drain: no worker is mid-round; stopping the manager")
+            return cmd_down(argparse.Namespace(leave_workers=False))
+        if stopped or not quiet:
+            print(f"drain: stopped {', '.join(stopped) or 'nothing new'}; waiting for the rounds of "
+                  f"{', '.join(mid)} to end")
+        if text == old_text:
+            return 0
+        return tauceti("workers", "--config", str(CONFIG), "apply").returncode
+
+
 def cmd_down(a: argparse.Namespace) -> int:
+    if getattr(a, "drain", False):
+        if not CONFIG.is_file():
+            die("no fleet config: nothing to drain")
+        FLEET_HOME.mkdir(parents=True, exist_ok=True)
+        DRAINING.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        print("draining: each worker stops when its current round ends; `tauceti-fleet up` starts the fleet again")
+        return drain_step(quiet=False)
     args = ["workers", "--config", str(CONFIG), "manager-stop"]
     if a.leave_workers:
         args.append("--leave-workers")
@@ -3124,8 +3187,10 @@ def main() -> int:
     wp.add_argument("--revs", nargs="*", help="warm exactly these Mathlib revisions (used by the automatic background run)")
     wp.add_argument("--force", action="store_true", help="re-fetch even revisions marked warm")
     wp.set_defaults(fn=cmd_warm_pool)
-    d = sub.add_parser("down", help="stop the manager and its workers")
+    d = sub.add_parser("down", help="stop the manager and its workers (--drain: each when its current round ends)")
     d.add_argument("--leave-workers", action="store_true")
+    d.add_argument("--drain", action="store_true",
+                   help="stop each worker when its current round ends, then the manager; nothing in flight is lost")
     d.set_defaults(fn=cmd_down)
     rs = sub.add_parser("restart", help="restart workers between rounds (clears a backoff); mid-round ones are skipped unless --force")
     rs.add_argument("ids", nargs="+", metavar="ID")

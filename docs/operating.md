@@ -200,6 +200,21 @@ it wedges after 256 connections: rounds hang in `lake cache get` while `bubble c
 says running. The reconcile restarts a daemon that looks wedged and records it in `watchdog.log`; with
 the fix installed that should never fire.
 
+## Stopping without losing work
+
+`tauceti-fleet down` stops the manager and every worker at once, which throws away any round in
+flight. To stop for maintenance instead:
+
+```bash
+tauceti-fleet down --drain
+```
+
+Every worker between rounds stops at once; a worker mid-round finishes its round and stops when it
+ends; once none is left, the manager stops. No periodic round starts meanwhile, and no login chain
+changes hands. A round can last as long as the round timeout, so a drain can take that long; the
+live view shows `DRAINING` until it is done. `tauceti-fleet up` ends a drain and starts the fleet
+again.
+
 ## Logs
 
 Every worker writes durable logs under `state/logs/<id>/`; the periodic rounds under
