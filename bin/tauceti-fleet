@@ -1946,6 +1946,8 @@ def build_view(progress: Progress, console=None):
     newest = max((s_ for s_ in statuses.values() if isinstance(s_.get("mine_open"), int)),
                  key=lambda s_: s_.get("survey_at") or 0, default={})
     off_reason = "backpressure" if (newest.get("mine_open") or 0) >= MAX_OPEN_PRS_BACKPRESSURE else "authors idle"
+    if draining():
+        off_reason = "drained"
     for w in ids:
         st = statuses.get(w, {})
         label, style = health(st)
@@ -1956,7 +1958,7 @@ def build_view(progress: Progress, console=None):
             # Turned off by the reconcile, not failed: the manager stops it with SIGTERM (rc=143), and
             # its status file still describes the last loop.
             label, style = f"disabled ({off_reason})", "dim"
-            what = "turned off by the reconcile"
+            what = "stopped between rounds by `down --drain`" if draining() else "turned off by the reconcile"
         agent = st.get("agent", "") or ("claude" if re.fullmatch(rf"{re.escape(NAME)}-(c\d+|fix\d*[13579])", w) else "auto")
         m = re.search(r"provider=(\w+)", st.get("detail") or "") if agent == "auto" else None
         if m and st.get("state") in ("running", "surveying"):
