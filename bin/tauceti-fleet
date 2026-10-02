@@ -830,9 +830,12 @@ def _reset_phrase(t: float | None) -> str:
         return "reset due"
     if left < 100 * 60:
         return f"resets in {int(left // 60)}m"
-    if left < 36 * 3600:
-        return f"resets {datetime.fromtimestamp(t):%H:%M}"
-    return f"resets {datetime.fromtimestamp(t):%a %H:%M}"
+    when = datetime.fromtimestamp(t)
+    # A bare time only for a reset later today: "resets 14:59" at 04:00 on Friday read as this
+    # afternoon when it meant Saturday's (the old rule was "under 36 hours away").
+    if when.date() == datetime.now().date():
+        return f"resets {when:%H:%M}"
+    return f"resets {when:%a %H:%M}"
 
 
 def usage_text():
