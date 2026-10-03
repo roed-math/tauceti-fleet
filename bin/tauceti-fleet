@@ -298,7 +298,8 @@ def reset_stale_mirror(wid: str) -> str | None:
     """A worker pins the credential source it was first seeded from (.tauceti-creds-source); when the
     fleet moves it to another chain (or back to the shared ~/.claude), drop the old mirror and marker
     so the worker reseeds from the new source at its next isolate_home. Only for a worker whose config
-    block is being switched now (write_config's `switched`): a running worker's marker is live state.
+    block is being switched now (write_config's `switched`), or the periodic runner under its run lock:
+    a running worker's marker is live state.
     Returns a note when something was removed."""
     iso = WORKTREE / "state" / wid / "home" / ".claude"
     marker = iso / ".tauceti-creds-source"
@@ -1478,6 +1479,10 @@ def run_periodic(stage: str, *, quiet: bool = True, force: bool = False) -> str:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return f"periodic: a round is already running ({stage} waits)"
+    # No config block means write_config never resets this mirror. A pin left on ~/.claude from a round
+    # that ran before the lease made the worker renew the wrong file while its copied token expired.
+    if note := reset_stale_mirror(PERIODIC_WID):
+        _watchdog_note(note)
     logs = STATE / "logs" / PERIODIC_WID
     logs.mkdir(parents=True, exist_ok=True)
     log = logs / f"{stage}-{datetime.now():%Y%m%d-%H%M%S}.log"
@@ -1546,6 +1551,17 @@ def cmd_periodic(a: argparse.Namespace) -> int:
               f"`tauceti-fleet reconcile`", file=sys.stderr)
         return 2
     if a.now:
+        import fcntl
+
+        with open(periodic_dir() / "run.lock", "a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                pass  # a timed round is using the mirror; it gets reset before the next one
+            else:
+                if note := reset_stale_mirror(PERIODIC_WID):
+                    _watchdog_note(note)
+                    print(note)
         env = periodic_env(a)
         argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", a.now, "--worker-id", PERIODIC_WID,
                 "--author-model", env["TAUCETI_AUTHORING_CLAUDE_MODEL"], "--author-effort", env["TAUCETI_AUTHORING_CLAUDE_EFFORT"],

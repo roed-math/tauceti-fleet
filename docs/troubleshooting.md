@@ -29,6 +29,13 @@ account has at most `authoring.fallback_max_open` open PRs.
 **Authors disabled although the list has work.** The account has `authoring.max_open_prs` open PRs
 or more, so the reconcile turned the authors off until fixes and merges bring the count down.
 
+**Periodic rounds end with "no model under pace right now" while the workers run.** The periodic
+runner's credential copy is pinned (`state/<name>-periodic/home/.claude/.tauceti-creds-source`) to a
+source other than its leased chain, typically `~/.claude` from a round that ran before the lease, so
+it renews the wrong file and its copied token expires. Its round logs repeat "keeps Claude creds
+first copied from …". `run_periodic` resets such a pin before each round; on an older wrapper,
+delete that file and `.credentials.json` beside it between rounds.
+
 **A worker halted.** It saw an identity other than `fleet.github_login`, or a credential error.
 `tauceti-fleet clear-halt` shows the incident and clears it once you have looked.
 
