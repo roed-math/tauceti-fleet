@@ -172,6 +172,28 @@ def worker_env() -> dict[str, str]:
     return env
 
 
+def provider_paces() -> dict[str, str]:
+    """`up.pace_claude` / `up.pace_codex` as the workers' $TAUCETI_PACE_CLAUDE / $TAUCETI_PACE_CODEX,
+    each overriding `up.pace` for that provider's windows. fleet.toml only, not the shell: the reconcile
+    also runs from a worker's round-done hook, whose environment carries the old values. A malformed
+    curve is left out with a warning, since the worker would refuse to start on it."""
+    out = {}
+    for prov in ("claude", "codex"):
+        spec = setting("up", f"pace_{prov}")
+        if not spec:
+            continue
+        try:
+            from tauceti_worker.quota import parse_pace_curve
+            parse_pace_curve(spec)
+        except ImportError:
+            pass
+        except ValueError as e:
+            print(f"warning: up.pace_{prov} = {spec!r} ignored: {e}", file=sys.stderr)
+            continue
+        out[f"TAUCETI_PACE_{prov.upper()}"] = spec
+    return out
+
+
 def _config_env(var: str) -> str | None:
     """The value the fleet config gives every worker for `var`, or None before any config exists."""
     if not CONFIG.is_file():
@@ -420,6 +442,7 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             # Authoring backpressure, only when fleet.toml overrides the worker's default.
             **({"TAUCETI_MAX_OPEN_PRS": str(MAX_OPEN_PRS_SETTING)} if MAX_OPEN_PRS_SETTING else {}),
             **({"TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_MAX_OPEN_SETTING)} if FALLBACK_MAX_OPEN_SETTING else {}),
+            **provider_paces(),
             # Pilot mode interacts less on GitHub: no reactions, no automatic stuck-review issues.
             "TAUCETI_REACTIONS": "0" if a.pilot else "1",
             "TAUCETI_STUCK_ISSUES": "0" if a.pilot else "1",
@@ -1449,6 +1472,9 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
     pace = os.environ.get("TAUCETI_PACE", "") or (re.search(r'^pace\s*=\s*"([^"]+)"', CONFIG.read_text(), re.M) or [None, ""])[1] if CONFIG.is_file() else ""
     if pace:
         env["TAUCETI_PACE"] = pace
+    for var in ("TAUCETI_PACE_CLAUDE", "TAUCETI_PACE_CODEX"):
+        env.pop(var, None)  # a hook's environment carries the worker's values; fleet.toml decides
+    env.update(provider_paces())
     d = login_dir(PERIODIC_WID)
     if d is not None:
         env["CLAUDE_CONFIG_DIR"] = str(d)
