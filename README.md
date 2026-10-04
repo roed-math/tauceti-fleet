@@ -127,6 +127,7 @@ interpreter that has `rich`, for the live view.
 | `restart ID… [--when-idle] [--force]` | restart workers between rounds |
 | `reconcile [--dry-run]` | reshape the fleet from the backlog now (it runs after every round anyway) |
 | `round` | one supervised round in the foreground, then the gate report |
+| `lookahead SLUG` | one lookahead round on that target-list item now: a session while it is blocked, its port once eligible (docs/operating.md) |
 | `logs ID [-f]` | one worker's log |
 | `gate …` | the worker's gate commands: `status`, `report`, `publication prune`, … |
 | `clear-halt` | show each halted worker's incident, then clear it |

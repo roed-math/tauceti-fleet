@@ -127,6 +127,10 @@ week old). Without the setting, a fleet leaves an eligible item with a fresh bra
 (`TAUCETI_LOOKAHEAD_HOLD_HOURS`) before authoring it fresh. Items marked `lookahead: no` in the target
 list are skipped.
 
+`tauceti-fleet lookahead SLUG` runs one such round on that item now, setting or no setting: a session
+while the item is blocked, its port once it is eligible. It runs as the periodic worker under the
+periodic lock, as `review` does, so curate and decide wait for it.
+
 The live view's `lookahead` row shows the branches and the last week's sessions, ports and deletions.
 Every outcome that is not the plan working leaves a `lookahead` incident in the attention list:
 `failed` (a session pushed nothing; the item is not offered again for three days), `held` and

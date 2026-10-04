@@ -6,6 +6,7 @@
     tauceti-fleet up [--pilot] [--claude N] [--codex N] [--sandbox bubble] [--no-watch]
     tauceti-fleet logins                 # the Claude login pool: chains, leases, missing sign-ins
     tauceti-fleet attention [--ack PR]   # rounds whose agent declined to act (a PR to close?), until acknowledged
+    tauceti-fleet lookahead SLUG         # one lookahead session (or port) on that target-list item, now
     tauceti-fleet restart ID...          # restart workers between rounds (clears a long backoff)
     tauceti-fleet periodic [--now STAGE] # the cadenced curate/decide rounds
     tauceti-fleet review PR               # review one PR now, as the periodic worker
@@ -2617,6 +2618,43 @@ def cmd_review(a: argparse.Namespace) -> int:
         lock.close()
 
 
+def cmd_lookahead(a: argparse.Namespace) -> int:
+    """One lookahead round on one target-list item, now, in the foreground (the worker's lookahead.py):
+    a session proving it against stubs while it is blocked, or the port of its branch once its
+    suppliers have landed. It runs as the periodic worker, holding the periodic lock as `review` does,
+    and works whether or not authoring.lookahead is on, so a pilot can be run by hand. Nothing else is
+    authored in its place."""
+    import fcntl
+
+    lock = open(periodic_dir() / "run.lock", "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("a periodic round is running; waiting for it to finish …", flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    env = periodic_env()
+    env.update({"TAUCETI_LOOKAHEAD": "1", "TAUCETI_TARGET_ONLY": a.slug})
+    if LOOKAHEAD_MAX_BRANCHES_SETTING is not None:
+        env["TAUCETI_LOOKAHEAD_MAX_BRANCHES"] = str(LOOKAHEAD_MAX_BRANCHES_SETTING)
+    argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", "roadmap", "--worker-id", PERIODIC_WID,
+            "--agent", a.agent, "--roadmap-targets", str(TARGETS)]
+    if setting("up", "sandbox", "bubble") == "bubble":
+        argv.append("--bubble")
+    logs = STATE / "logs" / PERIODIC_WID
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"lookahead-{a.slug}-{datetime.now():%Y%m%d-%H%M%S}.log"
+    print(f"lookahead: {' '.join(argv[2:])}\nlog: {log}", flush=True)
+    try:
+        with open(log, "a") as out, subprocess.Popen(argv, cwd=WORKTREE, env=env, stdout=subprocess.PIPE,
+                                                     stderr=subprocess.STDOUT, text=True) as proc:
+            for line in proc.stdout:
+                out.write(line); out.flush()
+                sys.stdout.write(line); sys.stdout.flush()
+        return proc.returncode
+    finally:
+        lock.close()
+
+
 def pool_dir() -> Path:
     return Path(os.environ.get("TAUCETI_MATHLIB_POOL") or (HOME / ".cache" / "mathlib"))
 
@@ -3358,6 +3396,11 @@ def main() -> int:
     rv.add_argument("--agent", choices=("codex", "claude", "auto"), default="codex",
                     help="the review provider (default codex, which the fleet's reviewers try first)")
     rv.set_defaults(fn=cmd_review)
+    la = sub.add_parser("lookahead", help="one lookahead round on one target-list item now, as the periodic worker: "
+                        "prove it ahead of its supplier while blocked, or port its branch once eligible")
+    la.add_argument("slug")
+    la.add_argument("--agent", choices=("claude", "codex", "auto"), default="claude")
+    la.set_defaults(fn=cmd_lookahead)
     r = sub.add_parser("round", help="run ONE round in the foreground with the pilot's environment, then print the gate report")
     r.add_argument("--worker-id", default=None, help="default: the first Claude author")
     r.add_argument("--only", default="roadmap")
