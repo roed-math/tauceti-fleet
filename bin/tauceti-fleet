@@ -2959,7 +2959,12 @@ def drain_step(quiet: bool) -> int:
             CONFIG.write_text(text)
         if not mid:
             print("drain: no worker is mid-round; stopping the manager")
-            return cmd_down(argparse.Namespace(leave_workers=False))
+            p = tauceti("workers", "--config", str(CONFIG), "manager-stop", capture=True)
+            if p.returncode != 0 and "offline" in (p.stdout or "") + (p.stderr or ""):
+                print("drain: the manager was already stopped")
+                return 0  # a drain repeated on a stopped fleet (the schedule's first tick) has nothing left to do
+            print(((p.stdout or "") + (p.stderr or "")).strip())
+            return p.returncode
         if stopped or not quiet:
             print(f"drain: stopped {', '.join(stopped) or 'nothing new'}; waiting for the rounds of "
                   f"{', '.join(mid)} to end")
