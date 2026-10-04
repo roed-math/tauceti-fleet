@@ -32,8 +32,10 @@ Milestones no roadmap states yet. This section is never authored against.
   token, conventionally the milestone's main declaration in kebab-case. The text runs from ` — ` to
   the trailing parenthesis.
 - The trailing parenthesis holds `key: value` clauses separated by `;`. `needs:` lists prerequisite
-  slugs from any area, or `none`. `in flight: #N` names the PR working on the item. Anything else
-  (`serves:`, `done:`) is kept verbatim for readers.
+  slugs from any area, or `none`. `in flight: #N` names the PR working on the item. `lookahead: no —
+  <reason>` keeps an item whose route is unsettled out of lookahead authoring, both as a target and
+  as a supplier to stub (see [operating.md](operating.md#lookahead-authoring)); agents never see this
+  clause. Anything else (`serves:`, `done:`) is kept verbatim for readers.
 - An item is **eligible** when it is open and everything it needs is done; an in-flight prerequisite
   counts as not landed.
 

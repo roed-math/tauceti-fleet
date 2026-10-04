@@ -94,12 +94,44 @@ The live view shows a `needs you` badge and panel; `tauceti-fleet attention` pri
   stops spending on that PR until you look.
 - **A target-list item whose PR closed without a recorded verdict.** The curator cannot tell whether
   the work landed elsewhere, so it asks: mark it `[ ]` to re-author or `[x]` if done.
+- **A lookahead branch that did not work as planned** (`lookahead`): see
+  [Lookahead authoring](#lookahead-authoring) for the kinds and what each means.
 - **A target list that diverged from its repository** (`targets-diverged`): a curation committed
   here conflicts with one pushed elsewhere. See
   [target-lists.md](target-lists.md#sharing-a-list).
 
 A worker in a long backoff can be restarted between rounds with `tauceti-fleet restart ID`, or
 `--when-idle` to queue it for the end of the current round.
+
+## Lookahead authoring
+
+With `authoring.lookahead = true`, an author that finds nothing it can take on the target list
+first looks for a blocked item it can prove ahead: an open item whose unmet needs are all in flight
+or eligible, settled, and themselves unblocked (a stub never stands in for another stub). It proves
+the item against `sorry`'d stubs of those suppliers' pinned statements on the branch
+`lookahead/<area>/<slug>` of the account's TauCeti fork, writes the plan of pull requests into the
+branch's `LOOKAHEAD.md`, and pushes once. The branch is never opened: the push wrapper pushes nothing
+else in that round and the PR wrapper refuses. Only when no candidate can be claimed, or
+`authoring.lookahead_max_branches` branches are already live, does it author outside the list. The
+claim is `lookahead/<area>/<slug>`, separate from the item's author claim.
+
+When the suppliers land, the item becomes eligible and an author ports the branch: it opens the
+plan's next split as a pull request, the stubs replaced by the landed declarations. One PR per round,
+but while a split that does not wait on another is still unopened, the item stays available to the
+next round, so independent splits are opened without waiting for each other to merge. Every port PR
+carries a `tauceti-lookahead-port:v1` marker, which is how the next round knows what is open.
+
+All of this state is on GitHub, so it does not matter which fleet is active. The curator's round
+deletes the branch of an item that is done and lists stale branches (built on a `main` more than a
+week old). Without the setting, a fleet leaves an eligible item with a fresh branch for six hours
+(`TAUCETI_LOOKAHEAD_HOLD_HOURS`) before authoring it fresh. Items marked `lookahead: no` in the target
+list are skipped.
+
+The live view's `lookahead` row shows the branches and the last week's sessions, ports and deletions.
+Every outcome that is not the plan working leaves a `lookahead` incident in the attention list:
+`failed` (a session pushed nothing; the item is not offered again for three days), `held` and
+`skipped` (a fleet without the setting held the item, then authored it fresh), `mismatch` (a port
+round could not use the branch), `unreadable`, `stale` and `abandoned`.
 
 ## The progress-report worker
 

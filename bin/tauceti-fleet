@@ -442,6 +442,9 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             # Authoring backpressure, only when fleet.toml overrides the worker's default.
             **({"TAUCETI_MAX_OPEN_PRS": str(MAX_OPEN_PRS_SETTING)} if MAX_OPEN_PRS_SETTING else {}),
             **({"TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_MAX_OPEN_SETTING)} if FALLBACK_MAX_OPEN_SETTING else {}),
+            **({"TAUCETI_LOOKAHEAD": "1"} if LOOKAHEAD_SETTING else {}),
+            **({"TAUCETI_LOOKAHEAD_MAX_BRANCHES": str(LOOKAHEAD_MAX_BRANCHES_SETTING)}
+               if LOOKAHEAD_MAX_BRANCHES_SETTING is not None else {}),
             **provider_paces(),
             # Pilot mode interacts less on GitHub: no reactions, no automatic stuck-review issues.
             "TAUCETI_REACTIONS": "0" if a.pilot else "1",
@@ -1918,6 +1921,50 @@ def _gate_part_for_view(part: str) -> str:
     return part
 
 
+LOOKAHEAD_DIR = GATE_DIR / "lookahead"
+
+
+def lookahead_line() -> str | None:
+    """Lookahead at a glance, from local data only: the branches as the workers last listed them
+    (`<gate>/lookahead/branches.json`), and the last seven days of `history.jsonl`. None while the
+    setting is off and nothing was ever recorded."""
+    snap = read_json(LOOKAHEAD_DIR / "branches.json")
+    rows = snap.get("branches") or []
+    week = time.time() - 7 * 86400
+    hist = []
+    try:
+        for line in (LOOKAHEAD_DIR / "history.jsonl").read_text().splitlines():
+            try:
+                rec = json.loads(line)
+                at = datetime.strptime(str(rec.get("at") or ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+            if at >= week:
+                hist.append(rec)
+    except OSError:
+        pass
+    if not (LOOKAHEAD_SETTING or rows or hist):
+        return None
+    parts = ["on" if LOOKAHEAD_SETTING else "off"]
+    live = ", ".join(f"{r.get('slug')} ({r.get('status')})" for r in rows)
+    parts.append(f"{len(rows)} branch(es) live{': ' + live if live else ''}")
+    sessions = [r for r in hist if r.get("event") == "session"]
+    if sessions:
+        pushed = sum(1 for r in sessions if r.get("outcome") == "pushed")
+        parts.append(f"7 d: {len(sessions)} session(s), {pushed} pushed")
+    ports = [r for r in hist if r.get("event") == "port"]
+    if ports:
+        parts.append(f"{len(ports)} port round(s), {sum(1 for r in ports if r.get('outcome') == 'not used')} not used")
+    deleted = [r for r in hist if r.get("event") == "deleted"]
+    if deleted:
+        ported = sum(1 for r in deleted if r.get("reason") == "ported")
+        parts.append(f"{ported} ported, {len(deleted) - ported} abandoned")
+    at = snap.get("at")
+    if isinstance(at, (int, float)):
+        parts.append(f"listed {age(at)} ago")
+    return " · ".join(parts)
+
+
 def target_list_summary() -> str:
     """The target list at a glance, from local data only: the list file, the fleet's shared open-PR
     listing (which the workers refresh each minute they survey; an open PR's marker puts its item in
@@ -2063,6 +2110,9 @@ def build_view(progress: Progress, console=None):
         claims = d.get("claims") or []
         p.add_row("claims held", ", ".join(claims) if claims else "none")
     p.add_row("target list", Text(target_list_summary(), overflow="fold"))
+    look = lookahead_line()
+    if look:
+        p.add_row("lookahead", Text(look, overflow="fold"))
     if progress_worker_enabled():
         p.add_row("reports", Text(progress_worker_line(), overflow="fold"))
     if progress.remote_ok and d.get("error"):
@@ -2320,6 +2370,12 @@ MAX_OPEN_PRS_BACKPRESSURE = MAX_OPEN_PRS_SETTING or 8
 # (the worker's $TAUCETI_TARGETS_FALLBACK_MAX_OPEN, default 6). Only the worker reads it; the reconcile
 # learns the outcome from the authors' "not authoring outside the list" rounds.
 FALLBACK_MAX_OPEN_SETTING = _setting_int("authoring", "fallback_max_open")
+# Lookahead authoring (the worker's lookahead.py): an author with nothing to take on the target list
+# proves a blocked item against stubs of its in-flight supplier, on a branch of the account's fork,
+# before it would author outside the list; an author ports the branch once the supplier lands. Off
+# unless set; only the worker reads these (TAUCETI_LOOKAHEAD, TAUCETI_LOOKAHEAD_MAX_BRANCHES).
+LOOKAHEAD_SETTING = _setting_bool("authoring", "lookahead")
+LOOKAHEAD_MAX_BRANCHES_SETTING = _setting_int("authoring", "lookahead_max_branches")
 
 
 # A backlog this large gets every fixer even while authors run. It was the old backpressure point, so
@@ -3197,6 +3253,11 @@ reads_per_hour = 600
 # An author with nothing on the target list authors outside it only while at most this many PRs
 # are open; unset = the worker's default, 6.
 # fallback_max_open = 6
+# Before that, prove a blocked item ahead of its in-flight supplier, against stubs, on a branch
+# lookahead/<area>/<slug> of the account's fork, and port it once the supplier lands; at most
+# lookahead_max_branches such branches at once. Off unless true.
+# lookahead = false
+# lookahead_max_branches = 4
 
 [decide]
 # The stage that rules on declined rounds. `close = true` lets it close the account's own PRs that
