@@ -2968,6 +2968,112 @@ def drain_step(quiet: bool) -> int:
         return tauceti("workers", "--config", str(CONFIG), "apply").returncode
 
 
+SCHEDULE_STATE = FLEET_HOME / "schedule.state"
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+SCHEDULE_UNIT = "tauceti-fleet-schedule"
+
+
+def parse_schedule(spec: str) -> list[tuple[int, int]]:
+    """`schedule.active`, e.g. "Thu 07:00 -> Sat 15:00" (several slots separated by commas), as
+    (start, end) minutes from Monday 00:00, host-local time. A slot may wrap past Sunday midnight."""
+    slots = []
+    for part in (p.strip() for p in spec.split(",") if p.strip()):
+        ends = [e.strip() for e in re.split(r"->|–|—", part)]
+        if len(ends) != 2:
+            raise ValueError(f"schedule slot {part!r} is not 'Day HH:MM -> Day HH:MM'")
+        mins = []
+        for e in ends:
+            m = re.fullmatch(r"([A-Za-z]{3})[a-z]*\s+(\d{1,2}):(\d{2})", e)
+            if not m or m.group(1).lower() not in _WEEKDAYS or int(m.group(2)) > 23 or int(m.group(3)) > 59:
+                raise ValueError(f"schedule time {e!r} is not 'Day HH:MM' (e.g. Thu 07:00)")
+            mins.append(_WEEKDAYS.index(m.group(1).lower()) * 1440 + int(m.group(2)) * 60 + int(m.group(3)))
+        if mins[0] == mins[1]:
+            raise ValueError(f"schedule slot {part!r} is empty")
+        slots.append((mins[0], mins[1]))
+    return slots
+
+
+def _week_minute(now: datetime) -> int:
+    return now.weekday() * 1440 + now.hour * 60 + now.minute
+
+
+def schedule_active(slots: list[tuple[int, int]], now: datetime) -> bool:
+    t = _week_minute(now)
+    return any((a <= t < b) if a < b else (t >= a or t < b) for a, b in slots)
+
+
+def schedule_next_change(slots: list[tuple[int, int]], now: datetime) -> int:
+    """Minutes until the schedule next flips, from `now`."""
+    t = _week_minute(now)
+    return min((edge - t) % 10080 or 10080 for a, b in slots for edge in (a, b))
+
+
+def cmd_schedule(a: argparse.Namespace) -> int:
+    """The fleet's weekly active slots (`schedule.active` in fleet.toml, host-local time). `--tick` acts
+    on a boundary only: when the slot the clock is in differs from the last tick's, it runs `up` (the
+    fleet's own settings) or `down --drain`. A manual up or down between boundaries is left alone.
+    `--install` adds a systemd user timer that ticks every five minutes."""
+    spec = setting("schedule", "active")
+    if a.install or a.uninstall:
+        return _schedule_unit(install=a.install)
+    if not spec:
+        print("no schedule: set `active = \"Thu 07:00 -> Sat 15:00\"` under [schedule] in "
+              f"{SETTINGS_FILE}" + ("; nothing to do" if a.tick else ""))
+        return 0
+    try:
+        slots = parse_schedule(spec)
+    except ValueError as e:
+        die(f"schedule.active: {e}")
+    now = datetime.now()
+    want = "active" if schedule_active(slots, now) else "inactive"
+    left = schedule_next_change(slots, now)
+    if not a.tick:
+        last = SCHEDULE_STATE.read_text().strip() if SCHEDULE_STATE.is_file() else "never ticked"
+        print(f"schedule {spec!r}: {want} now ({now:%a %H:%M}), flips in {left // 60} h {left % 60} min; "
+              f"last tick: {last}; draining: {draining()}")
+        return 0
+    last = SCHEDULE_STATE.read_text().split()[0] if SCHEDULE_STATE.is_file() else ""
+    if want == last:
+        return 0
+    argv = [str(Path(__file__).resolve()), "up", "--no-watch"] if want == "active" else \
+        [str(Path(__file__).resolve()), "down", "--drain"]
+    if want == "inactive" and not CONFIG.is_file():
+        rc = 0  # never started: nothing to drain
+    else:
+        rc = subprocess.run(argv, env=worker_env()).returncode
+    note = f"schedule: {want} ({now:%a %H:%M}) → {' '.join(argv[1:]) if CONFIG.is_file() or want == 'active' else 'nothing to drain'} (rc={rc})"
+    _watchdog_note(note)
+    print(note)
+    if rc == 0:
+        SCHEDULE_STATE.write_text(f"{want} {now:%Y-%m-%d %H:%M}\n")
+    return rc
+
+
+def _schedule_unit(install: bool) -> int:
+    unit_dir = HOME / ".config" / "systemd" / "user"
+    service, timer = unit_dir / f"{SCHEDULE_UNIT}.service", unit_dir / f"{SCHEDULE_UNIT}.timer"
+    if not install:
+        subprocess.run(["systemctl", "--user", "disable", "--now", f"{SCHEDULE_UNIT}.timer"], check=False)
+        for f in (service, timer):
+            f.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        print(f"removed {SCHEDULE_UNIT}.timer")
+        return 0
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    path = os.pathsep.join([str(HOME / ".local" / "bin"), str(HOME / ".elan" / "bin"), "/usr/local/bin", "/usr/bin", "/bin"])
+    service.write_text(
+        "[Unit]\nDescription=tauceti-fleet weekly schedule tick\n\n[Service]\nType=oneshot\n"
+        f"Environment=TAUCETI_FLEET_HOME={FLEET_HOME}\nEnvironment=PATH={path}\n"
+        f"ExecStart={Path(__file__).resolve()} schedule --tick\n")
+    timer.write_text(
+        "[Unit]\nDescription=tauceti-fleet weekly schedule tick, every 5 minutes\n\n[Timer]\n"
+        "OnCalendar=*:0/5\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    rc = subprocess.run(["systemctl", "--user", "enable", "--now", f"{SCHEDULE_UNIT}.timer"]).returncode
+    print(f"installed {timer} (every 5 min; logs: journalctl --user -u {SCHEDULE_UNIT})")
+    return rc
+
+
 def cmd_down(a: argparse.Namespace) -> int:
     if getattr(a, "drain", False):
         if not CONFIG.is_file():
@@ -3241,6 +3347,11 @@ def main() -> int:
     wp.add_argument("--revs", nargs="*", help="warm exactly these Mathlib revisions (used by the automatic background run)")
     wp.add_argument("--force", action="store_true", help="re-fetch even revisions marked warm")
     wp.set_defaults(fn=cmd_warm_pool)
+    sc = sub.add_parser("schedule", help="the weekly active slots (schedule.active): show, tick, or install the timer")
+    sc.add_argument("--tick", action="store_true", help="act if the clock crossed a slot boundary since the last tick")
+    sc.add_argument("--install", action="store_true", help="install a systemd user timer that ticks every 5 minutes")
+    sc.add_argument("--uninstall", action="store_true", help="remove that timer")
+    sc.set_defaults(fn=cmd_schedule)
     d = sub.add_parser("down", help="stop the manager and its workers (--drain: each when its current round ends)")
     d.add_argument("--leave-workers", action="store_true")
     d.add_argument("--drain", action="store_true",

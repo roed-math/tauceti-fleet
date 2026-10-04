@@ -94,6 +94,7 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `up.sandbox` | `bubble` (egress-denied containers) or `host` | `init` writes `bubble` |
 | `up.pace` | the worker's pacing curve, `time%:budget%` points; the reconcile applies a change | the worker's own curve |
 | `up.pace_claude`, `up.pace_codex` | a curve for that provider's windows only, overriding `up.pace` (an `auto` worker paces each provider on its own); the reconcile applies a change | `up.pace` |
+| `schedule.active` | weekly active slots in host-local time, e.g. `"Thu 07:00 -> Sat 15:00"` (comma-separated for several); `tauceti-fleet schedule --install` adds a systemd user timer that runs `up` when a slot opens and `down --drain` when it closes, acting only at the boundaries | always on |
 | `up.claude`, `up.codex` | Claude authors, and `auto` authors (Codex first, then Claude) | 2 and 2; 1 and 0 in pilot mode |
 | `gate.mutations_per_hour`, `gate.reads_per_hour` | fleet-wide GitHub budgets, rolling hour; the reconcile after each round applies a change | 40 and 600 |
 | `authoring.max_open_prs` | authors stop while the account has this many open PRs in scope; the reconcile applies a change | the worker's 8 |
