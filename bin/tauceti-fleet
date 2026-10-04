@@ -2636,6 +2636,8 @@ def cmd_lookahead(a: argparse.Namespace) -> int:
     env.update({"TAUCETI_LOOKAHEAD": "1", "TAUCETI_TARGET_ONLY": a.slug})
     if LOOKAHEAD_MAX_BRANCHES_SETTING is not None:
         env["TAUCETI_LOOKAHEAD_MAX_BRANCHES"] = str(LOOKAHEAD_MAX_BRANCHES_SETTING)
+    if MAX_OPEN_PRS_SETTING:  # the authors' backpressure point; the periodic env does not carry it
+        env["TAUCETI_MAX_OPEN_PRS"] = str(MAX_OPEN_PRS_SETTING)
     argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", "roadmap", "--worker-id", PERIODIC_WID,
             "--agent", a.agent, "--roadmap-targets", str(TARGETS)]
     if setting("up", "sandbox", "bubble") == "bubble":
