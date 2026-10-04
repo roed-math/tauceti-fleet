@@ -3042,11 +3042,18 @@ def cmd_schedule(a: argparse.Namespace) -> int:
         return 0
     argv = [str(Path(__file__).resolve()), "up", "--no-watch"] if want == "active" else \
         [str(Path(__file__).resolve()), "down", "--drain"]
+    if want == "active" and os.environ.get("INVOCATION_ID") and shutil.which("systemd-run"):
+        # Under the timer's oneshot service, systemd kills whatever is left in the service's cgroup when
+        # it exits, manager and workers included (claudeW's first start, 2026-10-04). A scope of their own
+        # outlives the tick.
+        argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                f"--unit={SCHEDULE_UNIT}-{NAME}-up-{now:%Y%m%d-%H%M%S}", *argv]
     if want == "inactive" and not CONFIG.is_file():
         rc = 0  # never started: nothing to drain
     else:
         rc = subprocess.run(argv, env=worker_env()).returncode
-    note = f"schedule: {want} ({now:%a %H:%M}) → {' '.join(argv[1:]) if CONFIG.is_file() or want == 'active' else 'nothing to drain'} (rc={rc})"
+    what = " ".join(argv[argv.index("up") if "up" in argv else argv.index("down"):])
+    note = f"schedule: {want} ({now:%a %H:%M}) → {what if CONFIG.is_file() or want == 'active' else 'nothing to drain'} (rc={rc})"
     _watchdog_note(note)
     print(note)
     if rc == 0:
