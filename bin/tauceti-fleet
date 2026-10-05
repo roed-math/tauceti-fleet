@@ -443,6 +443,8 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             # Authoring backpressure, only when fleet.toml overrides the worker's default.
             **({"TAUCETI_MAX_OPEN_PRS": str(MAX_OPEN_PRS_SETTING)} if MAX_OPEN_PRS_SETTING else {}),
             **({"TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_MAX_OPEN_SETTING)} if FALLBACK_MAX_OPEN_SETTING else {}),
+            **({"TAUCETI_FALLBACK_AUTO": "1", "TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_AUTO_MIN)}
+               if FALLBACK_AUTO else {}),
             **LOOKAHEAD_ENV,
             **({"TAUCETI_LOOKAHEAD_MAX_BRANCHES": str(LOOKAHEAD_MAX_BRANCHES_SETTING)}
                if LOOKAHEAD_MAX_BRANCHES_SETTING is not None else {}),
@@ -2211,6 +2213,9 @@ def view_data(progress: Progress) -> dict:
     prs = open_prs_line()
     if prs:
         row("open PRs", Text(prs, overflow="fold"))
+    budget = budget_line()
+    if budget:
+        row("budget", Text(budget, overflow="fold"))
     look = lookahead_line()
     if look:
         row("lookahead", Text(look, overflow="fold"))
@@ -2315,6 +2320,233 @@ def render_view(data: dict, console=None, *, needs=True, above=()):
 
 def build_view(progress: Progress, console=None):
     return render_view(view_data(progress), console)
+
+
+# ----------------------------------------------------------------------------- budget pacing
+#
+# `authoring.fallback_max_open = "auto"`: the outside-list cap follows the account's weekly Claude
+# budget. Target work, the account's other use (the owner's own sessions included) and other people's
+# PRs keep a reserve sized from the recent burn rate until the slot ends; outside-list work gets the
+# rest, paced to use it up by then. Design: ~/claude/handoffs/TAUCETI_FALLBACK_PACING_DESIGN.md.
+
+FALLBACK_CAP = GATE_DIR / "fallback-cap.json"  # the workers read it each round (work_units.fallback_cap)
+USAGE_HISTORY = FLEET_HOME / "usage-history.jsonl"
+PACE_EVERY = 900  # seconds between steps
+PACE_WINDOW = 3 * 3600  # the burn rate and the spend shares are measured over this much recent time
+PACE_MIN_SPAN = 3600  # less history than this is a warm-up: the cap holds
+PACE_STALE = 1800  # a reading older than this moves nothing
+BUDGET_FLOOR = 0.05  # kept on top of the target reserve: target demand jumps when items become eligible
+
+
+def claude_week_reading() -> tuple[float, float, float] | None:
+    """(fetched_at, weekly used %, weekly reset epoch) from the freshest cached Claude usage reading."""
+    got = newest_quota_cache("claude")
+    if got is None:
+        return None
+    payload, at, _wid = got
+    for label, used, reset in usage_windows("claude", payload):
+        if label == "7d" and isinstance(used, (int, float)) and reset:
+            return at, float(used), float(reset)
+    return None
+
+
+def record_usage_history() -> None:
+    """Append the freshest weekly reading to usage-history.jsonl when it is newer than the last line."""
+    r = claude_week_reading()
+    if r is None:
+        return
+    try:
+        last = USAGE_HISTORY.read_text().splitlines()[-1] if USAGE_HISTORY.is_file() else ""
+        if last and float(json.loads(last).get("at") or 0) >= r[0]:
+            return
+        with open(USAGE_HISTORY, "a") as f:
+            f.write(json.dumps({"at": r[0], "used": r[1], "resets": r[2]}) + "\n")
+        if USAGE_HISTORY.stat().st_size > 2_000_000:
+            USAGE_HISTORY.write_text("\n".join(USAGE_HISTORY.read_text().splitlines()[-5000:]) + "\n")
+    except (OSError, ValueError):
+        pass
+
+
+def pace_horizon_end(now_ts: float, resets: float) -> float:
+    """When this budget stops being spendable: the end of the current slot (or of the next one, for a
+    fleet running ahead of its slot, as after an early switch), or the weekly reset if that is sooner."""
+    spec = setting("schedule", "active")
+    if not spec:
+        return resets
+    try:
+        slots = parse_schedule(spec)
+    except ValueError:
+        return resets
+    now = datetime.fromtimestamp(now_ts)
+    if schedule_active(slots, now):
+        end = now_ts + schedule_next_change(slots, now) * 60
+    else:
+        start = now_ts + schedule_next_change(slots, now) * 60
+        end = start + 60 + schedule_next_change(slots, datetime.fromtimestamp(start + 60)) * 60
+    return min(resets, end)
+
+
+def round_costs(since: float) -> dict[str, float]:
+    """Claude spend by kind of round (target, outside, shared) since `since`, from every worker's
+    rounds.jsonl (the cost each Claude agent reported)."""
+    out = {"target": 0.0, "outside": 0.0, "shared": 0.0}
+    for f in (WORKTREE / "state").glob("*/rounds.jsonl") if (WORKTREE / "state").is_dir() else []:
+        try:
+            lines = f.read_text().splitlines()[-500:]
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if (r.get("ended_at") or 0) < since or r.get("provider") != "claude" or not r.get("cost_usd"):
+                continue
+            out[r.get("kind") if r.get("kind") in out else "shared"] += float(r["cost_usd"])
+    return out
+
+
+def our_open_prs() -> int | None:
+    """The account's open, non-draft PRs, as the authors count them for the cap (open-PR listing)."""
+    listing = next(iter(sorted((GATE_DIR / "cache").glob("open_prs-*.json"))), None) if (GATE_DIR / "cache").is_dir() else None
+    if listing is None:
+        return None
+    prs = read_json(listing).get("prs") or []
+    return sum(1 for pr in prs if (pr.get("author") or {}).get("login") == EXPECT_LOGIN and not pr.get("isDraft"))
+
+
+def pace_step(state: dict, *, now: float, B: float, H: float, R: float | None, f_out: float, n_open: int) -> dict:
+    """One controller step (pure): the new cap and why. `state` is the last step's record or {}."""
+    prev = state.get("cap") if isinstance(state.get("cap"), int) else None
+    if prev is None:
+        prev = n_open  # a first step holds: no new outside PRs until there is a burn rate to judge by
+    out = {"at": now, "mode": "auto", "B": B, "H": H, "R": R, "f_out": f_out, "n_open": n_open, "prev": prev}
+    if R is None:
+        cap, why = prev, "warm-up: under an hour of readings this window"
+    else:
+        O = R * f_out
+        D = R - O  # what continues with no outside work: target rounds, shared rounds, the account's other use
+        reserve = D * H * (1 + BUDGET_MARGIN) + BUDGET_FLOOR + BUDGET_KEEP
+        surplus = B - reserve
+        A = max(surplus, 0.0) / H
+        out.update(O=O, D=D, reserve=reserve, surplus=surplus, A=A)
+        if surplus <= 0:
+            cap, why = FALLBACK_AUTO_MIN, "no surplus over the target reserve: outside work stops"
+        elif O < 0.8 * A:
+            base = max(prev, n_open)  # a closed cap reopens from the PRs already open
+            cap, why = base + max(1, round(0.1 * base)), "spending under plan"
+        elif O > 1.2 * A:
+            cap, why = prev - max(1, round(0.1 * prev)), "spending over plan"
+        else:
+            cap, why = prev, "on plan"
+    out["cap"] = max(FALLBACK_AUTO_MIN, min(FALLBACK_AUTO_MAX, cap))
+    out["reason"] = why
+    return out
+
+
+def manager_alive() -> bool:
+    uid = os.getuid()
+    candidates = [Path(os.environ["TAUCETI_RUNTIME_DIR"]).expanduser()] if os.environ.get("TAUCETI_RUNTIME_DIR") else []
+    if os.environ.get("XDG_RUNTIME_DIR"):
+        candidates.append(Path(os.environ["XDG_RUNTIME_DIR"]) / "tauceti")
+    candidates += [Path(f"/run/user/{uid}/tauceti"), Path(f"/tmp/tauceti-{uid}")]
+    return any((c / "manager.sock").exists() for c in candidates)
+
+
+def budget_pace(force: bool = False) -> dict | None:
+    """Every PACE_EVERY seconds while the fleet runs: record the weekly reading, take one controller
+    step, write the cap for the workers, and say when the target work alone will outrun the budget.
+    Never raises; does nothing unless fallback_max_open = "auto"."""
+    if not FALLBACK_AUTO:
+        return None
+    try:
+        record_usage_history()
+        state = read_json(FALLBACK_CAP) if FALLBACK_CAP.is_file() else {}
+        now = time.time()
+        if not force and now - float(state.get("at") or 0) < PACE_EVERY:
+            return state
+        if draining() or not manager_alive():
+            return state
+        r = claude_week_reading()
+        n_open = our_open_prs()
+        if r is None or now - r[0] > PACE_STALE or n_open is None:
+            return state  # nothing current to judge by: the cap holds (the workers drop a stale file)
+        at, used, resets = r
+        end = pace_horizon_end(now, resets)
+        H = max(0.25, (end - now) / 3600)
+        hist = []
+        for line in (USAGE_HISTORY.read_text().splitlines()[-2000:] if USAGE_HISTORY.is_file() else []):
+            try:
+                h = json.loads(line)
+            except ValueError:
+                continue
+            if abs(float(h.get("resets") or 0) - resets) < 600 and float(h.get("at") or 0) >= now - PACE_WINDOW:
+                hist.append(h)
+        R = None
+        if len(hist) >= 2 and hist[-1]["at"] - hist[0]["at"] >= PACE_MIN_SPAN:
+            R = max(0.0, (hist[-1]["used"] - hist[0]["used"]) / 100) / ((hist[-1]["at"] - hist[0]["at"]) / 3600)
+        costs = round_costs(now - PACE_WINDOW)
+        known = sum(costs.values())
+        f_out = costs["outside"] / known if known > 0 else 0.0
+        # A step from another weekly window, or from the last slot, says nothing about this one.
+        if not (isinstance(state.get("resets"), (int, float)) and abs(state["resets"] - resets) < 600
+                and now - float(state.get("at") or 0) < 6 * 3600):
+            state = {}
+        out = pace_step(state, now=now, B=max(0.0, 1 - used / 100), H=H, R=R, f_out=f_out, n_open=n_open)
+        out.update(resets=resets, end=end, reading_at=at, costs=costs)
+        tmp = FALLBACK_CAP.with_name(f".{FALLBACK_CAP.name}.{os.getpid()}.tmp")
+        GATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(out))
+        os.replace(tmp, FALLBACK_CAP)
+        if out["cap"] != out["prev"]:
+            _watchdog_note(f"budget: outside-list cap {out['prev']} → {out['cap']} ({out['reason']})")
+        budget_short_incident(out)
+        return out
+    except Exception as exc:  # pacing is advisory: never fail a round, a tick or a reconcile
+        _watchdog_note(f"budget: {exc}")
+        return None
+
+
+def budget_short_incident(out: dict) -> None:
+    """A `budget-short` item in the attention list while the work that is not outside the list (the
+    target list, other people's PRs, the account's other use) alone would outrun the budget before the
+    slot ends; removed when that stops being true."""
+    path = INCIDENTS / "budget-short-claude.json"
+    D, H, B = out.get("D"), out.get("H"), out.get("B")
+    if not isinstance(D, (int, float)) or D * H <= B:
+        path.unlink(missing_ok=True)
+        return
+    left_h = B / D if D > 0 else float("inf")
+    prev = read_json(path) if path.is_file() else {}
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    rec = {"kind": "budget-short", "key": "claude", "worker": PERIODIC_WID, "first_at": prev.get("first_at") or now,
+           "last_at": now, "detail": f"at the current burn the weekly Claude budget runs out in {left_h:.0f} h, "
+           f"{H - left_h:.0f} h before the slot ends, with no outside-list work at all: switch fleets early or "
+           f"lower the load"}
+    try:
+        INCIDENTS.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(rec, indent=1) + "\n")
+    except OSError:
+        pass
+
+
+def budget_line() -> str | None:
+    """The view's `budget` row: the last controller step, or the fixed cap."""
+    if not FALLBACK_AUTO:
+        return f"outside-list cap {FALLBACK_MAX_OPEN_SETTING} (fixed)" if FALLBACK_MAX_OPEN_SETTING else None
+    st = read_json(FALLBACK_CAP) if FALLBACK_CAP.is_file() else {}
+    if not st.get("at"):
+        return "outside-list cap: budget-paced, no step yet"
+    parts = []
+    if isinstance(st.get("B"), (int, float)):
+        parts.append(f"claude weekly {st['B'] * 100:.0f}% left")
+    if isinstance(st.get("H"), (int, float)):
+        parts.append(f"{st['H']:.0f} h to slot end")
+    if isinstance(st.get("reserve"), (int, float)):
+        parts.append(f"reserve {st['reserve'] * 100:.0f}%, surplus {st['surplus'] * 100:.0f}%")
+        parts.append(f"burn {st['R'] * 100:.1f}%/h ({st['f_out'] * 100:.0f}% outside)")
+    parts.append(f"outside cap {st.get('cap')} ({st.get('reason', '')}, {age(st.get('at'))} ago)")
+    return " · ".join(parts)
 
 
 # ----------------------------------------------------------------------------- all fleets
@@ -2650,7 +2882,15 @@ MAX_OPEN_PRS_BACKPRESSURE = MAX_OPEN_PRS_SETTING or 8
 # How many of my PRs may be open while an author with nothing on the target list authors outside it
 # (the worker's $TAUCETI_TARGETS_FALLBACK_MAX_OPEN, default 6). Only the worker reads it; the reconcile
 # learns the outcome from the authors' "not authoring outside the list" rounds.
-FALLBACK_MAX_OPEN_SETTING = _setting_int("authoring", "fallback_max_open")
+# `fallback_max_open = "auto"` paces that cap by the weekly budget instead (budget_pace below): the
+# workers then read it from <gate>/fallback-cap.json each round, and fall back to fallback_auto_min.
+_FALLBACK_RAW = setting("authoring", "fallback_max_open").strip()
+FALLBACK_AUTO = _FALLBACK_RAW.lower() == "auto"
+FALLBACK_MAX_OPEN_SETTING = None if FALLBACK_AUTO or not _FALLBACK_RAW else int(_FALLBACK_RAW)
+FALLBACK_AUTO_MIN = _setting_int("authoring", "fallback_auto_min") if setting("authoring", "fallback_auto_min") else 0
+FALLBACK_AUTO_MAX = _setting_int("authoring", "fallback_auto_max") if setting("authoring", "fallback_auto_max") else 40
+BUDGET_MARGIN = float(setting("authoring", "budget_reserve_margin", "0.25"))
+BUDGET_KEEP = float(setting("authoring", "budget_keep", "0"))
 # Lookahead authoring (the worker's lookahead.py): an author with nothing to take on the target list
 # proves a blocked item against stubs of its in-flight supplier, on a branch of the account's fork,
 # before it would author outside the list; an author ports the branch once the supplier lands. Off
@@ -2829,6 +3069,7 @@ def _shape_from_config(a: argparse.Namespace) -> argparse.Namespace:
 def cmd_reconcile(a: argparse.Namespace) -> int:
     rc = reconcile(_shape_from_config(a), apply=not a.dry_run, quiet=a.quiet)
     if not a.dry_run:
+        budget_pace()
         publish_status()  # after every round (the round-done hook), so the all-fleets view stays current
     return rc
 
@@ -3421,6 +3662,7 @@ def cmd_schedule(a: argparse.Namespace) -> int:
               f"last tick: {last}; draining: {draining()}")
         return 0
     last = SCHEDULE_STATE.read_text().split()[0] if SCHEDULE_STATE.is_file() else ""
+    budget_pace()
     publish_status()  # every tick, so an idle or inactive fleet's needs-you items stay visible
     if want == last:
         return 0
@@ -3579,8 +3821,14 @@ reads_per_hour = 600
 # Authors stop while github_login has this many open PRs in scope; unset = the worker's default, 8.
 # max_open_prs = 8
 # An author with nothing on the target list authors outside it only while at most this many PRs
-# are open; unset = the worker's default, 6.
+# are open; unset = the worker's default, 6. "auto" paces it by the weekly Claude budget: target work
+# keeps a reserve until the slot ends (margin, plus 5%), outside work spends the rest by then,
+# between fallback_auto_min and fallback_auto_max; budget_keep leaves that share unspent.
 # fallback_max_open = 6
+# fallback_auto_min = 0
+# fallback_auto_max = 40
+# budget_reserve_margin = 0.25
+# budget_keep = 0
 # Before that, prove a blocked item ahead of its in-flight supplier, against stubs, on a branch
 # lookahead/<area>/<slug> of the account's fork, and port it once the supplier lands; at most
 # lookahead_max_branches such branches at once. true: on; false: passive (hold items whose branch

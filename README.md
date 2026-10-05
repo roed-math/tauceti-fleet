@@ -99,7 +99,8 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `up.claude`, `up.codex` | Claude authors, and `auto` authors (Codex first, then Claude) | 2 and 2; 1 and 0 in pilot mode |
 | `gate.mutations_per_hour`, `gate.reads_per_hour` | fleet-wide GitHub budgets, rolling hour; the reconcile after each round applies a change | 40 and 600 |
 | `authoring.max_open_prs` | authors stop while the account has this many open PRs in scope; the reconcile applies a change | the worker's 8 |
-| `authoring.fallback_max_open` | with nothing on the target list, authors work outside it only while at most this many PRs are open; the reconcile applies a change | the worker's 6 |
+| `authoring.fallback_max_open` | with nothing on the target list, authors work outside it only while at most this many PRs are open; the reconcile applies a change. `"auto"` paces it by the weekly Claude budget (docs/operating.md) | the worker's 6 |
+| `authoring.fallback_auto_min`, `fallback_auto_max`, `budget_reserve_margin`, `budget_keep` | with `"auto"`: the cap's bounds, the safety factor on the target reserve, and a share of the budget to leave unspent at the slot's end | 0, 40, 0.25, 0 |
 | `authoring.lookahead`, `authoring.lookahead_max_branches` | `true`: before authoring outside the list, prove a blocked item ahead of its in-flight supplier on a fork branch, ported when the supplier lands, at most this many branches at once; `false`: only hold items whose branch awaits its port and sweep finished branches (docs/operating.md) | absent (none of it), 4 |
 | `decide.enabled` | the decide stage, which rules on declined rounds (see docs/operating.md) | `true` |
 | `decide.close`, `decide.max_closes_per_day` | let the decide stage close the account's own PRs that main has subsumed, and how many a day | `false`, 3 |

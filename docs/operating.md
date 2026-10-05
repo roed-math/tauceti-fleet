@@ -141,6 +141,29 @@ Every outcome that is not the plan working leaves a `lookahead` incident in the 
 `skipped` (a passive fleet held the item, then authored it fresh), `mismatch` (a port round could
 not use the branch), `unreadable`, `stale`, `orphan` and `abandoned` (deleted unused).
 
+## Pacing the budget
+
+With `authoring.fallback_max_open = "auto"` the cap on authoring outside the target list follows
+the account's weekly Claude budget, toward two goals: target work never runs short because the
+budget went outside the list, and nothing is left over when the slot ends.
+
+Every 15 minutes while the fleet runs, the controller reads the weekly usage and the burn rate over
+the last three hours. The usage starts wherever your other use of the account left it, and that use
+counts in the burn. It splits the fleet's own Claude spend into target, outside and shared work,
+from the cost each round reports. It then holds back what everything except outside work will need
+until the slot ends (or the weekly reset, if sooner), with `budget_reserve_margin` (0.25) and 5% on
+top. If the reserve takes everything, the cap drops to `fallback_auto_min` and outside work stops.
+Otherwise the cap moves a step, about 10%, toward the rate that spends the rest by the end. A fleet
+running ahead of its slot, after an early switch, plans to the end of the coming slot. The first
+hour of each weekly window holds the cap while the burn rate is measured.
+
+The workers read the cap from `<gate>/fallback-cap.json` each round, so changes need no restart. A
+file older than 30 minutes falls back to `fallback_auto_min`. The view's `budget` row shows the last
+step: budget left, hours to the end, the reserve and surplus, the burn rate and its outside share,
+and the cap with its reason. Each change is a line in `watchdog.log`. When the work that is not
+outside the list would alone use up the budget before the slot ends, the attention list gets a
+`budget-short` item: switch fleets early or lower the load.
+
 ## Watching all fleets
 
 Each fleet can publish its live view as `<fleet.status_dir>/<name>.json`, after every round and on
