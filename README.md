@@ -88,6 +88,7 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `fleet.targets` | the target list the authors work through; several fleets may share one (docs/setup.md) | required |
 | `fleet.github_login` | the GitHub account every worker must act as; any other identity halts the worker | required |
 | `fleet.claim_repo` | the project-wide claim namespace; every fleet must agree on it | `TauCetiProject/tauceti-claims` |
+| `fleet.status_dir` | a directory the fleet users share, where each fleet publishes its view for `watch --fleets` (docs/operating.md) | unset (no publishing) |
 | `paths.worker` | a TauCetiWorker checkout (see Requirements) | `~/TauCetiWorker-v2` |
 | `paths.roadmap` | a TauCetiRoadmap checkout, to check the list's areas are real roadmaps | `~/TauCetiRoadmap` |
 | `up.pilot` | start in pilot mode | `init` writes `true` |
@@ -119,7 +120,8 @@ interpreter that has `rich`, for the live view.
 |---|---|
 | `init` | write the settings file |
 | `up` | write `workers.toml`, pre-seed checkouts, start the manager, open the live view |
-| `watch`, `status` | the live view, or one snapshot of it |
+| `watch`, `status` | the live view, or one snapshot of it; with `--fleets` (or from a user with no fleet), every fleet that publishes to `fleet.status_dir` |
+| `publish` | write this fleet's view to `fleet.status_dir` now (every round and every timer tick do it anyway) |
 | `logins` | the Claude login pool: chains, leases, sign-ins still missing |
 | `attention [--ack PR\|all] [--lookup]` | what needs you: rounds whose agent declined to act (a PR to close?), capped review exchanges |
 | `targets [--apply]` | audit the list's in-flight items against their PRs |

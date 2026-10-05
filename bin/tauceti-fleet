@@ -776,6 +776,27 @@ def operator_claude_users() -> list[str] | None:
     return users
 
 
+CREDS_VIEW_TTL = 600
+
+
+def cached_credential_lines() -> list[tuple[str, str]]:
+    """credential_lines() at most every CREDS_VIEW_TTL seconds, shared by `watch` and `publish`: its
+    `gh auth status` is a GitHub request outside the gate, and publish runs after every round."""
+    cache = FLEET_HOME / "view-creds.json"
+    c = read_json(cache) if cache.is_file() else {}
+    if isinstance(c.get("at"), (int, float)) and time.time() - c["at"] < CREDS_VIEW_TTL and isinstance(c.get("lines"), list):
+        return [tuple(x) for x in c["lines"]]
+    try:
+        lines = credential_lines()
+    except Exception as exc:
+        lines = [(f"credentials: {exc}", "red")]
+    try:
+        cache.write_text(json.dumps({"at": time.time(), "lines": lines}))
+    except OSError:
+        pass
+    return lines
+
+
 def credential_lines() -> list[tuple[str, str]]:
     pool = _login_pool_line()
     users = None if IS_MAC else operator_claude_users()
@@ -2009,10 +2030,84 @@ def target_list_summary() -> str:
             f"({waiting} wait on prerequisites, {held_n} held by a decline){note}")
 
 
-def build_view(progress: Progress, console=None):
-    from rich.console import Group
-    from rich.panel import Panel
-    from rich.table import Table
+def _cell(x) -> dict:
+    """One view cell as JSON. A plain string stays a string, which rich reads as markup as it always
+    has; a Text keeps its characters and its style spans."""
+    from rich.text import Text
+
+    if isinstance(x, Text):
+        return {"text": x.plain, "style": str(x.style or ""), "spans": [[sp.start, sp.end, str(sp.style)] for sp in x.spans]}
+    return {"markup": str(x)}
+
+
+def _uncell(c):
+    from rich.text import Text
+
+    if not isinstance(c, dict):
+        return str(c)
+    if "markup" in c:
+        return c["markup"]
+    t = Text(c.get("text", ""), style=c.get("style") or "")
+    for a, b, style in c.get("spans") or []:
+        t.stylize(style, a, b)
+    return t
+
+
+# Our PRs that wait on a human rather than on the fleet: an approved PR changing human-owned files
+# (needs-human-review), and a held or draft one.
+HUMAN_LABELS = {"needs-human-review", "hold", "on-hold"}
+PR_STATUS_ORDER = ("awaiting-CI", "awaiting-review", "review-in-progress", "awaiting-author", "ci-failed",
+                   "merge-conflict", "needs-rebase", "ready-to-merge")
+
+
+def open_prs_line() -> str | None:
+    """The account's open PRs from the shared open-PR listing the workers refresh as they survey (no
+    GitHub read): those the fleets drive, by status label, and those waiting on a human."""
+    listing = next(iter(sorted((GATE_DIR / "cache").glob("open_prs-*.json"))), None) if (GATE_DIR / "cache").is_dir() else None
+    if listing is None:
+        return None
+    c = read_json(listing)
+    mine = [pr for pr in c.get("prs") or [] if (pr.get("author") or {}).get("login") == EXPECT_LOGIN]
+    if not c.get("prs"):
+        return None
+    def labels(pr):
+        return {lb.get("name") for lb in pr.get("labels") or [] if isinstance(lb, dict)}
+    human = [pr for pr in mine if pr.get("isDraft") or labels(pr) & HUMAN_LABELS]
+    managed = [pr for pr in mine if pr not in human]
+    counts: dict[str, int] = {}
+    for pr in managed:
+        status = next((st for st in PR_STATUS_ORDER if st in labels(pr)), "unlabeled")
+        counts[status] = counts.get(status, 0) + 1
+    order = [*PR_STATUS_ORDER, "unlabeled"]
+    line = f"{len(managed)} fleet-managed" + (": " + " · ".join(f"{k} {counts[k]}" for k in order if counts.get(k)) if counts else "")
+    if human:
+        line += f"; {len(human)} wait on a human (" + ", ".join(f"#{pr.get('number')}" for pr in human[:6]) + (" …" if len(human) > 6 else "") + ")"
+    at = c.get("fetched_at")
+    if isinstance(at, (int, float)) and time.time() - at > 900:
+        line += f" (as of {age(at)} ago)"
+    return line
+
+
+def schedule_info() -> dict:
+    """The fleet's slot as the view needs it: whether the schedule says active now, when it next
+    flips, the last tick, and whether the fleet is draining or its manager is gone."""
+    spec = setting("schedule", "active")
+    out: dict = {"spec": spec, "draining": draining(),
+                 "last_tick": SCHEDULE_STATE.read_text().strip() if SCHEDULE_STATE.is_file() else ""}
+    if spec:
+        try:
+            slots = parse_schedule(spec)
+            now = datetime.now()
+            out["active_now"] = schedule_active(slots, now)
+            out["next_change_at"] = time.time() + schedule_next_change(slots, now) * 60
+        except ValueError:
+            pass
+    return out
+
+
+def view_data(progress: Progress) -> dict:
+    """Everything the live view shows, as plain JSON: what `watch` draws for this fleet, and what
+    `publish` writes for the view of all fleets. render_view draws either."""
     from rich.text import Text
 
     statuses = worker_status()
@@ -2034,9 +2129,7 @@ def build_view(progress: Progress, console=None):
     enabled_ids = [w for w in ids if w not in _off]  # disabled workers are neither healthy nor unhealthy
     healthy = sum(1 for w in enabled_ids if health(statuses.get(w, {}))[1] == "green")
 
-    t = Table(title=None, expand=True, pad_edge=False)
-    for col in ("worker", "agent", "health", "phase / target", "last log line", "act", "next"):
-        t.add_column(col, overflow="ellipsis", no_wrap=True, ratio=3 if col == "last log line" else None)
+    workers = []
     cfg_text = CONFIG.read_text() if CONFIG.is_file() else ""
     disabled = set(re.findall(r'^id\s*=\s*"([^"]+)"\s*\nenabled\s*=\s*false', cfg_text, re.M))
     # Why the reconcile turned authors off: the account's open-PR count (freshest survey) at the
@@ -2061,8 +2154,8 @@ def build_view(progress: Progress, console=None):
         m = re.search(r"provider=(\w+)", st.get("detail") or "") if agent == "auto" else None
         if m and st.get("state") in ("running", "surveying"):
             agent = f"auto→{m.group(1)}"  # what the pacer picked for the round in flight
-        t.add_row(w, agent, Text(label, style=style),
-                  str(what)[:60], last_log_line(w)[:120], age(st.get("activity_at")), until(st.get("next_action_at")))
+        workers.append([w, agent, _cell(Text(label, style=style)), _cell(str(what)[:60]), _cell(last_log_line(w)[:120]),
+                        age(st.get("activity_at")), until(st.get("next_action_at"))])
     # The cadenced stages run outside the manager (one `tauceti work` round each, on a timer), so
     # they have no status file; one row each from their logs and the cadence files.
     for stage in PERIODIC:
@@ -2075,8 +2168,8 @@ def build_view(progress: Progress, console=None):
             label, style, what = "idle", "dim", (f"after a decline, else every {PERIODIC[stage] // 3600} h" if stage == "decide"
                                                  else f"every {PERIODIC[stage] // 3600} h")
         nxt = "running" if ps["running"] else ("—" if not ps["enabled"] else ("due" if ps["next_at"] is None or ps["next_at"] <= time.time() else until(ps["next_at"])))
-        t.add_row(f"periodic:{stage}", "claude", Text(label, style=style), what[:60], ps["last_line"][:120],
-                  age(ps["last_at"]) if ps["last_at"] else "never", nxt)
+        workers.append([f"periodic:{stage}", "claude", _cell(Text(label, style=style)), _cell(what[:60]),
+                        _cell(ps["last_line"][:120]), age(ps["last_at"]) if ps["last_at"] else "never", nxt])
 
     d = progress.refresh() if progress.remote_ok else (progress.data or {"error": "remote refresh off (pass --refresh)"})
     gate_line = ""
@@ -2099,77 +2192,112 @@ def build_view(progress: Progress, console=None):
     except Exception as exc:
         gate_line = f"gate: {exc}"
     halts = sorted((WORKTREE / "state").glob("*/halt.json")) if (WORKTREE / "state").is_dir() else []
-    p = Table.grid(padding=(0, 2))
-    p.add_column(); p.add_column()
+    rows = []
+
+    def row(label, value):
+        rows.append([_cell(label), _cell(value)])
+
     if d.get("per_area"):
         area_lines = []
         for a, st in d["per_area"].items():
             area_lines.append(f"{a}: {st['done']} done · {st['inflight']} in flight · {st['open']} open · [bold]{st['eligible']} eligible[/bold]")
-        p.add_row("targets", "\n".join(area_lines))
-        p.add_row("last 24h", f"{d.get('opened_24h', 0)} PRs opened · {d.get('merged_24h', 0)} of mine merged · {d.get('targets_merged_24h', 0)} listed targets merged (any author)")
+        row("targets", "\n".join(area_lines))
+        row("last 24h", f"{d.get('opened_24h', 0)} PRs opened · {d.get('merged_24h', 0)} of mine merged · {d.get('targets_merged_24h', 0)} listed targets merged (any author)")
         lab = d.get("labels", {})
-        p.add_row("my open PRs", f"{d.get('mine_open', 0)} of {d.get('open_total', 0)} open — " + ", ".join(f"{k} {v}" for k, v in sorted(lab.items())))
+        row("my open PRs", f"{d.get('mine_open', 0)} of {d.get('open_total', 0)} open — " + ", ".join(f"{k} {v}" for k, v in sorted(lab.items())))
         claims = d.get("claims") or []
-        p.add_row("claims held", ", ".join(claims) if claims else "none")
-    p.add_row("target list", Text(target_list_summary(), overflow="fold"))
+        row("claims held", ", ".join(claims) if claims else "none")
+    row("target list", Text(target_list_summary(), overflow="fold"))
+    prs = open_prs_line()
+    if prs:
+        row("open PRs", Text(prs, overflow="fold"))
     look = lookahead_line()
     if look:
-        p.add_row("lookahead", Text(look, overflow="fold"))
+        row("lookahead", Text(look, overflow="fold"))
     if progress_worker_enabled():
-        p.add_row("reports", Text(progress_worker_line(), overflow="fold"))
+        row("reports", Text(progress_worker_line(), overflow="fold"))
     if progress.remote_ok and d.get("error"):
-        p.add_row(Text("progress", style="yellow"), Text(f"partial: {d['error']}", style="yellow"))
-    p.add_row("gate", Text(gate_line, style="red" if "HALTED" in gate_line else "yellow" if "COOLDOWN" in gate_line else "", overflow="fold"))
+        row(Text("progress", style="yellow"), Text(f"partial: {d['error']}", style="yellow"))
+    row("gate", Text(gate_line, style="red" if "HALTED" in gate_line else "yellow" if "COOLDOWN" in gate_line else "", overflow="fold"))
     if halts:
-        p.add_row(Text("halted", style="red"), Text(", ".join(h.parent.name for h in halts) + "  (tauceti-fleet clear-halt)", style="red"))
-    needs = attention_items()
-    if needs:
-        lines = Text()
-        for i, d in enumerate(needs[-6:]):
-            if i:
-                lines.append("\n")
-            lines.append(attention_line(d, 140), style="bold red" if d.get("close_hint") else "yellow")
-        if len(needs) > 6:
-            lines.append(f"\n… {len(needs) - 6} more")
-        hint = "tauceti-fleet attention for the full text; --ack <PR> once handled"
-        if any(d.get("decision") == "roadmap" for d in needs):
-            hint += "; --file-roadmap <PR> to file a drafted roadmap change"
-        lines.append(f"\n({hint})", style="dim")
-        p.add_row(Text("needs you", style="bold red"), lines)
+        row(Text("halted", style="red"), Text(", ".join(h.parent.name for h in halts) + "  (tauceti-fleet clear-halt)", style="red"))
+    items = attention_items()
+    needs = [[attention_line(it, 140), "bold red" if it.get("close_hint") else "yellow"] for it in items]
+    hint = "tauceti-fleet attention for the full text; --ack <PR> once handled"
+    if any(it.get("decision") == "roadmap" for it in items):
+        hint += "; --file-roadmap <PR> to file a drafted roadmap change"
+    after = []  # the rows drawn below the needs-you row
     waiting, recent = pending_decide(), recent_rulings()
     if waiting or recent:
         counts = {}
-        for d in recent:
-            counts[d["decision"]] = counts.get(d["decision"], 0) + 1
-        closed = [f"#{d['pr']}" for d in recent if d["decision"] == "closed"]
+        for r in recent:
+            counts[r["decision"]] = counts.get(r["decision"], 0) + 1
+        closed = [f"#{r['pr']}" for r in recent if r["decision"] == "closed"]
         parts = ([f"{waiting} awaiting a ruling"] if waiting else []) + (
             ["24 h: " + ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))] if counts else [])
         if closed:
             parts.append("closed " + " ".join(closed))
-        p.add_row("decide", Text("; ".join(parts), style="bold" if closed else "dim", overflow="fold"))
+        after.append([_cell("decide"), _cell(Text("; ".join(parts), style="bold" if closed else "dim", overflow="fold"))])
     if not progress.creds or time.time() - getattr(progress, "creds_at", 0) > 300:
-        try:
-            progress.creds = credential_lines()
-        except Exception as exc:
-            progress.creds = [(f"credentials: {exc}", "red")]
+        progress.creds = cached_credential_lines()
         progress.creds_at = time.time()
-    p.add_row("usage", usage_text())
-    p.add_row("credentials", Text.assemble(*[(t + "   ", st) for t, st in progress.creds]))
-    p.add_row("mathlib pool", Text(pool_line(), overflow="fold"))
+    after.append([_cell("usage"), _cell(usage_text())])
+    after.append([_cell("credentials"), _cell(Text.assemble(*[(t + "   ", st) for t, st in progress.creds]))])
+    after.append([_cell("mathlib pool"), _cell(Text(pool_line(), overflow="fold"))])
     if progress.remote_ok:  # the GitHub panel; without --refresh it never runs, so there is nothing to date
-        p.add_row("refreshed", f"{age(progress.at)} ago (every {progress.ttl // 60} min)")
+        after.append([_cell("refreshed"), _cell(f"{age(progress.at)} ago (every {progress.ttl // 60} min)")])
+    return {"v": 1, "fleet": NAME, "user": _pwd.getpwuid(os.getuid()).pw_name, "at": time.time(),
+            "targets": TARGETS.name, "manager_up": mgr_alive, "draining": draining(), "disk_free_gb": free_gb,
+            "healthy": healthy, "enabled": len(enabled_ids), "total": len(ids), "workers": workers,
+            "rows": rows, "needs": needs, "needs_hint": hint, "rows_after": after,
+            "events": [list(e) for e in recent_events(40)], "schedule": schedule_info()}
 
+
+def render_view(data: dict, console=None, *, needs=True, above=()):
+    """The live view for one fleet from view_data(): the header, the worker table, the progress panel
+    and the events panel, which takes whatever height is left. `above` goes first (the all-fleets
+    strip); `needs=False` leaves out the needs-you row (the all-fleets view draws one for all)."""
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    t = Table(title=None, expand=True, pad_edge=False)
+    for col in ("worker", "agent", "health", "phase / target", "last log line", "act", "next"):
+        t.add_column(col, overflow="ellipsis", no_wrap=True, ratio=3 if col == "last log line" else None)
+    for w, agent, label, what, last, act, nxt in data.get("workers") or []:
+        t.add_row(w, agent, _uncell(label), _uncell(what), _uncell(last), act, nxt)
+    p = Table.grid(padding=(0, 2))
+    p.add_column(); p.add_column()
+    for label, value in data.get("rows") or []:
+        p.add_row(_uncell(label), _uncell(value))
+    items = data.get("needs") or []
+    if needs and items:
+        lines = Text()
+        for i, (line, style) in enumerate(items[-6:]):
+            if i:
+                lines.append("\n")
+            lines.append(line, style=style)
+        if len(items) > 6:
+            lines.append(f"\n… {len(items) - 6} more")
+        lines.append(f"\n({data.get('needs_hint', '')})", style="dim")
+        p.add_row(Text("needs you", style="bold red"), lines)
+    for label, value in data.get("rows_after") or []:
+        p.add_row(_uncell(label), _uncell(value))
+    healthy, enabled, total = data.get("healthy", 0), data.get("enabled", 0), data.get("total", 0)
+    free_gb = data.get("disk_free_gb") or 0
     header = Text.assemble(
-        (f" {datetime.now():%Y-%m-%d %H:%M:%S} ", "bold"),
-        (f" workers {healthy}/{len(enabled_ids)} healthy{f' ({len(ids) - len(enabled_ids)} off)' if len(enabled_ids) < len(ids) else ''} ",
-         "green" if healthy == len(enabled_ids) and enabled_ids else "yellow"),
-        *([(" DRAINING (each worker stops when its round ends) ", "yellow")] if draining() else []),
-        (f" manager {'up' if mgr_alive else 'not seen'} ", "green" if mgr_alive else "red"),
+        *([(f" {data['fleet']} ", "bold reverse")] if above else []),
+        (f" {datetime.fromtimestamp(data.get('at') or time.time()):%Y-%m-%d %H:%M:%S} ", "bold"),
+        (f" workers {healthy}/{enabled} healthy{f' ({total - enabled} off)' if enabled < total else ''} ",
+         "green" if healthy == enabled and enabled else "yellow"),
+        *([(" DRAINING (each worker stops when its round ends) ", "yellow")] if data.get("draining") else []),
+        (f" manager {'up' if data.get('manager_up') else 'not seen'} ", "green" if data.get("manager_up") else "red"),
         (f" disk free {free_gb:.0f} GB ", "red" if free_gb < 40 else "yellow" if free_gb < 80 else "green"),
-        *([(f" needs you {len(needs)} ", "bold red")] if needs else []),
-        (f" targets {TARGETS.name} ", "dim"),
+        *([(f" needs you {len(items)} ", "bold red")] if needs and items else []),
+        (f" targets {data.get('targets', '')} ", "dim"),
     )
-    top = Group(header, t, Panel(p, title="progress", border_style="blue"))
+    top = Group(*above, header, t, Panel(p, title="progress", border_style="blue"))
     # Give every remaining terminal line to the events panel: measure what the rest takes, then fill.
     n_events = 8
     if console is not None:
@@ -2180,9 +2308,157 @@ def build_view(progress: Progress, console=None):
             pass
     ev = Table.grid(padding=(0, 1))
     ev.add_column(style="dim"); ev.add_column(overflow="ellipsis", no_wrap=True)
-    for w, line in recent_events(n_events):
+    for w, line in (data.get("events") or [])[-n_events:]:
         ev.add_row(w, line)
     return TerminalSafe(Group(top, Panel(ev, title=f"recent events (last {n_events})", border_style="dim")))
+
+
+def build_view(progress: Progress, console=None):
+    return render_view(view_data(progress), console)
+
+
+# ----------------------------------------------------------------------------- all fleets
+#
+# A fleet's own processes can read its home; another user (the shared `agents` account) cannot, and
+# should not: the home holds the Claude login chains, and the workers' private homes hold access-token
+# mirrors readable by design. So each fleet publishes its view_data() as `<status_dir>/<name>.json`
+# (fleet.status_dir, a directory the fleet users share), after every round and on the schedule timer,
+# and `watch` by a user with no fleet of its own draws all of them.
+
+PUBLISH_MIN_GAP = 45  # seconds: the round-done hook fires many times a minute when the fleet is busy
+
+
+def status_dir() -> Path | None:
+    v = setting("fleet", "status_dir", "", "TAUCETI_FLEET_STATUS_DIR")
+    return _expand(v) if v else None
+
+
+def publish_status(quiet: bool = True, force: bool = False) -> Path | None:
+    """Write this fleet's view_data() to `<status_dir>/<name>.json`; never raises."""
+    d = status_dir()
+    if d is None or not NAME:
+        return None
+    out = d / f"{NAME}.json"
+    try:
+        if not force and out.is_file() and time.time() - out.stat().st_mtime < PUBLISH_MIN_GAP:
+            return out
+        data = view_data(Progress())
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / f".{NAME}.json.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(data))
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, out)
+        return out
+    except Exception as exc:  # a view is never worth failing a round, a tick or a reconcile for
+        _watchdog_note(f"publish: {exc}")
+        if not quiet:
+            print(f"publish: {exc}")
+        return None
+
+
+def cmd_publish(a: argparse.Namespace) -> int:
+    out = publish_status(quiet=False, force=True)
+    if out is None:
+        print("publish: fleet.status_dir is not set in fleet.toml; nothing to publish")
+        return 0
+    print(f"published {out}")
+    return 0
+
+
+def fleet_snapshots(d: Path) -> list[dict]:
+    snaps = []
+    for f in sorted(d.glob("*.json")):
+        s = read_json(f)
+        if s.get("v") == 1 and s.get("fleet"):
+            snaps.append(s)
+    return snaps
+
+
+def _fleet_state(s: dict) -> tuple[str, str]:
+    """(what the fleet is doing, style) for the all-fleets strip."""
+    sch = s.get("schedule") or {}
+    nxt = sch.get("next_change_at")
+    when = f"{datetime.fromtimestamp(nxt):%a %H:%M}" if isinstance(nxt, (int, float)) else "?"
+    running = s.get("manager_up") and not s.get("draining")
+    if running:
+        return (f"RUNNING, slot ends {when}" if sch.get("active_now") else f"RUNNING outside its slot (next slot {when})"), "bold green"
+    if s.get("manager_up"):
+        return "DRAINING (workers finishing their rounds)", "yellow"
+    if sch.get("active_now"):
+        return f"stopped during its slot (ends {when})", "yellow"
+    return f"off; slot starts {when}", "dim"
+
+
+def main_fleet(snaps: list[dict]) -> dict:
+    """The fleet the view follows: the one running, else the one draining, else the one whose slot it
+    is, else the freshest. Two running at once (an overlap) prefer the one in its slot."""
+    def key(s):
+        sch = s.get("schedule") or {}
+        running = bool(s.get("manager_up") and not s.get("draining"))
+        return (running, bool(s.get("manager_up")), bool(sch.get("active_now")), s.get("at") or 0)
+    return max(snaps, key=key)
+
+
+def render_fleets(snaps: list[dict], d: Path, console=None):
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    if not snaps:
+        return Text(f"no fleet has published to {d} yet (fleet.status_dir in each fleet.toml; "
+                    f"`tauceti-fleet publish` as a fleet user writes one now)", style="yellow")
+    main = main_fleet(snaps)
+    strip = Table.grid(padding=(0, 2))
+    for _ in range(5):
+        strip.add_column()
+    needs_all = Text()
+    n_needs = 0
+    for s in snaps:
+        state, style = _fleet_state(s)
+        stale = time.time() - (s.get("at") or 0)
+        n = len(s.get("needs") or [])
+        strip.add_row(Text(("▶ " if s is main else "  ") + s["fleet"], style="bold" if s is main else ""),
+                      Text(s.get("user", "")), Text(state, style=style),
+                      Text(f"workers {s.get('healthy', 0)}/{s.get('enabled', 0)} healthy" if s.get("manager_up") else "manager stopped",
+                           style="dim"),
+                      Text(f"needs you {n}" if n else "nothing needs you", style="bold red" if n else "dim")
+                      + Text(f"   snapshot {age(s.get('at'))} old", style="red" if stale > 900 else "dim"))
+        for line, lstyle in s.get("needs") or []:
+            if n_needs:
+                needs_all.append("\n")
+            needs_all.append(f"{s['fleet']}: ", style="bold")
+            needs_all.append(line, style=lstyle)
+            n_needs += 1
+    above = [Panel(strip, title=f"fleets ({d})", border_style="magenta")]
+    if n_needs:
+        needs_all.append("\n(as each fleet's user: tauceti-fleet attention for the full text; --ack <PR> once handled)", style="dim")
+        above.append(Panel(needs_all, title=f"needs you, all fleets ({n_needs})", border_style="red"))
+    return render_view(main, console, needs=False, above=above)
+
+
+def default_status_dir() -> Path | None:
+    return status_dir() or (HOME / "fleet-shared" / "status")
+
+
+def cmd_watch_fleets(a: argparse.Namespace) -> int:
+    if not _HAVE_RICH:
+        die("the live view needs the `rich` module (python3-rich, or set TAUCETI_FLEET_PYTHON)")
+    from rich.console import Console
+    from rich.live import Live
+
+    d = Path(a.fleets).expanduser() if isinstance(a.fleets, str) and a.fleets else default_status_dir()
+    console = Console()
+    if a.once:
+        console.print(render_fleets(fleet_snapshots(d), d, console))
+        return 0
+    with Live(render_fleets(fleet_snapshots(d), d, console), console=console, screen=True, refresh_per_second=1) as live:
+        try:
+            while True:
+                time.sleep(max(5, a.interval))
+                live.update(render_fleets(fleet_snapshots(d), d, console))
+        except KeyboardInterrupt:
+            return 0
 
 
 # Characters Rich counts as zero-width but a terminal may not: the emoji presentation selector turns
@@ -2210,6 +2486,8 @@ class TerminalSafe:
 
 
 def cmd_watch(a: argparse.Namespace) -> int:
+    if getattr(a, "fleets", None) or not NAME:
+        return cmd_watch_fleets(a)
     if not _HAVE_RICH:
         die("the live view needs the `rich` module; set TAUCETI_FLEET_PYTHON to an interpreter that has it "
             "(the uv tool's ~/.local/share/uv/tools/tauceti/bin/python3, or `pip install rich`)")
@@ -2227,6 +2505,7 @@ def cmd_watch(a: argparse.Namespace) -> int:
             while True:
                 time.sleep(a.interval)
                 live.update(build_view(progress, console))
+                publish_status()
                 # A fully quiet fleet (every worker parked at a usage limit) finishes no rounds, so no
                 # reconcile runs; the view is the process that is still awake, so it keeps the free
                 # login chains renewable. Leased chains are their workers' business (see the pool).
@@ -2548,7 +2827,10 @@ def _shape_from_config(a: argparse.Namespace) -> argparse.Namespace:
 
 
 def cmd_reconcile(a: argparse.Namespace) -> int:
-    return reconcile(_shape_from_config(a), apply=not a.dry_run, quiet=a.quiet)
+    rc = reconcile(_shape_from_config(a), apply=not a.dry_run, quiet=a.quiet)
+    if not a.dry_run:
+        publish_status()  # after every round (the round-done hook), so the all-fleets view stays current
+    return rc
 
 
 def cmd_scale(a: argparse.Namespace) -> int:
@@ -3117,7 +3399,8 @@ def cmd_schedule(a: argparse.Namespace) -> int:
     """The fleet's weekly active slots (`schedule.active` in fleet.toml, host-local time). `--tick` acts
     on a boundary only: when the slot the clock is in differs from the last tick's, it runs `up` (the
     fleet's own settings) or `down --drain`. A manual up or down between boundaries is left alone.
-    `--install` adds a systemd user timer that ticks every five minutes."""
+    `--install` adds a systemd user timer that ticks every minute; each tick also publishes the view
+    (fleet.status_dir)."""
     spec = setting("schedule", "active")
     if a.install or a.uninstall:
         return _schedule_unit(install=a.install)
@@ -3138,6 +3421,7 @@ def cmd_schedule(a: argparse.Namespace) -> int:
               f"last tick: {last}; draining: {draining()}")
         return 0
     last = SCHEDULE_STATE.read_text().split()[0] if SCHEDULE_STATE.is_file() else ""
+    publish_status()  # every tick, so an idle or inactive fleet's needs-you items stay visible
     if want == last:
         return 0
     argv = [str(Path(__file__).resolve()), "up", "--no-watch"] if want == "active" else \
@@ -3178,11 +3462,11 @@ def _schedule_unit(install: bool) -> int:
         f"Environment=TAUCETI_FLEET_HOME={FLEET_HOME}\nEnvironment=PATH={path}\n"
         f"ExecStart={Path(__file__).resolve()} schedule --tick\n")
     timer.write_text(
-        "[Unit]\nDescription=tauceti-fleet weekly schedule tick, every 5 minutes\n\n[Timer]\n"
-        "OnCalendar=*:0/5\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
+        "[Unit]\nDescription=tauceti-fleet weekly schedule tick, every minute\n\n[Timer]\n"
+        "OnCalendar=*:*:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     rc = subprocess.run(["systemctl", "--user", "enable", "--now", f"{SCHEDULE_UNIT}.timer"]).returncode
-    print(f"installed {timer} (every 5 min; logs: journalctl --user -u {SCHEDULE_UNIT})")
+    print(f"installed {timer} (every minute; logs: journalctl --user -u {SCHEDULE_UNIT})")
     return rc
 
 
@@ -3385,14 +3669,19 @@ def main() -> int:
     up.add_argument("--no-watch", action="store_true", help="start and return instead of opening the live view")
     up.add_argument("--dry-run", action="store_true", help="write and validate the config, pre-seed checkouts, but do not start")
     up.set_defaults(fn=cmd_up)
-    w = sub.add_parser("watch", help="live health and progress view")
+    w = sub.add_parser("watch", help="live health and progress view (all fleets, from a user with no fleet of its own)")
     w.add_argument("--interval", type=int, default=30)
     w.add_argument("--once", action="store_true")
     w.add_argument("--refresh", action="store_true", help="also refresh PR/claim state from GitHub (through the gate) every 5 min")
+    w.add_argument("--fleets", nargs="?", const=True, default=None, metavar="DIR",
+                   help="every fleet that publishes to DIR (default: fleet.status_dir, else ~/fleet-shared/status)")
     w.set_defaults(fn=cmd_watch)
     s = sub.add_parser("status", help="print the view once")
     s.add_argument("--refresh", action="store_true")
-    s.set_defaults(fn=lambda a: cmd_watch(argparse.Namespace(interval=0, once=True, refresh=a.refresh)))
+    s.add_argument("--fleets", nargs="?", const=True, default=None, metavar="DIR")
+    s.set_defaults(fn=lambda a: cmd_watch(argparse.Namespace(interval=0, once=True, refresh=a.refresh, fleets=a.fleets)))
+    pb = sub.add_parser("publish", help="write this fleet's view to fleet.status_dir now (rounds and the timer do it anyway)")
+    pb.set_defaults(fn=cmd_publish)
     ch = sub.add_parser("clear-halt", help="print each worker's halt incident, then clear it (owner action)")
     ch.set_defaults(fn=lambda a: [print(f"== {h.parent.name}\n{h.read_text()}") or h.unlink() for h in sorted((WORKTREE / "state").glob("*/halt.json"))] and 0 or 0)
     gt = sub.add_parser("gate", help="pass-through to `tauceti gate ...` (status, report, resume, halt)")
@@ -3472,7 +3761,7 @@ def main() -> int:
     wp.set_defaults(fn=cmd_warm_pool)
     sc = sub.add_parser("schedule", help="the weekly active slots (schedule.active): show, tick, or install the timer")
     sc.add_argument("--tick", action="store_true", help="act if the clock crossed a slot boundary since the last tick")
-    sc.add_argument("--install", action="store_true", help="install a systemd user timer that ticks every 5 minutes")
+    sc.add_argument("--install", action="store_true", help="install a systemd user timer that ticks every minute")
     sc.add_argument("--uninstall", action="store_true", help="remove that timer")
     sc.set_defaults(fn=cmd_schedule)
     d = sub.add_parser("down", help="stop the manager and its workers (--drain: each when its current round ends)")
@@ -3490,6 +3779,8 @@ def main() -> int:
     lg.add_argument("-f", "--follow", action="store_true")
     lg.set_defaults(fn=cmd_logs)
     a = ap.parse_args()
+    if a.cmd in ("watch", "status") and (a.fleets or not NAME):
+        return a.fn(a) or 0  # the all-fleets view needs no fleet of its own
     if a.cmd != "init" and not (NAME and EXPECT_LOGIN):
         die(f"no fleet settings in {SETTINGS_FILE} (fleet.name and fleet.github_login are required): run "
             f"`{PROG} init`, or set TAUCETI_FLEET_HOME to an existing fleet's home")

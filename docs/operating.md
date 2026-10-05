@@ -141,6 +141,23 @@ Every outcome that is not the plan working leaves a `lookahead` incident in the 
 `skipped` (a passive fleet held the item, then authored it fresh), `mismatch` (a port round could
 not use the branch), `unreadable`, `stale`, `orphan` and `abandoned` (deleted unused).
 
+## Watching all fleets
+
+Each fleet can publish its live view as `<fleet.status_dir>/<name>.json`, after every round and on
+every schedule tick (each minute), with `tauceti-fleet publish` to force one. A user with no fleet of
+its own, such as the shared `agents` account, then runs `tauceti-fleet watch` and sees all of them:
+
+- a strip with one line per fleet: running, draining, or off, and when its slot starts or ends;
+- one needs-you panel for every fleet, each item tagged with its fleet;
+- the full view of the fleet that is running (else the one draining, else the one in its slot),
+  which follows the rotation by itself.
+
+The fleets publish rather than open their homes to the viewer: a fleet home holds its Claude login
+chains, and the workers' private homes hold access-token copies the sandbox reads. The view needs
+only Python with `rich` (the system `python3-rich` will do) and the script, for example
+`/home/agents/fleet-shared/tauceti-fleet/bin/tauceti-fleet watch`. A snapshot older than 15 minutes
+shows its age in red. `--fleets DIR` reads another directory.
+
 ## The progress-report worker
 
 `<name>-prog1`, off until `enabled = true` under `[progress]`, writes roadmaps' STATUS.md and
