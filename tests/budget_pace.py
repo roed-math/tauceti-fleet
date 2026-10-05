@@ -40,9 +40,6 @@ fallback_auto_max = 40
 active = "Mon 23:00 -> Thu 07:00"
 """)
 os.environ["TAUCETI_FLEET_HOME"] = str(HOME)
-RUNTIME = TMP / "run"
-RUNTIME.mkdir()
-os.environ["TAUCETI_RUNTIME_DIR"] = str(RUNTIME)
 loader = importlib.machinery.SourceFileLoader("tf", str(HERE / "bin" / "tauceti-fleet"))
 spec = importlib.util.spec_from_loader("tf", loader)
 tf = importlib.util.module_from_spec(spec)
@@ -106,7 +103,7 @@ rows = [{"ended_at": now - 600, "provider": "claude", "kind": "target", "cost_us
 check("spend shares: Claude rounds in the window only", tf.round_costs(now - 3 * 3600) == {"target": 6.0, "outside": 2.0, "shared": 2.0})
 
 # ---- an end-to-end step ----------------------------------------------------------------------------------
-(RUNTIME / "manager.sock").write_text("")
+tf.manager_alive = lambda: True  # the real runtime dir may hold a live manager's socket: decide it here
 resets = now + 3 * 86400
 (w1 / "cache").mkdir()
 (w1 / "cache" / "quota-claude.json").write_text(json.dumps({"fetched_at": now - 60, "payload": {
@@ -132,7 +129,7 @@ check("…and it clears once that stops being true", not (tf.INCIDENTS / "budget
 tf.budget_short_incident({"D": 0.1, "H": 10, "B": 0.5})
 item = json.loads((tf.INCIDENTS / "budget-short-claude.json").read_text())
 check("budget-short says when the budget runs out", item["kind"] == "budget-short" and "runs out in 5 h" in item["detail"], item["detail"])
-(RUNTIME / "manager.sock").unlink()
+tf.manager_alive = lambda: False
 tf.FALLBACK_CAP.write_text(json.dumps({"at": 0}))
 check("a stopped fleet takes no step", tf.budget_pace(force=True).get("cap") is None)
 
