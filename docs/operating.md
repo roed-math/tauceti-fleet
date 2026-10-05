@@ -120,6 +120,8 @@ plan's next split as a pull request, the stubs replaced by the landed declaratio
 but while a split that does not wait on another is still unopened, the item stays available to the
 next round, so independent splits are opened without waiting for each other to merge. Every port PR
 carries a `tauceti-lookahead-port:v1` marker, which is how the next round knows what is open.
+A complete branch that stubs nothing (everything the item uses has landed, though a listed need is
+not complete) is ported at once, without waiting for that need.
 
 All of this state is on GitHub, so it does not matter which fleet is active. The curator's round
 deletes the branch of an item that is done and lists stale branches (built on a `main` more than a
