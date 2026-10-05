@@ -99,7 +99,7 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `gate.mutations_per_hour`, `gate.reads_per_hour` | fleet-wide GitHub budgets, rolling hour; the reconcile after each round applies a change | 40 and 600 |
 | `authoring.max_open_prs` | authors stop while the account has this many open PRs in scope; the reconcile applies a change | the worker's 8 |
 | `authoring.fallback_max_open` | with nothing on the target list, authors work outside it only while at most this many PRs are open; the reconcile applies a change | the worker's 6 |
-| `authoring.lookahead`, `authoring.lookahead_max_branches` | before authoring outside the list, prove a blocked item ahead of its in-flight supplier on a fork branch, ported when the supplier lands; at most this many branches at once (docs/operating.md) | `false`, 4 |
+| `authoring.lookahead`, `authoring.lookahead_max_branches` | `true`: before authoring outside the list, prove a blocked item ahead of its in-flight supplier on a fork branch, ported when the supplier lands, at most this many branches at once; `false`: only hold items whose branch awaits its port and sweep finished branches (docs/operating.md) | absent (none of it), 4 |
 | `decide.enabled` | the decide stage, which rules on declined rounds (see docs/operating.md) | `true` |
 | `decide.close`, `decide.max_closes_per_day` | let the decide stage close the account's own PRs that main has subsumed, and how many a day | `false`, 3 |
 | `models.claude`, `models.claude_effort` | the Claude model for every Claude round; the reconcile applies a change | `claude-opus-5-5`, `high` |

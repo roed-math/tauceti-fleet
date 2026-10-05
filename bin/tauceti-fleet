@@ -443,7 +443,7 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             # Authoring backpressure, only when fleet.toml overrides the worker's default.
             **({"TAUCETI_MAX_OPEN_PRS": str(MAX_OPEN_PRS_SETTING)} if MAX_OPEN_PRS_SETTING else {}),
             **({"TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_MAX_OPEN_SETTING)} if FALLBACK_MAX_OPEN_SETTING else {}),
-            **({"TAUCETI_LOOKAHEAD": "1"} if LOOKAHEAD_SETTING else {}),
+            **LOOKAHEAD_ENV,
             **({"TAUCETI_LOOKAHEAD_MAX_BRANCHES": str(LOOKAHEAD_MAX_BRANCHES_SETTING)}
                if LOOKAHEAD_MAX_BRANCHES_SETTING is not None else {}),
             **provider_paces(),
@@ -1469,6 +1469,7 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
         # The decide stage may close the account's own subsumed PRs only when the operator says so.
         "TAUCETI_DECIDE_CLOSE": "1" if _setting_bool("decide", "close") else "0",
         "TAUCETI_DECIDE_MAX_CLOSES_PER_DAY": setting("decide", "max_closes_per_day", "3"),
+        **LOOKAHEAD_ENV,  # the curator's branch sweep
     })
     # The same pacing curve as the managed workers, which get theirs as `pace = ...` in the config.
     # Without it the worker's default curve applies, and that one allows nothing at all early in a
@@ -1944,9 +1945,9 @@ def lookahead_line() -> str | None:
                 hist.append(rec)
     except OSError:
         pass
-    if not (LOOKAHEAD_SETTING or rows or hist):
+    if not (LOOKAHEAD_ENV or rows or hist):
         return None
-    parts = ["on" if LOOKAHEAD_SETTING else "off"]
+    parts = ["on" if LOOKAHEAD_SETTING else "passive" if LOOKAHEAD_ENV else "off"]
     live = ", ".join(f"{r.get('slug')} ({r.get('status')})" for r in rows)
     parts.append(f"{len(rows)} branch(es) live{': ' + live if live else ''}")
     sessions = [r for r in hist if r.get("event") == "session"]
@@ -2377,6 +2378,9 @@ FALLBACK_MAX_OPEN_SETTING = _setting_int("authoring", "fallback_max_open")
 # unless set; only the worker reads these (TAUCETI_LOOKAHEAD, TAUCETI_LOOKAHEAD_MAX_BRANCHES).
 LOOKAHEAD_SETTING = _setting_bool("authoring", "lookahead")
 LOOKAHEAD_MAX_BRANCHES_SETTING = _setting_int("authoring", "lookahead_max_branches")
+# true: sessions and ports. false: passive, holding an item whose branch awaits its port and sweeping
+# finished branches, for a fleet that rotates with lookahead fleets. Absent: none of it, no env at all.
+LOOKAHEAD_ENV = {"TAUCETI_LOOKAHEAD": "1" if LOOKAHEAD_SETTING else "0"} if setting("authoring", "lookahead") else {}
 
 
 # A backlog this large gets every fixer even while authors run. It was the old backpressure point, so
@@ -3295,7 +3299,8 @@ reads_per_hour = 600
 # fallback_max_open = 6
 # Before that, prove a blocked item ahead of its in-flight supplier, against stubs, on a branch
 # lookahead/<area>/<slug> of the account's fork, and port it once the supplier lands; at most
-# lookahead_max_branches such branches at once. Off unless true.
+# lookahead_max_branches such branches at once. true: on; false: passive (hold items whose branch
+# awaits its port, sweep finished branches); absent: none of it.
 # lookahead = false
 # lookahead_max_branches = 4
 

@@ -124,10 +124,12 @@ A complete branch that stubs nothing (everything the item uses has landed, thoug
 not complete) is ported at once, without waiting for that need.
 
 All of this state is on GitHub, so it does not matter which fleet is active. The curator's round
-deletes the branch of an item that is done and lists stale branches (built on a `main` more than a
-week old). Without the setting, a fleet leaves an eligible item with a fresh branch for six hours
-(`TAUCETI_LOOKAHEAD_HOLD_HOURS`) before authoring it fresh. Items marked `lookahead: no` in the target
-list are skipped.
+deletes the branch of an item that is done, and lists stale branches (built on a `main` more than a
+week old) and branches whose item is not on the list; it never deletes those. With
+`authoring.lookahead = false` a fleet is passive: it proves and ports nothing, but sweeps branches,
+and leaves an eligible item with a fresh branch for six hours (`TAUCETI_LOOKAHEAD_HOLD_HOURS`)
+before authoring it fresh. Without the setting a fleet does none of this and never lists the
+branches. Items marked `lookahead: no` in the target list are skipped.
 
 `tauceti-fleet lookahead SLUG` runs one such round on that item now, setting or no setting: a session
 while the item is blocked, its port once it is eligible. It runs as the periodic worker under the
@@ -136,8 +138,8 @@ periodic lock, as `review` does, so curate and decide wait for it.
 The live view's `lookahead` row shows the branches and the last week's sessions, ports and deletions.
 Every outcome that is not the plan working leaves a `lookahead` incident in the attention list:
 `failed` (a session pushed nothing; the item is not offered again for three days), `held` and
-`skipped` (a fleet without the setting held the item, then authored it fresh), `mismatch` (a port
-round could not use the branch), `unreadable`, `stale` and `abandoned`.
+`skipped` (a passive fleet held the item, then authored it fresh), `mismatch` (a port round could
+not use the branch), `unreadable`, `stale`, `orphan` and `abandoned` (deleted unused).
 
 ## The progress-report worker
 
