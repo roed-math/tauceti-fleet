@@ -2343,6 +2343,8 @@ PACE_WINDOW = 3 * 3600  # the burn rate and the spend shares are measured over t
 PACE_MIN_SPAN = 3600  # less history than this is a warm-up: the cap holds
 PACE_STALE = 1800  # a reading older than this moves nothing
 BUDGET_FLOOR = 0.05  # kept on top of the target reserve: target demand jumps when items become eligible
+EXTRA_CLAIMED = FLEET_HOME / "budget-extra-claimed.json"  # written when the readings show the reset claimed
+RESET_DUE_AT = 0.10  # weekly budget left below which an unclaimed reset is put on the attention list
 
 
 def claude_week_reading() -> tuple[float, float, float] | None:
@@ -2366,12 +2368,36 @@ def record_usage_history() -> None:
         last = USAGE_HISTORY.read_text().splitlines()[-1] if USAGE_HISTORY.is_file() else ""
         if last and float(json.loads(last).get("at") or 0) >= r[0]:
             return
+        if last:
+            note_claimed_reset(json.loads(last), r[0], r[1])
         with open(USAGE_HISTORY, "a") as f:
             f.write(json.dumps({"at": r[0], "used": r[1], "resets": r[2]}) + "\n")
         if USAGE_HISTORY.stat().st_size > 2_000_000:
             USAGE_HISTORY.write_text("\n".join(USAGE_HISTORY.read_text().splitlines()[-5000:]) + "\n")
     except (OSError, ValueError):
         pass
+
+
+def budget_extra(now: float) -> float:
+    """The share of a weekly window still to be claimed as the account's one-time reset: budget_extra
+    until the readings show it claimed or budget_extra_until passes, else 0."""
+    if BUDGET_EXTRA <= 0 or EXTRA_CLAIMED.is_file():
+        return 0.0
+    try:
+        until = datetime.fromisoformat(BUDGET_EXTRA_UNTIL).timestamp() if BUDGET_EXTRA_UNTIL else float("inf")
+    except ValueError:
+        return 0.0
+    return BUDGET_EXTRA if now < until else 0.0
+
+
+def note_claimed_reset(prev: dict, at: float, used: float) -> None:
+    """Record the one-time reset as claimed when weekly use falls by 20 points or more before the
+    window's own reset time: a weekly reset happens at or after the `resets` the last reading gave."""
+    if BUDGET_EXTRA <= 0 or EXTRA_CLAIMED.is_file():
+        return
+    if float(prev.get("used") or 0) - used >= 20 and at < float(prev.get("resets") or 0) - 600:
+        EXTRA_CLAIMED.write_text(json.dumps({"at": at, "used_before": prev.get("used"), "used_after": used}) + "\n")
+        _watchdog_note(f"budget: the one-time reset was claimed (weekly use {prev.get('used')}% → {used}%)")
 
 
 def pace_horizon_end(now_ts: float, resets: float) -> float:
@@ -2489,6 +2515,11 @@ def budget_pace(force: bool = False) -> dict | None:
                 continue
             if abs(float(h.get("resets") or 0) - resets) < 600 and float(h.get("at") or 0) >= now - PACE_WINDOW:
                 hist.append(h)
+        # A claimed reset empties the window before its reset time: measure the burn from after it.
+        for i in range(len(hist) - 1, 0, -1):
+            if hist[i]["used"] < hist[i - 1]["used"]:
+                hist = hist[i:]
+                break
         R = None
         if len(hist) >= 2 and hist[-1]["at"] - hist[0]["at"] >= PACE_MIN_SPAN:
             R = max(0.0, (hist[-1]["used"] - hist[0]["used"]) / 100) / ((hist[-1]["at"] - hist[0]["at"]) / 3600)
@@ -2499,8 +2530,9 @@ def budget_pace(force: bool = False) -> dict | None:
         if not (isinstance(state.get("resets"), (int, float)) and abs(state["resets"] - resets) < 600
                 and now - float(state.get("at") or 0) < 6 * 3600):
             state = {}
-        out = pace_step(state, now=now, B=max(0.0, 1 - used / 100), H=H, R=R, f_out=f_out, n_open=n_open)
-        out.update(resets=resets, end=end, reading_at=at, costs=costs)
+        left, extra = max(0.0, 1 - used / 100), budget_extra(now)
+        out = pace_step(state, now=now, B=left + extra, H=H, R=R, f_out=f_out, n_open=n_open)
+        out.update(resets=resets, end=end, reading_at=at, costs=costs, extra=extra)
         tmp = FALLBACK_CAP.with_name(f".{FALLBACK_CAP.name}.{os.getpid()}.tmp")
         GATE_DIR.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(out))
@@ -2508,6 +2540,7 @@ def budget_pace(force: bool = False) -> dict | None:
         if out["cap"] != out["prev"]:
             _watchdog_note(f"budget: outside-list cap {out['prev']} → {out['cap']} ({out['reason']})")
         budget_short_incident(out)
+        reset_due_incident(left, extra, R)
         return out
     except Exception as exc:  # pacing is advisory: never fail a round, a tick or a reconcile
         _watchdog_note(f"budget: {exc}")
@@ -2537,6 +2570,27 @@ def budget_short_incident(out: dict) -> None:
         pass
 
 
+def reset_due_incident(left: float, extra: float, R: float | None) -> None:
+    """A `budget-reset` item in the attention list while the weekly budget is nearly spent and the
+    one-time reset is unclaimed: the owner claims it by hand, and the pacing has been spending it."""
+    path = INCIDENTS / "budget-reset-claude.json"
+    if extra <= 0 or left >= RESET_DUE_AT:
+        path.unlink(missing_ok=True)
+        return
+    prev = read_json(path) if path.is_file() else {}
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    when = f", about {left / R:.0f} h at the current burn" if R else ""
+    rec = {"kind": "budget-reset", "key": "claude", "worker": PERIODIC_WID, "first_at": prev.get("first_at") or now,
+           "last_at": now, "detail": f"the weekly Claude budget is down to {left * 100:.0f}% left{when}: claim this "
+           f"account's one-time quota reset now (the pacing counts it as budget until {BUDGET_EXTRA_UNTIL or 'claimed'}); "
+           f"once the limit is reached, Claude rounds wait until it is claimed"}
+    try:
+        INCIDENTS.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(rec, indent=1) + "\n")
+    except OSError:
+        pass
+
+
 def budget_line() -> str | None:
     """The view's `budget` row: the last controller step, or the fixed cap."""
     if not FALLBACK_AUTO:
@@ -2546,7 +2600,9 @@ def budget_line() -> str | None:
         return "outside-list cap: budget-paced, no step yet"
     parts = []
     if isinstance(st.get("B"), (int, float)):
-        parts.append(f"claude weekly {st['B'] * 100:.0f}% left")
+        extra = st.get("extra") or 0
+        parts.append(f"claude weekly {(st['B'] - extra) * 100:.0f}% left"
+                     + (f" + {extra * 100:.0f}% reset to claim" if extra else ""))
     if isinstance(st.get("H"), (int, float)):
         parts.append(f"{st['H']:.0f} h to slot end")
     if isinstance(st.get("reserve"), (int, float)):
@@ -2898,6 +2954,10 @@ FALLBACK_AUTO_MIN = _setting_int("authoring", "fallback_auto_min") if setting("a
 FALLBACK_AUTO_MAX = _setting_int("authoring", "fallback_auto_max") if setting("authoring", "fallback_auto_max") else 40
 BUDGET_MARGIN = float(setting("authoring", "budget_reserve_margin", "0.25"))
 BUDGET_KEEP = float(setting("authoring", "budget_keep", "0"))
+# A one-time quota reset the owner claims by hand (2026-10-06: one week per account, to be used by
+# October 22): the pacing counts it as budget until it is claimed or budget_extra_until passes.
+BUDGET_EXTRA = float(setting("authoring", "budget_extra", "0"))
+BUDGET_EXTRA_UNTIL = str(setting("authoring", "budget_extra_until", "") or "")
 # Lookahead authoring (the worker's lookahead.py): an author with nothing to take on the target list
 # proves a blocked item against stubs of its in-flight supplier, on a branch of the account's fork,
 # before it would author outside the list; an author ports the branch once the supplier lands. Off
@@ -3831,11 +3891,16 @@ reads_per_hour = 600
 # are open; unset = the worker's default, 6. "auto" paces it by the weekly Claude budget: target work
 # keeps a reserve until the slot ends (margin, plus 5%), outside work spends the rest by then,
 # between fallback_auto_min and fallback_auto_max; budget_keep leaves that share unspent.
+# budget_extra is a share of a weekly window the account can still claim by hand (a one-time reset):
+# counted as budget until budget_extra_until (local time) or until the readings show it claimed, with
+# a `budget-reset` attention item when the weekly budget is nearly spent and it is still unclaimed.
 # fallback_max_open = 6
 # fallback_auto_min = 0
 # fallback_auto_max = 40
 # budget_reserve_margin = 0.25
 # budget_keep = 0
+# budget_extra = 0
+# budget_extra_until = "2026-10-22T00:00"
 # Before that, prove a blocked item ahead of its in-flight supplier, against stubs, on a branch
 # lookahead/<area>/<slug> of the account's fork, and port it once the supplier lands; at most
 # lookahead_max_branches such branches at once. true: on; false: passive (hold items whose branch

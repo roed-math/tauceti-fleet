@@ -129,6 +129,43 @@ check("…and it clears once that stops being true", not (tf.INCIDENTS / "budget
 tf.budget_short_incident({"D": 0.1, "H": 10, "B": 0.5})
 item = json.loads((tf.INCIDENTS / "budget-short-claude.json").read_text())
 check("budget-short says when the budget runs out", item["kind"] == "budget-short" and "runs out in 5 h" in item["detail"], item["detail"])
+# ---- the one-time reset the owner claims by hand -----------------------------------------------------------
+tf.BUDGET_EXTRA, tf.BUDGET_EXTRA_UNTIL = 1.0, datetime.fromtimestamp(now + 86400).isoformat()
+check("an unclaimed reset counts until its date", tf.budget_extra(now) == 1.0 and tf.budget_extra(now + 2 * 86400) == 0.0)
+
+
+def reading(used, at):
+    (w1 / "cache" / "quota-claude.json").write_text(json.dumps({"fetched_at": at, "payload": {
+        "seven_day": {"utilization": used, "resets_at": datetime.fromtimestamp(resets).astimezone().isoformat()}}}))
+
+
+t = time.time()
+tf.USAGE_HISTORY.write_text("".join(json.dumps({"at": t - 7200 + 1800 * i, "used": u, "resets": resets}) + "\n"
+                                    for i, u in enumerate((92.0, 93.0, 94.0))))
+reading(95.0, t - 60)
+out = tf.budget_pace(force=True)
+check("the step spends the reset as budget", abs(out["B"] - 1.05) < 1e-9 and out["extra"] == 1.0 and out["surplus"] > 0, str(out))
+check("the view says what is left and what is still to claim", "5% left + 100% reset to claim" in (tf.budget_line() or ""),
+      tf.budget_line())
+reset_item = tf.INCIDENTS / "budget-reset-claude.json"
+item = json.loads(reset_item.read_text()) if reset_item.exists() else {}
+check("nearly spent with the reset unclaimed: the owner is told to claim it",
+      item.get("kind") == "budget-reset" and "claim" in item.get("detail", ""), str(item))
+tf.note_claimed_reset({"used": 95.0, "resets": t - 100}, t, 1.0)
+check("a drop at the window's own reset time is not a claim", not tf.EXTRA_CLAIMED.exists())
+# the owner claims: weekly use falls before the window's reset time
+reading(1.0, t - 45)
+tf.record_usage_history()
+check("a drop before the window's reset time is the claim", tf.EXTRA_CLAIMED.exists() and tf.budget_extra(t) == 0.0)
+# move the claim back an hour, so the readings after it span the minimum the burn needs
+tf.USAGE_HISTORY.write_text("".join(json.dumps({"at": t - a, "used": u, "resets": resets}) + "\n"
+                                    for a, u in ((7000, 90.0), (5000, 95.0), (3700, 1.0))))
+reading(3.0, t - 30)
+out = tf.budget_pace(force=True)
+check("after the claim the burn is measured from the claim on", out["R"] is not None and abs(out["R"] - 0.02) < 2e-3, str(out.get("R")))
+check("…the reset is no longer counted, and the reminder clears",
+      out["extra"] == 0 and abs(out["B"] - 0.97) < 1e-9 and not reset_item.exists(), str(out))
+
 tf.manager_alive = lambda: False
 tf.FALLBACK_CAP.write_text(json.dumps({"at": 0}))
 check("a stopped fleet takes no step", tf.budget_pace(force=True).get("cap") is None)
