@@ -136,6 +136,7 @@ sys.path.insert(0, str(WORKTREE))
 try:
     from tauceti_worker.targets import load_targets, overlay_live, eligible_items, open_items  # noqa: E402
     from tauceti_worker.survey import target_marker_ids  # noqa: E402
+    from tauceti_worker.github import normalize_merged  # noqa: E402
 except Exception as exc:  # pragma: no cover - environment problem, say so plainly
     # Without settings, main() says "run init", which is the useful message.
     if SETTINGS_FILE.is_file() and sys.argv[1:2] not in (["init"], ["-h"], ["--help"], []):
@@ -1002,9 +1003,13 @@ class Progress:
             login = me()
             base = ["gh", "pr", "list", "--repo", TAUCETI, "--limit", "200", "--json"]
             op = subprocess.run(base + ["number,body,labels,createdAt,author", "--state", "open"], capture_output=True, text=True, timeout=60)
-            mp = subprocess.run(base + ["number,body,mergedAt,author", "--state", "merged"], capture_output=True, text=True, timeout=60)
+            # Bors merges are CLOSED to GitHub (see normalize_merged): list closed PRs by search, where
+            # `closed` covers merged ones too, and keep the merges of either kind.
+            mp = subprocess.run(base + ["number,body,mergedAt,closedAt,author,state,title", "--state", "closed",
+                                        "--search", "sort:updated-desc"], capture_output=True, text=True, timeout=60)
             open_prs = json.loads(op.stdout or "[]") if op.returncode == 0 else []
-            merged = json.loads(mp.stdout or "[]") if mp.returncode == 0 else []
+            merged = [p for p in map(normalize_merged, json.loads(mp.stdout or "[]") if mp.returncode == 0 else [])
+                      if p.get("state") == "MERGED"]
             if op.returncode != 0 or mp.returncode != 0:
                 d["error"] = (op.stderr or mp.stderr).strip().splitlines()[0][:80] if (op.stderr or mp.stderr) else "gh failed"
             inflight, done = set(), set()
@@ -1252,14 +1257,14 @@ def lookup_prs(numbers: list[int]) -> dict[int, str]:
             out[n] = f"#{n}  (gate refused the read: {(p.stderr or p.stdout).strip()[-80:]})"
             continue
         token = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else ""
-        q = subprocess.run(["gh", "pr", "view", str(n), "--repo", TAUCETI, "--json", "state,title,mergedAt,author"],
+        q = subprocess.run(["gh", "pr", "view", str(n), "--repo", TAUCETI, "--json", "state,title,mergedAt,closedAt,author"],
                            capture_output=True, text=True, timeout=60)
         subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "record", token, str(200 if q.returncode == 0 else 500)],
                        cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
         if q.returncode != 0:
             out[n] = f"#{n}  (gh failed: {q.stderr.strip()[-80:]})"
             continue
-        d = json.loads(q.stdout or "{}")
+        d = normalize_merged(json.loads(q.stdout or "{}"))
         when = (d.get("mergedAt") or "")[:10]
         out[n] = f"#{n}  {d.get('state', '?')}{' ' + when if when else ''}  {d.get('title', '')} ({(d.get('author') or {}).get('login', '?')})"
     return out
@@ -1272,11 +1277,13 @@ def _gated_pr_view(n: int, fields: str) -> dict | None:
     if p.returncode != 0:
         return None
     token = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else ""
-    q = subprocess.run(["gh", "pr", "view", str(n), "--repo", TAUCETI, "--json", fields],
+    want = fields.split(",")
+    want += [f for f, need in (("title", "state"), ("closedAt", "mergedAt")) if need in want and f not in want]
+    q = subprocess.run(["gh", "pr", "view", str(n), "--repo", TAUCETI, "--json", ",".join(want)],
                        capture_output=True, text=True, timeout=60)
     subprocess.run([PYTHON, "-m", "tauceti_worker", "gate", "record", token, str(200 if q.returncode == 0 else 500)],
                    cwd=WORKTREE, env=worker_env(), capture_output=True, text=True, timeout=60)
-    return json.loads(q.stdout or "{}") if q.returncode == 0 else None
+    return normalize_merged(json.loads(q.stdout or "{}")) if q.returncode == 0 else None
 
 
 def _verdicts() -> dict[int, dict]:
