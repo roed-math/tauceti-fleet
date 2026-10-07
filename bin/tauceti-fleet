@@ -692,13 +692,21 @@ def _login_pool_line() -> tuple[str, str] | None:
     return text, "red" if dead else "green"
 
 
+def _operator_dir(var: str, default: Path) -> Path:
+    """The operator's $CLAUDE_CONFIG_DIR or $CODEX_HOME, else `default`. Under a worker's environment
+    (the round-done hook publishes the view) the worker has repointed both at its own copy, whose
+    refresh token is blank, so there they say nothing about the operator's login."""
+    v = "" if os.environ.get("TAUCETI_DATA_HOME") else os.environ.get(var, "")
+    return Path(v) if v else default
+
+
 def _claude_operator_expiry() -> tuple[str, str]:
     """(text, style) for the operator's Claude credential; reads expiry only, never the tokens.
     macOS: the login Keychain item. Linux: <CLAUDE_CONFIG_DIR|~/.claude>/.credentials.json, which
     the worker's --auto-refresh rotates under a host flock."""
     if not IS_MAC:
         try:
-            path = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude")) / ".credentials.json"
+            path = _operator_dir("CLAUDE_CONFIG_DIR", HOME / ".claude") / ".credentials.json"
             got = _claude_file_expiry(path)
             if got is None:
                 return f"claude: no readable {path} — run `claude` and log in", "red"
@@ -736,7 +744,7 @@ def _claude_operator_expiry() -> tuple[str, str]:
 def _codex_operator_expiry() -> tuple[str, str]:
     try:
         import base64
-        path = Path(os.environ.get("CODEX_HOME", HOME / ".codex")) / "auth.json"
+        path = _operator_dir("CODEX_HOME", HOME / ".codex") / "auth.json"
         tok = json.loads(path.read_text())["tokens"]["access_token"].split(".")[1]
         tok += "=" * (-len(tok) % 4)
         exp = json.loads(base64.urlsafe_b64decode(tok))["exp"]
