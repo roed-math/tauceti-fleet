@@ -94,6 +94,10 @@ The live view shows a `needs you` badge and panel; `tauceti-fleet attention` pri
   the last 24 hours, closes included, though they need nothing from you.
 - **A review exchange hit its cap**, or a review errored three times without a verdict. The worker
   stops spending on that PR until you look.
+- **A fixer spent its budget on a PR** (`budget-spent`): its fix, fix-ci or rebase attempts at the
+  PR's head are used up, or three rounds at that head died before the agent started (bubble's
+  pre-agent Mathlib setup failed; such rounds are not charged to the fix budget). The worker stops
+  spending on that head. The item clears itself when the PR gets a new head or closes.
 - **A target-list item whose PR closed without a recorded verdict.** The curator cannot tell whether
   the work landed elsewhere, so it asks: mark it `[ ]` to re-author or `[x]` if done.
 - **A lookahead branch that did not work as planned** (`lookahead`): see
