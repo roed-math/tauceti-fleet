@@ -447,8 +447,6 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             **({"TAUCETI_FALLBACK_AUTO": "1", "TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_AUTO_MIN)}
                if FALLBACK_AUTO else {}),
             **LOOKAHEAD_ENV,
-            **({"TAUCETI_LOOKAHEAD_MAX_BRANCHES": str(LOOKAHEAD_MAX_BRANCHES_SETTING)}
-               if LOOKAHEAD_MAX_BRANCHES_SETTING is not None else {}),
             **provider_paces(),
             # Pilot mode interacts less on GitHub: no reactions, no automatic stuck-review issues.
             "TAUCETI_REACTIONS": "0" if a.pilot else "1",
@@ -2961,9 +2959,8 @@ BUDGET_EXTRA_UNTIL = str(setting("authoring", "budget_extra_until", "") or "")
 # Lookahead authoring (the worker's lookahead.py): an author with nothing to take on the target list
 # proves a blocked item against stubs of its in-flight supplier, on a branch of the account's fork,
 # before it would author outside the list; an author ports the branch once the supplier lands. Off
-# unless set; only the worker reads these (TAUCETI_LOOKAHEAD, TAUCETI_LOOKAHEAD_MAX_BRANCHES).
+# unless set; only the worker reads it (TAUCETI_LOOKAHEAD).
 LOOKAHEAD_SETTING = _setting_bool("authoring", "lookahead")
-LOOKAHEAD_MAX_BRANCHES_SETTING = _setting_int("authoring", "lookahead_max_branches")
 # true: sessions and ports. false: passive, holding an item whose branch awaits its port and sweeping
 # finished branches, for a fleet that rotates with lookahead fleets. Absent: none of it, no env at all.
 LOOKAHEAD_ENV = {"TAUCETI_LOOKAHEAD": "1" if LOOKAHEAD_SETTING else "0"} if setting("authoring", "lookahead") else {}
@@ -3228,8 +3225,6 @@ def cmd_lookahead(a: argparse.Namespace) -> int:
         fcntl.flock(lock, fcntl.LOCK_EX)
     env = periodic_env()
     env.update({"TAUCETI_LOOKAHEAD": "1", "TAUCETI_TARGET_ONLY": a.slug})
-    if LOOKAHEAD_MAX_BRANCHES_SETTING is not None:
-        env["TAUCETI_LOOKAHEAD_MAX_BRANCHES"] = str(LOOKAHEAD_MAX_BRANCHES_SETTING)
     if MAX_OPEN_PRS_SETTING:  # the authors' backpressure point; the periodic env does not carry it
         env["TAUCETI_MAX_OPEN_PRS"] = str(MAX_OPEN_PRS_SETTING)
     argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", "roadmap", "--worker-id", PERIODIC_WID,
@@ -3902,11 +3897,9 @@ reads_per_hour = 600
 # budget_extra = 0
 # budget_extra_until = "2026-10-22T00:00"
 # Before that, prove a blocked item ahead of its in-flight supplier, against stubs, on a branch
-# lookahead/<area>/<slug> of the account's fork, and port it once the supplier lands; at most
-# lookahead_max_branches such branches at once. true: on; false: passive (hold items whose branch
-# awaits its port, sweep finished branches); absent: none of it.
+# lookahead/<area>/<slug> of the account's fork, and port it once the supplier lands. true: on;
+# false: passive (hold items whose branch awaits its port, sweep finished branches); absent: none of it.
 # lookahead = false
-# lookahead_max_branches = 4
 
 [decide]
 # The stage that rules on declined rounds. `close = true` lets it close the account's own PRs that

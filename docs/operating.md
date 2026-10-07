@@ -111,9 +111,9 @@ or eligible, settled, and themselves unblocked (a stub never stands in for anoth
 the item against `sorry`'d stubs of those suppliers' pinned statements on the branch
 `lookahead/<area>/<slug>` of the account's TauCeti fork, writes the plan of pull requests into the
 branch's `LOOKAHEAD.md`, and pushes once. The branch is never opened: the push wrapper pushes nothing
-else in that round and the PR wrapper refuses. Only when no candidate can be claimed, or
-`authoring.lookahead_max_branches` branches are already live, does it author outside the list. The
-claim is `lookahead/<area>/<slug>`, separate from the item's author claim.
+else in that round and the PR wrapper refuses. Only when no candidate can be claimed does it author
+outside the list; the number of live branches is not capped. The claim is `lookahead/<area>/<slug>`,
+separate from the item's author claim.
 
 When the suppliers land, the item becomes eligible and an author ports the branch: it opens the
 plan's next split as a pull request, the stubs replaced by the landed declarations. One PR per round,
@@ -124,7 +124,8 @@ A complete branch that stubs nothing (everything the item uses has landed, thoug
 not complete) is ported at once, without waiting for that need.
 
 All of this state is on GitHub, so it does not matter which fleet is active. The curator's round
-deletes the branch of an item that is done, and lists stale branches (built on a `main` more than a
+deletes the branch of an item that is done, and a branch whose every planned split has merged
+(spent: it has nothing left to port, even if its item still lacks something), and lists stale branches (built on a `main` more than a
 week old) and branches whose item is not on the list; it never deletes those. With
 `authoring.lookahead = false` a fleet is passive: it proves and ports nothing, but sweeps branches,
 and leaves an eligible item with a fresh branch for six hours (`TAUCETI_LOOKAHEAD_HOLD_HOURS`)
