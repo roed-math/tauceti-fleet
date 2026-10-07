@@ -3506,7 +3506,11 @@ def cmd_logins(a: argparse.Namespace) -> int:
                                    fixers=a.max_fixers, reviewers=a.max_reviewers, sandbox=setting("up", "sandbox", "bubble"),
                                    pace="", pilot=pilot, mutations_per_hour=40, reads_per_hour=600,
                                    claude_model=DEFAULT_CLAUDE_MODEL, claude_effort=DEFAULT_CLAUDE_EFFORT, codex_model="", codex_effort="")
-    specs = fleet_specs(shape)
+    now = {s_["id"]: s_ for s_ in fleet_specs(shape)}
+    # The reconcile adds fixers and reviewers as the backlog grows, up to these maxima, so the count
+    # uses them: counted from today's config, the extra workers found no chain when they came.
+    specs = fleet_specs(argparse.Namespace(**{**vars(shape), "fixers": max(shape.fixers, a.max_fixers),
+                                              "reviewers": max(shape.reviewers, a.max_reviewers)}))
     slots, leases = login_slots(), read_leases()
     holder = {slot: wid for wid, slot in leases.items()}
     print(f"login chains under {LOGINS}:")
@@ -3527,7 +3531,9 @@ def cmd_logins(a: argparse.Namespace) -> int:
         if s_["agent"] not in ("claude", "auto"):
             continue
         wid = s_["id"]
-        if not s_["enabled"]:
+        if wid not in now:
+            state = "not running now (the reconcile adds it as the backlog grows)"
+        elif not now[wid]["enabled"]:
             state = "disabled (no chain held)"
         elif wid in leases:
             state = f"chain {leases[wid]}"
@@ -3535,14 +3541,15 @@ def cmd_logins(a: argparse.Namespace) -> int:
             state = "SHARED ~/.claude — a renewal by any other worker revokes this one's in-flight token"
         print(f"  {wid:9s} {s_['agent']:6s} {state}")
     # How many chains the fleet can use at once: every Claude-capable worker the shape defines (Claude
-    # and `auto` authors, every fixer and reviewer, the progress worker), whether or not it runs now,
-    # plus the periodic rounds. Counted from the specs themselves: a sum of shape settings left out
+    # and `auto` authors, the most fixers and reviewers, the progress worker), whether or not it runs
+    # now, plus the periodic rounds. Counted from the specs themselves: a sum of shape settings left out
     # the `auto` authors, which run on Claude whenever Codex is spent, and the progress worker.
     capable = [s_ for s_ in specs if s_["agent"] in ("claude", "auto")]
     need = len(capable) + 1
     have = len(slots)
     print(f"\n{have} chain(s) for up to {need} Claude-capable workers at once "
-          f"({len(capable)} workers that can run Claude, and the periodic rounds).")
+          f"({len(capable)} workers that can run Claude, with {max(shape.fixers, a.max_fixers)} fixers and "
+          f"{max(shape.reviewers, a.max_reviewers)} reviewers at most, and the periodic rounds).")
     if have < need:
         print("Create the missing ones (each opens a browser sign-in; the same Claude account is fine, any order):")
         taken = {d.name for d in slots}
