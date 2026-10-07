@@ -231,8 +231,9 @@ tauceti-fleet logins
 Run each printed `CLAUDE_CONFIG_DIR=… claude auth login` line and sign in with the subscription the
 workers spend. Each prints a URL to open in a browser and asks for the code it shows, so this needs
 you at a terminal on the host (an `ssh` session is fine). `logins` asks for one chain per worker that
-can run Claude, and one for the periodic rounds: 11 for the full shape with a progress worker, fewer
-in pilot mode. Run it again after changing the shape, since a bigger fleet needs more. The pool is
+can run Claude, counting `up.max_fixers` fixers and `up.max_reviewers` reviewers, and one for the
+periodic rounds: 11 with the default settings and a progress worker, fewer in pilot mode. Run it again
+after changing the shape, since a bigger fleet needs more. The pool is
 described in [operating.md](operating.md#the-claude-login-pool).
 
 Before the fleet, check the pieces offline, then run one supervised round:

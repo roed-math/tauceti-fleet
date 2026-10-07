@@ -525,10 +525,10 @@ def authors_idle(statuses: dict[str, dict]) -> bool:
     return bool(authors) and all(idle(wid, st) for wid, st in authors)
 
 
-def reviewers_for(active_authors_and_fixers: int, max_reviewers: int = 2) -> int:
-    """Two reviewers once two or more authors and fixers are active, else one. Review capacity is
+def reviewers_for(active_authors_and_fixers: int, max_reviewers: int) -> int:
+    """max_reviewers once two or more authors and fixers are active, else one. Review capacity is
     reciprocity toward the project, not our throughput, so it tracks the fleet size, not the backlog."""
-    return max(1, min(max_reviewers, 2 if active_authors_and_fixers >= 2 else 1))
+    return max(1, max_reviewers if active_authors_and_fixers >= 2 else 1)
 
 
 def toml_str(v: str) -> str:
@@ -2979,9 +2979,13 @@ LOOKAHEAD_ENV = {"TAUCETI_LOOKAHEAD": "1" if LOOKAHEAD_SETTING else "0"} if sett
 FULL_FIX_BACKLOG = 8
 # The status labels a fix worker has work on: review findings (fix) and red builds (fix-ci).
 FIX_LABELS = {"awaiting-author", "ci-failed"}
+# The most fixers and reviewers the reconcile runs. A flag overrides them for one run only: the
+# round-done hook's reconcile and `logins` read the settings.
+MAX_FIXERS = _setting_int("up", "max_fixers") or 3
+MAX_REVIEWERS = _setting_int("up", "max_reviewers") or 2
 
 
-def fixers_for(mine_open: int, backlog: int, max_fixers: int = 3) -> int:
+def fixers_for(mine_open: int, backlog: int, max_fixers: int) -> int:
     """How many fix workers the backlog (my PRs in FIX_LABELS) deserves. While mine_open >=
     MAX_OPEN_PRS_BACKPRESSURE authoring cannot happen (the worker's backpressure rule), so every worker
     slot should fix: max_fixers; the same once the backlog reaches FULL_FIX_BACKLOG. Below that: 6 or
@@ -3058,7 +3062,7 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
             want_fix = max(want_fix, min(a.max_fixers, backlog))
         a.fixers = want_fix
         active = want_fix + ((1 if idle else a.claude + a.codex) if authors_on else 0)
-        a.reviewers = reviewers_for(active, getattr(a, "max_reviewers", 2))
+        a.reviewers = reviewers_for(active, getattr(a, "max_reviewers", MAX_REVIEWERS))
         dry = bool(getattr(a, "dry_run", False))
         specs = lease_logins(fleet_specs(a), persist=not dry)
         changed, switched, deferred = write_config(specs, worker_status(), os.environ.get("TAUCETI_ROUND_WID"), write=not dry)
@@ -3887,6 +3891,8 @@ sandbox = "bubble"
 # pace = "0:100,100:100"
 # claude = 2
 # codex = 2
+# max_fixers = 3
+# max_reviewers = 2
 
 [gate]
 # Fleet-wide rolling-hour budgets for everything done as github_login. Two fleets acting as the
@@ -3987,13 +3993,13 @@ def main() -> int:
     up.add_argument("--claude", type=int, default=_setting_int("up", "claude"), help="Claude authoring workers (default: up.claude, else 2; 1 under --pilot)")
     up.add_argument("--codex", type=int, default=_setting_int("up", "codex"), help="auto (Codex first, then Claude) authoring workers (default: up.codex, else 2; 0 under --pilot)")
     up.add_argument("--fixers", type=int, default=2, help="initial fix/fix-ci workers, alternating Claude and auto (Codex, else Claude); reconcile sets the count")
-    up.add_argument("--reviewers", type=int, default=1, help="initial review workers; reconcile sets 1 or 2 by fleet size")
-    up.add_argument("--max-reviewers", type=int, default=2)
+    up.add_argument("--reviewers", type=int, default=1, help="initial review workers; reconcile sets 1 or --max-reviewers by fleet size")
+    up.add_argument("--max-reviewers", type=int, default=MAX_REVIEWERS, help="the most review workers (default: up.max_reviewers, else 2)")
     up.add_argument("--claude-model", default=DEFAULT_CLAUDE_MODEL)
     up.add_argument("--claude-effort", default=DEFAULT_CLAUDE_EFFORT)
     up.add_argument("--codex-model", default="")
     up.add_argument("--codex-effort", default="")
-    up.add_argument("--max-fixers", type=int, default=3, help=f"fixers while authoring is impossible (mine_open >= {MAX_OPEN_PRS_BACKPRESSURE}); fewer as the backlog shrinks")
+    up.add_argument("--max-fixers", type=int, default=MAX_FIXERS, help=f"fixers while authoring is impossible (mine_open >= {MAX_OPEN_PRS_BACKPRESSURE}); fewer as the backlog shrinks (default: up.max_fixers, else 3)")
     up.add_argument("--no-watch", action="store_true", help="start and return instead of opening the live view")
     up.add_argument("--dry-run", action="store_true", help="write and validate the config, pre-seed checkouts, but do not start")
     up.set_defaults(fn=cmd_up)
@@ -4039,13 +4045,13 @@ def main() -> int:
     r.set_defaults(fn=cmd_round)
     rc_ = sub.add_parser("reconcile", help="shape the fleet to the backlog (authors on/off, fixer count); runs after every round via the hook")
     for _p in (rc_,):
-        _p.add_argument("--max-fixers", type=int, default=3, help=f"fixers while authoring is impossible (mine_open >= {MAX_OPEN_PRS_BACKPRESSURE})")
-        _p.add_argument("--max-reviewers", type=int, default=2)
+        _p.add_argument("--max-fixers", type=int, default=MAX_FIXERS, help=f"fixers while authoring is impossible (mine_open >= {MAX_OPEN_PRS_BACKPRESSURE}) (default: up.max_fixers, else 3)")
+        _p.add_argument("--max-reviewers", type=int, default=MAX_REVIEWERS, help="the most review workers (default: up.max_reviewers, else 2)")
         _p.add_argument("--quiet", action="store_true", help="print only when the shape changes (the hook uses this)")
         _p.add_argument("--dry-run", action="store_true")
         _p.set_defaults(fn=cmd_reconcile)
     sc = sub.add_parser("scale", help="alias of reconcile")
-    sc.add_argument("--max-fixers", type=int, default=3)
+    sc.add_argument("--max-fixers", type=int, default=MAX_FIXERS)
     sc.add_argument("--mutations-per-hour", type=int, default=int(setting("gate", "mutations_per_hour", "40", "TAUCETI_GATE_MUTATIONS_PER_HOUR")))
     sc.add_argument("--reads-per-hour", type=int, default=int(setting("gate", "reads_per_hour", "600", "TAUCETI_GATE_READS_PER_HOUR")))
     sc.add_argument("--claude-model", default=DEFAULT_CLAUDE_MODEL)
@@ -4079,8 +4085,8 @@ def main() -> int:
     tg.add_argument("--apply", action="store_true", help="mark merged and recorded-subsumed items done in the target file")
     tg.set_defaults(fn=cmd_targets)
     lg = sub.add_parser("logins", help="the Claude login pool: chains, leases, and the sign-ins still missing")
-    lg.add_argument("--max-fixers", type=int, default=3)
-    lg.add_argument("--max-reviewers", type=int, default=2)
+    lg.add_argument("--max-fixers", type=int, default=MAX_FIXERS, help="count chains for this many fixers (default: up.max_fixers, else 3)")
+    lg.add_argument("--max-reviewers", type=int, default=MAX_REVIEWERS, help="count chains for this many reviewers (default: up.max_reviewers, else 2)")
     lg.set_defaults(fn=cmd_logins)
     wp = sub.add_parser("warm-pool", help="fill the Mathlib cache pool for main's revision and every open PR's (once per Mathlib bump)")
     wp.add_argument("--list-only", action="store_true", help="only list the revisions; do not download")
