@@ -98,6 +98,7 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `schedule.active` | weekly active slots in host-local time, e.g. `"Thu 07:00 -> Sat 15:00"` (comma-separated for several); `tauceti-fleet schedule --install` adds a systemd user timer that runs `up` when a slot opens and `down --drain` when it closes, acting only at the boundaries | always on |
 | `up.claude`, `up.codex` | Claude authors, and `auto` authors (Codex first, then Claude) | 2 and 2; 1 and 0 in pilot mode |
 | `up.max_fixers`, `up.max_reviewers` | the most fixers and reviewers the reconcile runs as the backlog grows; the reconcile applies a change, and `logins` asks for a chain for each | 3 and 2 |
+| `up.fixer_backlog_start`, `up.fixer_backlog_step` | the fix backlog that brings a second fixer, and how many more PRs bring each one after it, up to `up.max_fixers`; the reconcile applies a change | 6 and 2 |
 | `gate.mutations_per_hour`, `gate.reads_per_hour` | fleet-wide GitHub budgets, rolling hour; the reconcile after each round applies a change | 40 and 600 |
 | `authoring.max_open_prs` | authors stop while the account has this many open PRs in scope; the reconcile applies a change | the worker's 8 |
 | `authoring.fallback_max_open` | with nothing on the target list, authors work outside it only while at most this many PRs are open; the reconcile applies a change. `"auto"` paces it by the weekly Claude budget (docs/operating.md) | the worker's 6 |

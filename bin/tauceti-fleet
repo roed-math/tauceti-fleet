@@ -2974,30 +2974,30 @@ LOOKAHEAD_SETTING = _setting_bool("authoring", "lookahead")
 LOOKAHEAD_ENV = {"TAUCETI_LOOKAHEAD": "1" if LOOKAHEAD_SETTING else "0"} if setting("authoring", "lookahead") else {}
 
 
-# A backlog this large gets every fixer even while authors run. It was the old backpressure point, so
-# raising authoring.max_open_prs does not also take away the third fixer that point used to bring.
-FULL_FIX_BACKLOG = 8
 # The status labels a fix worker has work on: review findings (fix) and red builds (fix-ci).
 FIX_LABELS = {"awaiting-author", "ci-failed"}
 # The most fixers and reviewers the reconcile runs. A flag overrides them for one run only: the
 # round-done hook's reconcile and `logins` read the settings.
 MAX_FIXERS = _setting_int("up", "max_fixers") or 3
 MAX_REVIEWERS = _setting_int("up", "max_reviewers") or 2
+# The fix backlog that brings a second fixer, and how many more PRs bring each one after it.
+FIXER_BACKLOG_START = _setting_int("up", "fixer_backlog_start") or 6
+FIXER_BACKLOG_STEP = max(1, _setting_int("up", "fixer_backlog_step") or 2)
 
 
 def fixers_for(mine_open: int, backlog: int, max_fixers: int) -> int:
     """How many fix workers the backlog (my PRs in FIX_LABELS) deserves. While mine_open >=
     MAX_OPEN_PRS_BACKPRESSURE authoring cannot happen (the worker's backpressure rule), so every worker
-    slot should fix: max_fixers; the same once the backlog reaches FULL_FIX_BACKLOG. Below that: 6 or
-    more -> 2, fewer -> 1. Never more fixers than there are PRs to fix (an idle fixer still surveys
-    each round), never fewer than 1. Fixers share the fleet-wide mutation budget, so the count changes
-    who spends it, not how much GitHub traffic there is."""
-    if mine_open >= MAX_OPEN_PRS_BACKPRESSURE or backlog >= FULL_FIX_BACKLOG:
+    slot should fix: max_fixers. Otherwise one, a second at a backlog of FIXER_BACKLOG_START, and one
+    more every FIXER_BACKLOG_STEP PRs after that, up to max_fixers. Never more fixers than there are PRs
+    to fix (an idle fixer still surveys each round), never fewer than 1. Fixers share the fleet-wide
+    mutation budget, so the count changes who spends it, not how much GitHub traffic there is."""
+    if mine_open >= MAX_OPEN_PRS_BACKPRESSURE:
         want = max_fixers
-    elif backlog >= 6:
-        want = 2
-    else:
+    elif backlog < FIXER_BACKLOG_START:
         want = 1
+    else:
+        want = 2 + (backlog - FIXER_BACKLOG_START) // FIXER_BACKLOG_STEP
     return max(1, min(want, max_fixers, backlog))
 
 
@@ -3034,8 +3034,8 @@ def fleet_backlog(max_age_s: int = 7200) -> tuple[int | None, int | None, str]:
 
 def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
     """Set the fleet's shape from the backlog: authors enabled only when authoring can happen
-    (mine_open < MAX_OPEN_PRS_BACKPRESSURE), fixers by fixers_for (3 while authoring is impossible,
-    else by backlog). Under a lock, idempotent: the config is rewritten and applied only when the
+    (mine_open < MAX_OPEN_PRS_BACKPRESSURE), fixers by fixers_for (max_fixers while authoring is
+    impossible, else by backlog). Under a lock, idempotent: the config is rewritten and applied only when the
     shape changed. Counts come
     from the workers' own status files; a GitHub read happens only when those are stale."""
     import fcntl
@@ -3893,6 +3893,8 @@ sandbox = "bubble"
 # codex = 2
 # max_fixers = 3
 # max_reviewers = 2
+# fixer_backlog_start = 6
+# fixer_backlog_step = 2
 
 [gate]
 # Fleet-wide rolling-hour budgets for everything done as github_login. Two fleets acting as the

@@ -16,9 +16,10 @@ reshapes the fleet:
 - **Fixers** (`<name>-fix*`) run fix, fix-ci and rebase, taking the PRs that serve the target list
   first: a PR whose marker names an item of the list, or one the list marks `in flight`. Only when
   none of those needs work do they turn to the account's other PRs. They are sized by the fix backlog: the
-  account's PRs labelled `awaiting-author` or `ci-failed`. There are `up.max_fixers` (default 3) while
-  authoring is blocked or the backlog is 8 or more, otherwise 2 with a backlog of 6 or 7 and 1 below
-  that, never more than `up.max_fixers` nor than there are PRs to fix. Odd-numbered fixers are pinned to Claude; even-numbered ones run `auto`.
+  account's PRs labelled `awaiting-author` or `ci-failed`. There is 1 below a backlog of
+  `up.fixer_backlog_start` (default 6), 2 from there, and one more every `up.fixer_backlog_step`
+  (default 2) PRs after that, up to `up.max_fixers` (default 3); while authoring is blocked there are
+  `up.max_fixers`. Never more than there are PRs to fix. Odd-numbered fixers are pinned to Claude; even-numbered ones run `auto`.
 - **Reviewers** (`<name>-rev*`) run `auto`: `up.max_reviewers` (default 2) once two or more authors
   and fixers are active, else 1.
   Reviewing other people's PRs is what the fleet owes the project for the reviews its own PRs get.
