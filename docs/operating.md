@@ -105,6 +105,10 @@ The live view shows a `needs you` badge and panel; `tauceti-fleet attention` pri
 - **A target list that diverged from its repository** (`targets-diverged`): a curation committed
   here conflicts with one pushed elsewhere. See
   [target-lists.md](target-lists.md#sharing-a-list).
+- **A slot that did not start** (`schedule-start`): the schedule's `up` failed, with the reason it
+  gave. The timer retries every minute while the slot lasts, so fixing the cause is enough. The
+  item stays after the slot ends, so a lost slot is seen, and clears at the next successful `up`
+  or with `--ack schedule`.
 
 A worker in a long backoff can be restarted between rounds with `tauceti-fleet restart ID`, or
 `--when-idle` to queue it for the end of the current round.
@@ -177,7 +181,8 @@ Each fleet can publish its live view as `<fleet.status_dir>/<name>.json`, after 
 every schedule tick (each minute), with `tauceti-fleet publish` to force one. A user with no fleet of
 its own, such as the shared `agents` account, then runs `tauceti-fleet watch` and sees all of them:
 
-- a strip with one line per fleet: running, draining, or off, and when its slot starts or ends;
+- a strip with one line per fleet: running, draining, or off, and when its slot starts or ends, in
+  red when a slot's start failed;
 - one needs-you panel for every fleet, each item tagged with its fleet;
 - the full view of the fleet that is running (else the one draining, else the one in its slot),
   which follows the rotation by itself.

@@ -89,8 +89,9 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `fleet.github_login` | the GitHub account every worker must act as; any other identity halts the worker | required |
 | `fleet.claim_repo` | the project-wide claim namespace; every fleet must agree on it | `TauCetiProject/tauceti-claims` |
 | `fleet.status_dir` | a directory the fleet users share, where each fleet publishes its view for `watch --fleets` (docs/operating.md) | unset (no publishing) |
+| `fleet.shared_cache` | a directory the fleets on one account share for their PR scoreboard reads, so a fleet starting its slot reads on from the previous one's (docs/setup.md) | unset (each fleet's own gate store) |
 | `paths.worker` | a TauCetiWorker checkout (see Requirements) | `~/TauCetiWorker-v2` |
-| `paths.roadmap` | a TauCetiRoadmap checkout, to check the list's areas are real roadmaps | `~/TauCetiRoadmap` |
+| `paths.roadmap` | a TauCetiRoadmap checkout, to check the list's areas are real roadmaps; `up` fast-forwards it when it is a clean `main` | `~/TauCetiRoadmap` |
 | `up.pilot` | start in pilot mode | `init` writes `true` |
 | `up.sandbox` | `bubble` (egress-denied containers) or `host` | `init` writes `bubble` |
 | `up.pace` | the worker's pacing curve, `time%:budget%` points; the reconcile applies a change | the worker's own curve |

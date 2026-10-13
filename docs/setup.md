@@ -344,6 +344,23 @@ since it read the list; [target-lists.md](target-lists.md#sharing-a-list) has th
 Watch the first rounds of the second fleet: `tauceti-fleet gate status` in each, and `incus list`
 to see both fleets' containers by name.
 
+### Sharing the read cache
+
+Fleets acting as one account can also share what they have read. Each survey reads the comments of
+every open PR it has not seen at its current `updatedAt` within the last 3 hours, so a fleet whose
+slot opens after days off rereads them all at once, about 900 reads in 10 minutes for 320 PRs.
+Pointed at one directory, the incoming fleet reads on from the outgoing one's cache instead:
+
+```toml
+[fleet]
+shared_cache = "/home/shared/fleet/cache"
+```
+
+The directory goes beside the shared target list, in the group directory made above. `up` creates
+`review_state/` inside it, group-writable and setgid, and refuses to start when the other fleets
+could not replace what this one writes there. Run each fleet's `up` (or `reconcile`) once after
+setting it, so the workers get it.
+
 ## macOS
 
 The tool runs on macOS too, with `up.sandbox = "host"` (bubble needs Incus). Claude credentials live

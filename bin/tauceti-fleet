@@ -54,6 +54,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -119,6 +120,8 @@ EXPECT_LOGIN = setting("fleet", "github_login", env="TAUCETI_EXPECT_LOGIN")
 CLAIM_REPO = setting("fleet", "claim_repo", "TauCetiProject/tauceti-claims", "CLAIM_REPO")
 WORKTREE = _expand(setting("paths", "worker", "~/TauCetiWorker-v2", "TAUCETI_FLEET_WORKER"))
 ROADMAP_CHECKOUT = _expand(setting("paths", "roadmap", "~/TauCetiRoadmap", "TAUCETI_FLEET_ROADMAP"))
+_SHARED_CACHE_RAW = setting("fleet", "shared_cache", "", "TAUCETI_FLEET_SHARED_CACHE")
+SHARED_CACHE = _expand(_SHARED_CACHE_RAW) if _SHARED_CACHE_RAW else None
 # The Claude model and effort every Claude round uses unless `up --claude-model/--claude-effort` says
 # otherwise. Once written into workers.toml, reconcile keeps that choice.
 DEFAULT_CLAUDE_MODEL = setting("models", "claude", "claude-opus-5-5")
@@ -162,6 +165,8 @@ def worker_env() -> dict[str, str]:
     env["TAUCETI_GATE_DIR"] = str(GATE_DIR)
     env["TAUCETI_GATE_REQUIRED"] = "1"
     env["TAUCETI_EXPECT_LOGIN"] = EXPECT_LOGIN
+    if SHARED_CACHE:
+        env["TAUCETI_SHARED_READ_CACHE"] = str(SHARED_CACHE)
     # The wrapper's own gate calls (status, reconcile's backlog read, `attention --lookup`) share the
     # workers' budgets, so they must use the workers' NUMBERS: read them from the fleet config the
     # wrapper wrote (a hard-coded 600 here once made `gate status` print
@@ -441,6 +446,8 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             "TAUCETI_GATE_REQUIRED": "1",
             "TAUCETI_GATE_MUTATIONS_PER_HOUR": str(a.mutations_per_hour),
             "TAUCETI_GATE_READS_PER_HOUR": str(a.reads_per_hour),
+            # Scoreboard sidecars shared with the account's other fleets, so a slot starts warm.
+            **({"TAUCETI_SHARED_READ_CACHE": str(SHARED_CACHE)} if SHARED_CACHE else {}),
             # Authoring backpressure, only when fleet.toml overrides the worker's default.
             **({"TAUCETI_MAX_OPEN_PRS": str(MAX_OPEN_PRS_SETTING)} if MAX_OPEN_PRS_SETTING else {}),
             **({"TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_MAX_OPEN_SETTING)} if FALLBACK_MAX_OPEN_SETTING else {}),
@@ -1798,6 +1805,53 @@ def targets_problem() -> str:
     return ""
 
 
+def shared_cache_problem() -> str:
+    """Why this fleet could not share `fleet.shared_cache`, or "". Each fleet replaces and deletes sidecars
+    another fleet wrote, so `<shared_cache>/review_state` must be writable by every fleet user through
+    their group (setgid, so new files keep it) and must not be sticky. Creates it when missing."""
+    if SHARED_CACHE is None:
+        return ""
+    d = SHARED_CACHE / "review_state"
+    try:
+        for p in (SHARED_CACHE, d):
+            if not p.is_dir():
+                p.mkdir()
+                os.chmod(p, 0o2775)  # mkdir's mode is cut by the umask
+    except OSError as e:
+        return f"cannot create {d} (fleet.shared_cache): {e}"
+    mode = d.stat().st_mode
+    if not os.access(d, os.W_OK | os.X_OK):
+        return f"{d} (fleet.shared_cache) is not writable by this user: it needs the fleet users' group, with group write"
+    if not mode & stat.S_IWGRP or not mode & stat.S_ISGID:
+        return f"the other fleets could not replace what this one writes in {d}: chmod 2775 {d} (as its owner)"
+    if mode & stat.S_ISVTX:
+        return f"{d} is sticky, so a fleet could not replace another fleet's files: chmod -t {d} (as its owner)"
+    return ""
+
+
+def refresh_roadmap_checkout() -> str | None:
+    """Fast-forward the TauCetiRoadmap checkout when it is a clean `main`, so a roadmap merged since the
+    last `up` is there for the area check below and for the agents. Nothing else updates it: claudeW's
+    checkout, left at 10-01, failed that check and kept the fleet down for its whole 2026-10-10 slot.
+    At most once per 10 minutes, since the schedule tick retries a failed `up` every minute. Returns
+    what it did, or None."""
+    git = ["git", "-C", str(ROADMAP_CHECKOUT)]
+    fetched = ROADMAP_CHECKOUT / ".git" / "FETCH_HEAD"
+    if not (ROADMAP_CHECKOUT / ".git").is_dir() or (fetched.is_file() and time.time() - fetched.stat().st_mtime < 600):
+        return None
+    branch = subprocess.run(git + ["rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip()
+    if branch != "main":
+        return f"roadmap checkout {ROADMAP_CHECKOUT} is on {branch or '?'}, not main: not updated"
+    if subprocess.run(git + ["status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True).stdout.strip():
+        return f"roadmap checkout {ROADMAP_CHECKOUT} has local changes: not updated"
+    before = subprocess.run(git + ["rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+    p = subprocess.run(git + ["pull", "-q", "--ff-only", "origin", "main"], capture_output=True, text=True, timeout=180)
+    if p.returncode != 0:
+        return f"roadmap checkout {ROADMAP_CHECKOUT}: pull failed: {' '.join((p.stderr or p.stdout).split())[:160]}"
+    after = subprocess.run(git + ["rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+    return f"roadmap checkout {ROADMAP_CHECKOUT}: {before} → {after}" if after != before else None
+
+
 def _roadmap_change(action: str, pr: int, *extra: str) -> int:
     """`tauceti roadmap-change ACTION PR` in the foreground, as the periodic worker (its login chain,
     the gate), holding the periodic lock so no periodic round renews that chain meanwhile."""
@@ -2109,6 +2163,8 @@ def schedule_info() -> dict:
     spec = setting("schedule", "active")
     out: dict = {"spec": spec, "draining": draining(),
                  "last_tick": SCHEDULE_STATE.read_text().strip() if SCHEDULE_STATE.is_file() else ""}
+    if START_FAILED.is_file():
+        out["start_failed_since"] = read_json(START_FAILED).get("first_at") or "?"
     if spec:
         try:
             slots = parse_schedule(spec)
@@ -2240,7 +2296,8 @@ def view_data(progress: Progress) -> dict:
     if halts:
         row(Text("halted", style="red"), Text(", ".join(h.parent.name for h in halts) + "  (tauceti-fleet clear-halt)", style="red"))
     items = attention_items()
-    needs = [[attention_line(it, 140), "bold red" if it.get("close_hint") else "yellow"] for it in items]
+    needs = [[attention_line(it, 140), "bold red" if it.get("close_hint") or it.get("kind") == "schedule-start" else "yellow"]
+             for it in items]
     hint = "tauceti-fleet attention for the full text; --ack <PR> once handled"
     if any(it.get("decision") == "roadmap" for it in items):
         hint += "; --file-roadmap <PR> to file a drafted roadmap change"
@@ -2681,6 +2738,11 @@ def _fleet_state(s: dict) -> tuple[str, str]:
     nxt = sch.get("next_change_at")
     when = f"{datetime.fromtimestamp(nxt):%a %H:%M}" if isinstance(nxt, (int, float)) else "?"
     running = s.get("manager_up") and not s.get("draining")
+    if (since := sch.get("start_failed_since")) and not running:
+        since = f"{datetime.fromisoformat(since.replace('Z', '+00:00')).astimezone():%a %H:%M}" if since != "?" else since
+        if sch.get("active_now"):
+            return f"START FAILED at {since}, retrying each minute (slot ends {when})", "bold red"
+        return f"off; its last slot never started (failed {since}); next slot {when}", "bold red"
     if running:
         return (f"RUNNING, slot ends {when}" if sch.get("active_now") else f"RUNNING outside its slot (next slot {when})"), "bold green"
     if s.get("manager_up"):
@@ -2835,6 +2897,8 @@ def cmd_up(a: argparse.Namespace) -> int:
         die(f"target file not found: {TARGETS}")
     if problem := targets_problem():
         die(problem)
+    if problem := shared_cache_problem():
+        die(problem)
     if a.pilot:
         # The pilot's shape: one Claude author and no Codex author unless the owner says otherwise
         # on the command line; reconcile then sets fixers and reviewers from the backlog.
@@ -2857,6 +2921,8 @@ def cmd_up(a: argparse.Namespace) -> int:
         die("a worker is halted (" + ", ".join(p.parent.name for p in halted) + "); inspect and clear with "
             "`tauceti-fleet clear-halt` before starting anything")
     t = load_targets(TARGETS)
+    if not a.dry_run and (note := refresh_roadmap_checkout()):
+        print(note)
     roadmap_root = ROADMAP_CHECKOUT / "TauCetiRoadmap"
     if not roadmap_root.is_dir():
         die(f"no TauCetiRoadmap checkout at {ROADMAP_CHECKOUT} to check the target areas against (paths.roadmap in fleet.toml)")
@@ -2904,6 +2970,7 @@ def cmd_up(a: argparse.Namespace) -> int:
     r = tauceti("workers", "--config", str(CONFIG), "apply")
     if r.returncode != 0:
         die("`tauceti workers apply` failed")
+    START_FAILED.unlink(missing_ok=True)
     print(f"logs: {STATE / 'logs'}/<id>/work-*.log   (tauceti-fleet logs ID -f to follow one)")
     if a.no_watch:
         return 0
@@ -3678,6 +3745,9 @@ def drain_step(quiet: bool) -> int:
 
 
 SCHEDULE_STATE = FLEET_HOME / "schedule.state"
+# A slot whose `up` failed: an attention item until an `up` succeeds or the owner acknowledges it
+# (`attention --ack schedule`). The tick retries every minute, so one record holds the first failure.
+START_FAILED = INCIDENTS / "schedule-start.json"
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 SCHEDULE_UNIT = "tauceti-fleet-schedule"
 
@@ -3755,17 +3825,44 @@ def cmd_schedule(a: argparse.Namespace) -> int:
         # outlives the tick.
         argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
                 f"--unit={SCHEDULE_UNIT}-{NAME}-up-{now:%Y%m%d-%H%M%S}", *argv]
+    err = ""
     if want == "inactive" and not CONFIG.is_file():
         rc = 0  # never started: nothing to drain
     else:
-        rc = subprocess.run(argv, env=worker_env()).returncode
+        # stderr to a file, not a pipe: a daemon `up` starts could inherit a pipe and hold the tick open.
+        import tempfile
+        with tempfile.TemporaryFile("w+") as ef:
+            rc = subprocess.run(argv, env=worker_env(), stderr=ef).returncode
+            ef.seek(0)
+            err = ef.read()
+        sys.stderr.write(err)
     what = " ".join(argv[argv.index("up") if "up" in argv else argv.index("down"):])
     note = f"schedule: {want} ({now:%a %H:%M}) → {what if CONFIG.is_file() or want == 'active' else 'nothing to drain'} (rc={rc})"
     _watchdog_note(note)
     print(note)
+    if want == "active" and rc != 0:
+        start_failed_incident(rc, err)
     if rc == 0:
         SCHEDULE_STATE.write_text(f"{want} {now:%Y-%m-%d %H:%M}\n")
     return rc
+
+
+def start_failed_incident(rc: int, err: str) -> None:
+    """Put the slot's failed `up` on the attention list, with the reason it gave. Without it a failed
+    start shows only as a stopped fleet (claudeW, 2026-10-10: 56 h of `rc=1` ticks, seen two days later)."""
+    lines = [ln for ln in err.splitlines() if ln.strip()]
+    why = next((ln for ln in reversed(lines) if ln.startswith(f"{PROG}:")), lines[-1] if lines else f"exit status {rc}")
+    prev = read_json(START_FAILED) if START_FAILED.is_file() else {}
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    rec = {"kind": "schedule-start", "key": "schedule", "worker": NAME, "first_at": prev.get("first_at") or now,
+           "last_at": now, "tries": int(prev.get("tries") or 0) + 1,
+           "detail": f"the slot's `up` has failed since {(prev.get('first_at') or now)[:16]}Z, retried every minute; "
+                     f"the fleet is not running: {why.removeprefix(PROG + ': ')}"}
+    try:
+        INCIDENTS.mkdir(parents=True, exist_ok=True)
+        START_FAILED.write_text(json.dumps(rec, indent=1) + "\n")
+    except OSError:
+        pass
 
 
 def _schedule_unit(install: bool) -> int:

@@ -36,6 +36,12 @@ it renews the wrong file and its copied token expires. Its round logs repeat "ke
 first copied from …". `run_periodic` resets such a pin before each round; on an older wrapper,
 delete that file and `.credentials.json` beside it between rounds.
 
+**A fleet stays off during its slot.** Its scheduled `up` is failing. The attention list has a
+`schedule-start` item with the reason, and `watchdog.log` has a `schedule: active … (rc=1)` line for
+every minute's retry. One cause was a target list naming a roadmap the `paths.roadmap` checkout
+did not have yet. `up` now fast-forwards that checkout when it is a clean `main`, and says so when it
+cannot.
+
 **A worker halted.** It saw an identity other than `fleet.github_login`, or a credential error.
 `tauceti-fleet clear-halt` shows the incident and clears it once you have looked.
 
