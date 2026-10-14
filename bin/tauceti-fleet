@@ -115,7 +115,10 @@ def _setting_int(section: str, key: str) -> int | None:
 
 
 NAME = setting("fleet", "name", env="TAUCETI_FLEET_NAME")
-TARGETS = _expand(setting("fleet", "targets", "", "TAUCETI_FLEET_TARGETS") or FLEET_HOME / "targets.md")
+_TARGETS_RAW = setting("fleet", "targets", "", "TAUCETI_FLEET_TARGETS")
+# `targets = "none"`: no target list. Each author picks a roadmap area the way an unsteered worker does,
+# and the curator has nothing to keep.
+TARGETS = None if _TARGETS_RAW.strip().lower() == "none" else _expand(_TARGETS_RAW or FLEET_HOME / "targets.md")
 EXPECT_LOGIN = setting("fleet", "github_login", env="TAUCETI_EXPECT_LOGIN")
 CLAIM_REPO = setting("fleet", "claim_repo", "TauCetiProject/tauceti-claims", "CLAIM_REPO")
 WORKTREE = _expand(setting("paths", "worker", "~/TauCetiWorker-v2", "TAUCETI_FLEET_WORKER"))
@@ -126,6 +129,13 @@ SHARED_CACHE = _expand(_SHARED_CACHE_RAW) if _SHARED_CACHE_RAW else None
 # otherwise. Once written into workers.toml, reconcile keeps that choice.
 DEFAULT_CLAUDE_MODEL = setting("models", "claude", "claude-opus-5-5")
 DEFAULT_CLAUDE_EFFORT = setting("models", "claude_effort", "high")
+# `[claude] billing = "api"`: every worker runs Claude on an API key (the worker's --claude-billing api)
+# rather than on subscription logins, so there is no login pool, no usage pacing and no Codex. The key
+# stays in a private file the workers read; `budget` admits each session against the local grant ledger
+# (`tauceti-fleet budget`), which nothing else limits.
+API = setting("claude", "billing", "subscription").strip().lower() == "api"
+API_KEY_FILE = _expand(setting("claude", "api_key_file", "~/.config/tauceti/anthropic.key"))
+API_BUDGET = setting("claude", "budget", "true").strip().lower() not in ("false", "0", "no")
 CONFIG = FLEET_HOME / "workers.toml"
 STATE = FLEET_HOME / "state"
 GATE_DIR = FLEET_HOME / "gate"
@@ -242,6 +252,67 @@ def round_timeout() -> int:
             m = re.search(r'^TAUCETI_CLAUDE_REFRESH_SKEW\s*=\s*"(\d+)"', t, re.M)
             v = str(int(m.group(1)) - 600) if m else None
     return int(v) if v else 5400
+
+
+def api_flags() -> list[str]:
+    """`tauceti work` flags for API billing, or [] for a subscription fleet."""
+    if not API:
+        return []
+    return ["--claude-billing", "api", *(["--budget"] if API_BUDGET else []), "--anthropic-api-key-file", str(API_KEY_FILE)]
+
+
+def api_key_problem() -> str:
+    """Why the workers could not use the API key file, or "". Judged from its metadata alone: the key
+    never enters this process."""
+    try:
+        st = API_KEY_FILE.stat()
+    except FileNotFoundError:
+        return (f"no API key file at {API_KEY_FILE} (claude.api_key_file): create it as this user, mode 600, holding "
+                f"only the key; see docs/setup.md, 'An API-billed fleet'")
+    except OSError as e:
+        return f"cannot read {API_KEY_FILE} (claude.api_key_file): {e}"
+    if not stat.S_ISREG(st.st_mode):
+        return f"{API_KEY_FILE} (claude.api_key_file) is not a regular file"
+    if st.st_uid != os.getuid():
+        return f"{API_KEY_FILE} (claude.api_key_file) belongs to another user"
+    if st.st_mode & 0o077:
+        return f"{API_KEY_FILE} can be read by other users: chmod 600 {API_KEY_FILE}"
+    if st.st_size < 20:
+        return f"{API_KEY_FILE} (claude.api_key_file) is too short to hold a key"
+    return ""
+
+
+def api_budget() -> dict | None:
+    """`tauceti budget --json`: the local grant ledger the API workers are admitted against."""
+    try:
+        p = tauceti("budget", "--json", capture=True)
+        return json.loads(p.stdout) if p.returncode == 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def api_budget_text(b: dict | None) -> tuple[str, str]:
+    """The budget at a glance, and how worried to be about it."""
+    if b is None:
+        return "API budget: unreadable (tauceti-fleet budget)", "red"
+    def usd(k):
+        try:
+            return float(b.get(k) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    text = (f"API budget ${usd('balance'):.2f} · grant ${usd('grant_rate'):.2f}/h · spent ${usd('spent'):.2f} · "
+            f"{len(b.get('active_sessions') or [])} active · ${usd('pending'):.2f} pending")
+    if b.get("waiting"):
+        text += f" · {len(b['waiting'])} waiting for funds"
+    if b.get("unresolved"):
+        text += f" · {len(b['unresolved'])} unresolved (tauceti-fleet budget --recover)"
+    if b.get("ledger_repair_required"):
+        return text + " · LEDGER NEEDS REPAIR", "red"
+    if usd("available") <= 0 and usd("grant_rate") <= 0:
+        return text + " · no funds: tauceti-fleet budget --grant N", "red"
+    return text, "yellow" if usd("available") <= 0 or b.get("unresolved") else "green"
+
+
 LOGINS = FLEET_HOME / "logins"
 LEASES = LOGINS / "leases.json"
 
@@ -316,7 +387,9 @@ def with_logins(specs: list[dict], leases: dict[str, str]) -> list[dict]:
 
 def lease_logins(specs: list[dict], persist: bool = True) -> list[dict]:
     """Assign, persist and apply the leases for these specs (the config writers call this).
-    `persist=False` (a dry run) computes them without writing."""
+    `persist=False` (a dry run) computes them without writing. An API-billed fleet has no pool."""
+    if API:
+        return specs
     leases = assign_leases(specs)
     if persist:
         write_leases(leases)
@@ -415,14 +488,17 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             if authors_active is not None and author_rank[0] > authors_active:
                 enabled = False
         spec = {"id": wid, "enabled": enabled, "agent": agent, "only": only, "sandbox": extra.pop("sandbox", a.sandbox)}
-        if a.pace:
+        if a.pace and not API:
             spec["pace"] = a.pace
         spec.update({k: v for k, v in extra.items() if v})
         # Credentials: the operator's Codex file, and on Linux the Claude credential file, are rotated
         # by the worker under the host flock (auto_refresh); on macOS an expiring Claude token is renewed
         # by a warm-up `claude` run against the Keychain (TAUCETI_CLAUDE_WARM). Workers only ever hold
-        # access-token mirrors.
-        spec["auto_refresh"] = True
+        # access-token mirrors. API billing has none of this, and the worker refuses it there.
+        if API:
+            spec.update(claude_billing="api", budget=API_BUDGET, anthropic_api_key_file=str(API_KEY_FILE))
+        else:
+            spec["auto_refresh"] = True
         spec["env"] = {
             "CLAIM_REPO": CLAIM_REPO,
             # Rotating a Claude access token REVOKES the old one at once (measured 2026-09-20), so a
@@ -439,7 +515,7 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             "TAUCETI_AUTHORING_CLAUDE_EFFORT": a.claude_effort,
             **({"TAUCETI_AUTHORING_CODEX_MODEL": a.codex_model} if a.codex_model else {}),
             **({"TAUCETI_AUTHORING_CODEX_EFFORT": a.codex_effort} if a.codex_effort else {}),
-            # Identity gate: halt (exit 77, persistent halt.json) on any other login or credential error.
+            # Identity gate: halt (persistent halt.json) on any other login or credential error.
             "TAUCETI_EXPECT_LOGIN": EXPECT_LOGIN,
             # Shared GitHub gate: one store for the whole fleet; budgets have no defaults by design.
             "TAUCETI_GATE_DIR": str(GATE_DIR),
@@ -454,7 +530,7 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             **({"TAUCETI_FALLBACK_AUTO": "1", "TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_AUTO_MIN)}
                if FALLBACK_AUTO else {}),
             **LOOKAHEAD_ENV,
-            **provider_paces(),
+            **({} if API else provider_paces()),
             # Pilot mode interacts less on GitHub: no reactions, no automatic stuck-review issues.
             "TAUCETI_REACTIONS": "0" if a.pilot else "1",
             "TAUCETI_STUCK_ISSUES": "0" if a.pilot else "1",
@@ -465,28 +541,31 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
         }
         specs.append(spec)
 
+    listed = {"roadmap_targets": str(TARGETS)} if TARGETS is not None else {}
+    # API billing runs Claude only: every worker is pinned to it and there are no Codex authors.
+    auto = "claude" if API else "auto"
     for i in range(1, a.claude + 1):
-        add(wid("c", i), "claude", "roadmap", roadmap_targets=str(TARGETS),
+        add(wid("c", i), "claude", "roadmap", **listed,
             author_model=a.claude_model, author_effort=a.claude_effort)
     # The "Codex" authors run `auto` (Codex first, Claude when Codex's window is spent) so that share of
     # authoring never parks with its subscription; the Claude authors above stay pinned.
-    for i in range(1, a.codex + 1):
-        add(wid("x", i), "auto", "roadmap", roadmap_targets=str(TARGETS))
+    for i in range(1, (0 if API else a.codex) + 1):
+        add(wid("x", i), "auto", "roadmap", **listed)
     # Fixers alternate: odd ones pinned to Claude, even ones `auto` (the worker's pacer prefers Codex
     # and falls back to Claude when Codex's window is spent), so the Codex share of fixing survives
     # its subscription running dry instead of parking. Reviewers run `auto` for the same reason. An
     # `auto` worker may not take --author-model; its models come from TAUCETI_AUTHORING_* above.
     for i in range(1, a.fixers + 1):
         # Fixers read the target list too: they take the PRs serving it first (worker c31c588).
-        if i % 2 == 1:
-            add(wid("fix", i), "claude", "fix,fix-ci,rebase", roadmap_targets=str(TARGETS),
+        if i % 2 == 1 or API:
+            add(wid("fix", i), "claude", "fix,fix-ci,rebase", **listed,
                 author_model=a.claude_model, author_effort=a.claude_effort)
         else:
-            add(wid("fix", i), "auto", "fix,fix-ci,rebase", roadmap_targets=str(TARGETS))
+            add(wid("fix", i), "auto", "fix,fix-ci,rebase", **listed)
     for i in range(1, a.reviewers + 1):
         # Reviewers read the list too: among the account's own PRs they take those serving it first
         # (worker 51c9754); the balance between our PRs and other people's is unchanged.
-        add(wid("rev", i), "auto", "review", roadmap_targets=str(TARGETS))
+        add(wid("rev", i), auto, "review", **listed)
     # The progress-report worker (opt-in: `[progress] enabled = true`, since it publishes to
     # TauCetiRoadmap). Not periodic: it looks for work all the time, writing a roadmap's report as soon
     # as the roadmap qualifies (TauCetiProgress's `threshold` strategy) and seeing each report land.
@@ -778,6 +857,8 @@ def _gh_status() -> tuple[str, str]:
 def operator_claude_users() -> list[str] | None:
     """The enabled Claude-capable workers, and the periodic runner, that hold no login chain and so
     sign in with the operator's ~/.claude; None when there is no fleet config to tell from."""
+    if API:
+        return []
     if not CONFIG.is_file():
         return None
     leases = read_leases()
@@ -814,6 +895,10 @@ def cached_credential_lines() -> list[tuple[str, str]]:
 
 
 def credential_lines() -> list[tuple[str, str]]:
+    if API:
+        key = api_key_problem()
+        return [(f"claude: {key}", "red") if key else (f"claude: API key file {API_KEY_FILE} (600)", "green"),
+                _gh_status()]
     pool = _login_pool_line()
     users = None if IS_MAC else operator_claude_users()
     if users == []:
@@ -911,6 +996,8 @@ def usage_text():
     """The subscription-usage row: what is LEFT in each window, per provider, with its reset."""
     from rich.text import Text
 
+    if API:
+        return Text(*api_budget_text(api_budget()))
     t = Text()
     for i, provider in enumerate(("claude", "codex")):
         if i:
@@ -1012,7 +1099,7 @@ class Progress:
             return self.data
         d: dict = {"error": ""}
         try:
-            targets = load_targets(TARGETS)
+            targets = load_targets(TARGETS) if TARGETS is not None else None
             login = me()
             base = ["gh", "pr", "list", "--repo", TAUCETI, "--limit", "200", "--json"]
             op = subprocess.run(base + ["number,body,labels,createdAt,author", "--state", "open"], capture_output=True, text=True, timeout=60)
@@ -1030,8 +1117,8 @@ class Progress:
                 inflight.update(target_marker_ids(p.get("body") or ""))
             for p in merged:
                 done.update(target_marker_ids(p.get("body") or ""))
-            listed = {(a, it.slug) for a, items in targets.areas.items() for it in items}
-            live = overlay_live(targets, inflight & listed, done & listed)
+            listed = {(a, it.slug) for a, items in targets.areas.items() for it in items} if targets else set()
+            live = overlay_live(targets, inflight & listed, done & listed) if targets else None
             day_ago = (datetime.now(timezone.utc).timestamp() - 86400)
             def ts(s):
                 try:
@@ -1046,7 +1133,7 @@ class Progress:
                     if nm in ("awaiting-CI", "awaiting-review", "review-in-progress", "ci-failed", "awaiting-author", "ready-to-merge"):
                         labels[nm] = labels.get(nm, 0) + 1
             per_area = {}
-            for a, items in live.areas.items():
+            for a, items in (live.areas.items() if live else ()):
                 st = {"done": 0, "inflight": 0, "open": 0}
                 for it in items:
                     st[it.status] = st.get(it.status, 0) + 1
@@ -1212,7 +1299,7 @@ def targets_undecided() -> list[tuple[str, str]]:
             d = read_json(f)
             if newest is None or str(d.get("last_at") or "") > str(newest.get("last_at") or ""):
                 newest = d
-    if not newest or not newest.get("undecided") or not TARGETS.is_file():
+    if not newest or not newest.get("undecided") or TARGETS is None or not TARGETS.is_file():
         return []
     try:
         t = load_targets(TARGETS)
@@ -1374,7 +1461,7 @@ def periodic_enabled(stage: str) -> bool:
     only the fleet's own records and target list."""
     if stage == "decide":
         return setting("decide", "enabled", "true").lower() not in ("false", "0", "no")
-    return stage == "curate"
+    return stage == "curate" and TARGETS is not None
 
 
 # An author's decline ("main already has this") leaves its target skipped until the curator settles
@@ -1459,7 +1546,7 @@ def _decide_added_open() -> bool:
     """Is an item the decide stage added still open or in flight on the target list? The round retires
     one whose PRs have all merged or closed, so the cadence keeps running while there is one. Local."""
     try:
-        text = TARGETS.read_text()
+        text = TARGETS.read_text() if TARGETS is not None else ""
     except OSError:
         return False
     return re.search(r"^\s*-\s*\[[ ~]\].*\badded by the decide stage\b", text, re.M) is not None
@@ -1507,13 +1594,13 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
         env.pop(var, None)
     env.update({
         "TAUCETI_WORKER_ID": PERIODIC_WID,
-        "TAUCETI_ROADMAP_TARGETS": str(TARGETS),
+        **({"TAUCETI_ROADMAP_TARGETS": str(TARGETS)} if TARGETS is not None else {}),
         "TAUCETI_AUTHORING_CLAUDE_MODEL": getattr(a, "claude_model", None) or _config_env("TAUCETI_AUTHORING_CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL,
         "TAUCETI_AUTHORING_CLAUDE_EFFORT": getattr(a, "claude_effort", None) or _config_env("TAUCETI_AUTHORING_CLAUDE_EFFORT") or "high",
         "TAUCETI_CLAUDE_REFRESH_SKEW": str(round_timeout() + 600),
         "TAUCETI_REACTIONS": _config_env("TAUCETI_REACTIONS") or "0",
         "TAUCETI_STUCK_ISSUES": _config_env("TAUCETI_STUCK_ISSUES") or "0",
-        "TAUCETI_AUTO_REFRESH": "1",
+        **({} if API else {"TAUCETI_AUTO_REFRESH": "1"}),
         # The curator commits the target list and, in the fleet repository, pushes it so the other
         # host and the owner see the same list. Off if the file is not git-tracked (nothing to push).
         "TAUCETI_TARGETS_PUSH": _config_env("TAUCETI_TARGETS_PUSH") or "1",
@@ -1528,11 +1615,12 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
     # Without it the worker's default curve applies, and that one allows nothing at all early in a
     # usage window: the first curate round (2026-09-21) ended with "no model under pace right now".
     pace = os.environ.get("TAUCETI_PACE", "") or (re.search(r'^pace\s*=\s*"([^"]+)"', CONFIG.read_text(), re.M) or [None, ""])[1] if CONFIG.is_file() else ""
-    if pace:
+    if pace and not API:
         env["TAUCETI_PACE"] = pace
-    for var in ("TAUCETI_PACE_CLAUDE", "TAUCETI_PACE_CODEX"):
+    for var in ("TAUCETI_PACE_CLAUDE", "TAUCETI_PACE_CODEX", *(("TAUCETI_PACE",) if API else ())):
         env.pop(var, None)  # a hook's environment carries the worker's values; fleet.toml decides
-    env.update(provider_paces())
+    if not API:
+        env.update(provider_paces())
     d = login_dir(PERIODIC_WID)
     if d is not None:
         env["CLAUDE_CONFIG_DIR"] = str(d)
@@ -1541,6 +1629,8 @@ def periodic_env(a: argparse.Namespace | None = None) -> dict[str, str]:
 
 def _targets_repo() -> str:
     """`owner/name` of the repository the target list lives in (its `origin`), or "" if not git-tracked."""
+    if TARGETS is None:
+        return ""
     try:
         url = subprocess.run(["git", "-C", str(TARGETS.parent), "remote", "get-url", "origin"],
                              capture_output=True, text=True, timeout=10).stdout.strip()
@@ -1579,7 +1669,7 @@ def run_periodic(stage: str, *, quiet: bool = True, force: bool = False) -> str:
     argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", stage, "--worker-id", PERIODIC_WID,
             "--author-model", periodic_env().get("TAUCETI_AUTHORING_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
             "--author-effort", periodic_env().get("TAUCETI_AUTHORING_CLAUDE_EFFORT", "high"),
-            "--agent", "claude", "--roadmap-targets", str(TARGETS)]
+            "--agent", "claude", *(["--roadmap-targets", str(TARGETS)] if TARGETS is not None else []), *api_flags()]
     # The lock file descriptor is inherited by the child, so the lock lives as long as the round.
     subprocess.Popen(argv, cwd=WORKTREE, env=periodic_env(), stdout=open(log, "a"), stderr=subprocess.STDOUT,
                      stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=(lock.fileno(),))
@@ -1649,7 +1739,7 @@ def cmd_periodic(a: argparse.Namespace) -> int:
         env = periodic_env(a)
         argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", a.now, "--worker-id", PERIODIC_WID,
                 "--author-model", env["TAUCETI_AUTHORING_CLAUDE_MODEL"], "--author-effort", env["TAUCETI_AUTHORING_CLAUDE_EFFORT"],
-                "--agent", "claude", "--roadmap-targets", str(TARGETS)]
+                "--agent", "claude", *(["--roadmap-targets", str(TARGETS)] if TARGETS is not None else []), *api_flags()]
         (periodic_dir() / f"{a.now}.last").touch()
         # A forced round means now: clear the worker's own attempt gap for the stage (and the cached
         # progress verdict), or the round says "no eligible work" while the gap runs.
@@ -1685,6 +1775,8 @@ def cmd_targets(a: argparse.Namespace) -> int:
     as subsumed by main, 0 of 88 open items were eligible, and the author idled at the backoff cap.
     Prints a suggestion per item; --apply rewrites the confident ones (merged → done; closed with a
     recorded subsumed-by verdict → done, naming the upstream PR) and leaves the rest for the owner."""
+    if TARGETS is None:
+        die("this fleet has no target list (fleet.targets = \"none\")")
     text = TARGETS.read_text()
     verdicts = _verdicts()
     rows, edits = [], {}
@@ -2073,6 +2165,8 @@ def target_list_summary() -> str:
     flight) and the authors' decline records (a declined target is held until the curator settles it).
     Available = what an author could take now; unavailable = open items that wait on prerequisites,
     or are held."""
+    if TARGETS is None:
+        return "none: each author picks a roadmap area itself"
     try:
         t = load_targets(TARGETS)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 - a view line, not a check
@@ -2180,7 +2274,8 @@ def schedule_info() -> dict:
             slots = parse_schedule(spec)
             now = datetime.now()
             out["active_now"] = schedule_active(slots, now)
-            out["next_change_at"] = time.time() + schedule_next_change(slots, now) * 60
+            if spec.strip().lower() != "always":
+                out["next_change_at"] = time.time() + schedule_next_change(slots, now) * 60
         except ValueError:
             pass
     return out
@@ -2332,7 +2427,7 @@ def view_data(progress: Progress) -> dict:
     if progress.remote_ok:  # the GitHub panel; without --refresh it never runs, so there is nothing to date
         after.append([_cell("refreshed"), _cell(f"{age(progress.at)} ago (every {progress.ttl // 60} min)")])
     return {"v": 1, "fleet": NAME, "user": _pwd.getpwuid(os.getuid()).pw_name, "at": time.time(),
-            "targets": TARGETS.name, "manager_up": mgr_alive, "draining": draining(), "disk_free_gb": free_gb,
+            "targets": TARGETS.name if TARGETS is not None else "none", "manager_up": mgr_alive, "draining": draining(), "disk_free_gb": free_gb,
             "healthy": healthy, "enabled": len(enabled_ids), "total": len(ids), "workers": workers,
             "rows": rows, "needs": needs, "needs_hint": hint, "rows_after": after,
             "events": [list(e) for e in recent_events(40)], "schedule": schedule_info()}
@@ -2748,11 +2843,20 @@ def _fleet_state(s: dict) -> tuple[str, str]:
     nxt = sch.get("next_change_at")
     when = f"{datetime.fromtimestamp(nxt):%a %H:%M}" if isinstance(nxt, (int, float)) else "?"
     running = s.get("manager_up") and not s.get("draining")
+    always = str(sch.get("spec") or "").strip().lower() == "always"
     if (since := sch.get("start_failed_since")) and not running:
         since = f"{datetime.fromisoformat(since.replace('Z', '+00:00')).astimezone():%a %H:%M}" if since != "?" else since
+        if always:
+            return f"START FAILED at {since}, retrying each minute (always on)", "bold red"
         if sch.get("active_now"):
             return f"START FAILED at {since}, retrying each minute (slot ends {when})", "bold red"
         return f"off; its last slot never started (failed {since}); next slot {when}", "bold red"
+    if always:
+        if running:
+            return "RUNNING (always on)", "bold green"
+        if s.get("manager_up"):
+            return "DRAINING (workers finishing their rounds)", "yellow"
+        return "stopped (always on; `up` starts it, and the timer restarts it unless `down` stopped it)", "yellow"
     if running:
         return (f"RUNNING, slot ends {when}" if sch.get("active_now") else f"RUNNING outside its slot (next slot {when})"), "bold green"
     if s.get("manager_up"):
@@ -2768,7 +2872,9 @@ def main_fleet(snaps: list[dict]) -> dict:
     def key(s):
         sch = s.get("schedule") or {}
         running = bool(s.get("manager_up") and not s.get("draining"))
-        return (running, bool(s.get("manager_up")), bool(sch.get("active_now")), s.get("at") or 0)
+        always = str(sch.get("spec") or "").strip().lower() == "always"
+        # An always-on fleet runs beside the rotation; the view follows the rotation's fleet.
+        return (running, bool(s.get("manager_up")), bool(sch.get("active_now")), not always, s.get("at") or 0)
     return max(snaps, key=key)
 
 
@@ -2901,14 +3007,25 @@ def cmd_up(a: argparse.Namespace) -> int:
     if draining() and not a.dry_run:
         DRAINING.unlink()
         print("up: ending the drain")
+    if not a.dry_run:
+        STOPPED.unlink(missing_ok=True)
     if not (WORKTREE / "tauceti_worker").is_dir():
         die(f"worktree not found: {WORKTREE}")
-    if not TARGETS.is_file():
-        die(f"target file not found: {TARGETS}")
-    if problem := targets_problem():
-        die(problem)
+    if TARGETS is not None:
+        if not TARGETS.is_file():
+            die(f"target file not found: {TARGETS}")
+        if problem := targets_problem():
+            die(problem)
     if problem := shared_cache_problem():
         die(problem)
+    if API:
+        if problem := api_key_problem():
+            die(problem)
+        if a.codex:
+            print("note: API billing runs Claude only; up.codex / --codex is ignored")
+        a.codex = 0
+        if a.pace:
+            print("note: API billing has no usage windows to pace; up.pace is not passed to the workers")
     if a.pilot:
         # The pilot's shape: one Claude author and no Codex author unless the owner says otherwise
         # on the command line; reconcile then sets fixers and reviewers from the backlog.
@@ -2930,20 +3047,26 @@ def cmd_up(a: argparse.Namespace) -> int:
     if halted:
         die("a worker is halted (" + ", ".join(p.parent.name for p in halted) + "); inspect and clear with "
             "`tauceti-fleet clear-halt` before starting anything")
-    t = load_targets(TARGETS)
+    t = load_targets(TARGETS) if TARGETS is not None else None
     if not a.dry_run and (note := refresh_roadmap_checkout()):
         print(note)
-    roadmap_root = ROADMAP_CHECKOUT / "TauCetiRoadmap"
-    if not roadmap_root.is_dir():
-        die(f"no TauCetiRoadmap checkout at {ROADMAP_CHECKOUT} to check the target areas against (paths.roadmap in fleet.toml)")
-    bad = [a for a in t.areas if not re.fullmatch(r"[A-Za-z0-9_-]+", a) or not (roadmap_root / a / "README.md").is_file()]
-    if bad:
-        die("target file names areas that are not roadmap directories under " + str(roadmap_root) + ": "
-            + ", ".join(repr(a[:40]) for a in bad) + " — a worker would author against a roadmap that does not exist; "
-            f"if the roadmap merged recently, `git -C {ROADMAP_CHECKOUT} pull` first; otherwise move the area under "
-            "the Gaps section until its roadmap PR merges")
-    n_open = sum(len(open_items(t, area)) for area in t.areas)
-    print(f"targets: {TARGETS} — {n_open} open items in {len(t.areas)} areas")
+    if t is not None:
+        roadmap_root = ROADMAP_CHECKOUT / "TauCetiRoadmap"
+        if not roadmap_root.is_dir():
+            die(f"no TauCetiRoadmap checkout at {ROADMAP_CHECKOUT} to check the target areas against (paths.roadmap in fleet.toml)")
+        bad = [a for a in t.areas if not re.fullmatch(r"[A-Za-z0-9_-]+", a) or not (roadmap_root / a / "README.md").is_file()]
+        if bad:
+            die("target file names areas that are not roadmap directories under " + str(roadmap_root) + ": "
+                + ", ".join(repr(a[:40]) for a in bad) + " — a worker would author against a roadmap that does not exist; "
+                f"if the roadmap merged recently, `git -C {ROADMAP_CHECKOUT} pull` first; otherwise move the area under "
+                "the Gaps section until its roadmap PR merges")
+        n_open = sum(len(open_items(t, area)) for area in t.areas)
+        print(f"targets: {TARGETS} — {n_open} open items in {len(t.areas)} areas")
+    else:
+        print("targets: none — each author picks a roadmap area itself")
+    if API:
+        text, _style = api_budget_text(api_budget())
+        print(text)
     a.authors_enabled = True
     specs = lease_logins(fleet_specs(a), persist=not a.dry_run)
     for text, style in credential_lines():
@@ -3236,8 +3359,10 @@ def cmd_round(a: argparse.Namespace) -> int:
     """One round, foreground, with the pilot's environment (gate store and budgets, pinned login,
     reactions and stuck-issues off, bubble): a first isolated round on a new host, before `up`.
     Prints the gate report afterwards so every request the round made is visible."""
-    if not TARGETS.is_file():
+    if TARGETS is not None and not TARGETS.is_file():
         die(f"target file not found: {TARGETS}")
+    if API and a.agent != "claude":
+        die("API billing runs Claude only: --agent claude")
     a.worker_id = a.worker_id or wid("c", 1)
     if a.sandbox == "bubble" and shutil.which("bubble") is None:
         die("bubble is not on PATH")
@@ -3248,10 +3373,13 @@ def cmd_round(a: argparse.Namespace) -> int:
         "TAUCETI_GATE_READS_PER_HOUR": str(a.reads_per_hour),
         "TAUCETI_REACTIONS": "0",
         "TAUCETI_STUCK_ISSUES": "0",
-        "TAUCETI_PACE": os.environ.get("TAUCETI_PACE", "0:100,100:100"),
+        **({} if API else {"TAUCETI_PACE": os.environ.get("TAUCETI_PACE", "0:100,100:100")}),
     })
+    if API:
+        env.pop("TAUCETI_PACE", None)
     argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", a.only, "--agent", a.agent, "--worker-id", a.worker_id,
-            "--roadmap-targets", str(TARGETS), "--author-model", a.claude_model if a.agent == "claude" else a.codex_model or "",
+            *(["--roadmap-targets", str(TARGETS)] if TARGETS is not None else []), *api_flags(),
+            "--author-model", a.claude_model if a.agent == "claude" else a.codex_model or "",
             "--author-effort", a.claude_effort if a.agent == "claude" else a.codex_effort or ""]
     argv = [x for x in argv if x != ""]
     if a.sandbox == "bubble":
@@ -3279,8 +3407,9 @@ def cmd_review(a: argparse.Namespace) -> int:
         print("a periodic round is running; waiting for it to finish …", flush=True)
         fcntl.flock(lock, fcntl.LOCK_EX)
     env = periodic_env()
+    agent = "claude" if API else a.agent  # API billing runs Claude only
     argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", "review", "--pr", str(a.pr),
-            "--worker-id", PERIODIC_WID, "--agent", a.agent]
+            "--worker-id", PERIODIC_WID, "--agent", agent, *(api_flags() if agent == "claude" else [])]
     if setting("up", "sandbox", "bubble") == "bubble":
         argv.append("--bubble")
     logs = STATE / "logs" / PERIODIC_WID
@@ -3306,6 +3435,8 @@ def cmd_lookahead(a: argparse.Namespace) -> int:
     authored in its place."""
     import fcntl
 
+    if TARGETS is None:
+        die("this fleet has no target list (fleet.targets = \"none\")")
     lock = open(periodic_dir() / "run.lock", "a+")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -3317,7 +3448,9 @@ def cmd_lookahead(a: argparse.Namespace) -> int:
     if MAX_OPEN_PRS_SETTING:  # the authors' backpressure point; the periodic env does not carry it
         env["TAUCETI_MAX_OPEN_PRS"] = str(MAX_OPEN_PRS_SETTING)
     argv = [PYTHON, "-m", "tauceti_worker", "work", "--only", "roadmap", "--worker-id", PERIODIC_WID,
-            "--agent", a.agent, "--roadmap-targets", str(TARGETS)]
+            "--agent", a.agent, "--roadmap-targets", str(TARGETS), *(api_flags() if a.agent == "claude" else [])]
+    if API and a.agent != "claude":
+        die("API billing runs Claude only: --agent claude")
     if setting("up", "sandbox", "bubble") == "bubble":
         argv.append("--bubble")
     logs = STATE / "logs" / PERIODIC_WID
@@ -3575,6 +3708,11 @@ def cmd_logins(a: argparse.Namespace) -> int:
     use at once, and the sign-in commands for the ones still missing. See the pool notes above for
     why one chain per concurrently running worker, and why no reshaping or quiet spell ever asks for
     a new sign-in."""
+    if API:
+        print(f"API billing (claude.billing = \"api\"): no login chains; every worker reads the key in {API_KEY_FILE}")
+        if problem := api_key_problem():
+            print(f"  {problem}")
+        return 0
     if CONFIG.is_file():
         shape = _shape_from_config(a)
     else:
@@ -3702,6 +3840,9 @@ def cmd_warm_pool(a: argparse.Namespace) -> int:
 
 
 DRAINING = FLEET_HOME / "draining"
+# Left by `down` (not by a drain, which has DRAINING) until the next `up`: an always-on schedule
+# restarts a fleet whose manager has gone, but not one its owner stopped.
+STOPPED = FLEET_HOME / "stopped"
 
 
 def draining() -> bool:
@@ -3764,7 +3905,10 @@ SCHEDULE_UNIT = "tauceti-fleet-schedule"
 
 def parse_schedule(spec: str) -> list[tuple[int, int]]:
     """`schedule.active`, e.g. "Thu 07:00 -> Sat 15:00" (several slots separated by commas), as
-    (start, end) minutes from Monday 00:00, host-local time. A slot may wrap past Sunday midnight."""
+    (start, end) minutes from Monday 00:00, host-local time. A slot may wrap past Sunday midnight.
+    "always" is the whole week."""
+    if spec.strip().lower() == "always":
+        return [(0, 10080)]
     slots = []
     for part in (p.strip() for p in spec.split(",") if p.strip()):
         ends = [e.strip() for e in re.split(r"->|–|—", part)]
@@ -3797,6 +3941,13 @@ def schedule_next_change(slots: list[tuple[int, int]], now: datetime) -> int:
     return min((edge - t) % 10080 or 10080 for a, b in slots for edge in (a, b))
 
 
+def revive_always_on(spec: str, want: str, last: str) -> bool:
+    """An always-on fleet whose manager has gone (a reboot, a crash) is started again by the next tick,
+    unless `down` or a drain stopped it on purpose."""
+    return (spec.strip().lower() == "always" and want == last == "active" and CONFIG.is_file()
+            and not manager_alive() and not draining() and not STOPPED.is_file())
+
+
 def cmd_schedule(a: argparse.Namespace) -> int:
     """The fleet's weekly active slots (`schedule.active` in fleet.toml, host-local time). `--tick` acts
     on a boundary only: when the slot the clock is in differs from the last tick's, it runs `up` (the
@@ -3819,13 +3970,14 @@ def cmd_schedule(a: argparse.Namespace) -> int:
     left = schedule_next_change(slots, now)
     if not a.tick:
         last = SCHEDULE_STATE.read_text().strip() if SCHEDULE_STATE.is_file() else "never ticked"
-        print(f"schedule {spec!r}: {want} now ({now:%a %H:%M}), flips in {left // 60} h {left % 60} min; "
-              f"last tick: {last}; draining: {draining()}")
+        flips = "never flips" if spec.strip().lower() == "always" else f"flips in {left // 60} h {left % 60} min"
+        print(f"schedule {spec!r}: {want} now ({now:%a %H:%M}), {flips}; "
+              f"last tick: {last}; draining: {draining()}; stopped by down: {STOPPED.is_file()}")
         return 0
     last = SCHEDULE_STATE.read_text().split()[0] if SCHEDULE_STATE.is_file() else ""
     budget_pace()
     publish_status()  # every tick, so an idle or inactive fleet's needs-you items stay visible
-    if want == last:
+    if want == last and not revive_always_on(spec, want, last):
         return 0
     argv = [str(Path(__file__).resolve()), "up", "--no-watch"] if want == "active" else \
         [str(Path(__file__).resolve()), "down", "--drain"]
@@ -3911,6 +4063,8 @@ def cmd_down(a: argparse.Namespace) -> int:
     args = ["workers", "--config", str(CONFIG), "manager-stop"]
     if a.leave_workers:
         args.append("--leave-workers")
+    FLEET_HOME.mkdir(parents=True, exist_ok=True)
+    STOPPED.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S}\n")
     return tauceti(*args).returncode
 
 
@@ -3980,7 +4134,8 @@ SETTINGS_TEMPLATE = """\
 [fleet]
 # Short and unique on this host: worker ids are <name>-c1, <name>-fix1, <name>-rev1, ...
 name = {name}
-# The operator target list the authors work through (a `<!-- tauceti-targets:v1 -->` file).
+# The operator target list the authors work through (a `<!-- tauceti-targets:v1 -->` file), or "none":
+# each author then picks a roadmap area itself, and there is no curator.
 targets = {targets}
 # The GitHub account every worker must act as; a worker halts on any other identity.
 github_login = {login}
@@ -4002,6 +4157,15 @@ sandbox = "bubble"
 # max_reviewers = 2
 # fixer_backlog_start = 6
 # fixer_backlog_step = 2
+
+[claude]
+# "subscription": the workers sign in through the login pool (`tauceti-fleet logins`) and pace by the
+# subscription's usage windows. "api": they run on an API key read from api_key_file (mode 600, the
+# key alone), Claude only, admitted against the local grant ledger when budget = true
+# (`tauceti-fleet budget --grant USD`, `--grant-rate USD_PER_HOUR`).
+billing = {billing}
+# api_key_file = "~/.config/tauceti/anthropic.key"
+# budget = true
 
 [gate]
 # Fleet-wide rolling-hour budgets for everything done as github_login. Two fleets acting as the
@@ -4062,15 +4226,21 @@ def cmd_init(a: argparse.Namespace) -> int:
         die("--name must be a short lowercase word (letters and digits, at most 12): it prefixes every worker id")
     if SETTINGS_FILE.exists() and not a.force:
         die(f"{SETTINGS_FILE} already exists (--force to replace it)")
-    targets = _expand(a.targets).resolve()
-    if not targets.is_file():
-        die(f"no target file at {targets}")
+    if a.targets.strip().lower() == "none":
+        targets = "none"
+    else:
+        targets = _expand(a.targets).resolve()
+        if not targets.is_file():
+            die(f"no target file at {targets}")
     FLEET_HOME.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(SETTINGS_TEMPLATE.format(
         name=toml_str(a.name), targets=toml_str(str(targets)), login=toml_str(a.github_login),
-        worker=toml_str(a.worker), roadmap=toml_str(a.roadmap)), encoding="utf-8")
+        worker=toml_str(a.worker), roadmap=toml_str(a.roadmap), billing=toml_str(a.claude_billing)), encoding="utf-8")
     print(f"wrote {SETTINGS_FILE}")
-    print(f"next: {PROG} logins (sign in the Claude login pool), then {PROG} up")
+    if a.claude_billing == "api":
+        print(f"next: the API key file ([claude] api_key_file) and a budget ({PROG} budget --grant / --grant-rate), then {PROG} up")
+    else:
+        print(f"next: {PROG} logins (sign in the Claude login pool), then {PROG} up")
     return 0
 
 
@@ -4079,7 +4249,9 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     it = sub.add_parser("init", help="write the fleet's settings (fleet.toml in the fleet home)")
     it.add_argument("--name", required=True, help="short fleet name; prefixes every worker id")
-    it.add_argument("--targets", required=True, help="the operator target list for the authors")
+    it.add_argument("--targets", required=True, help="the operator target list for the authors, or `none`")
+    it.add_argument("--claude-billing", choices=("subscription", "api"), default="subscription",
+                    help="subscription logins (the default) or an API key with a local budget")
     it.add_argument("--github-login", required=True, help="the GitHub account the workers act as")
     it.add_argument("--worker", default="~/TauCetiWorker-v2", help="TauCetiWorker checkout (default ~/TauCetiWorker-v2)")
     it.add_argument("--roadmap", default="~/TauCetiRoadmap", help="TauCetiRoadmap checkout (default ~/TauCetiRoadmap)")
@@ -4130,6 +4302,10 @@ def main() -> int:
     gt = sub.add_parser("gate", help="pass-through to `tauceti gate ...` (status, report, resume, halt)")
     gt.add_argument("args", nargs=argparse.REMAINDER)
     gt.set_defaults(fn=lambda a: tauceti("gate", *a.args).returncode)
+    bg = sub.add_parser("budget", help="pass-through to `tauceti budget ...`, the API workers' local grant ledger "
+                        "(--grant USD, --grant-rate USD_PER_HOUR, --set-grant, --log, --json)")
+    bg.add_argument("args", nargs=argparse.REMAINDER)
+    bg.set_defaults(fn=lambda a: tauceti("budget", *a.args).returncode)
     rv = sub.add_parser("review", help="review one PR now, as the periodic worker (for a PR that should not wait its turn)")
     rv.add_argument("pr", type=int)
     rv.add_argument("--agent", choices=("codex", "claude", "auto"), default="codex",

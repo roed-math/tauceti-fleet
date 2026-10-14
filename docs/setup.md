@@ -361,6 +361,51 @@ The directory goes beside the shared target list, in the group directory made ab
 could not replace what this one writes there. Run each fleet's `up` (or `reconcile`) once after
 setting it, so the workers get it.
 
+## An API-billed fleet
+
+With `claude.billing = "api"` the workers run Claude on an API key rather than on subscription
+logins: no login pool, no usage windows to pace, no Codex. Every worker is pinned to Claude.
+
+The key lives in a file only the fleet user can read, never in `fleet.toml`, a shell profile or the
+environment, where every child process (and every agent tool call on the host) would inherit it.
+As the fleet user, with nothing echoed and nothing left in the shell history:
+
+```bash
+umask 077 && mkdir -p ~/.config/tauceti && read -rsp 'Anthropic API key: ' k && printf '%s\n' "$k" > ~/.config/tauceti/anthropic.key && unset k && echo
+```
+
+```toml
+[claude]
+billing = "api"
+api_key_file = "~/.config/tauceti/anthropic.key"
+budget = true
+```
+
+`up` refuses a key file that is missing or readable by anyone else. The worker hands the key to a
+round as a read-only file, so an agent in its container can read it, as it could read a
+subscription token; root on the host, and any `incus-admin` member, can read it too. A key of its
+own for the fleet, with a spending limit set in the Anthropic Console, bounds what a leaked key
+costs.
+
+`budget = true` admits each Claude session only while the local ledger has the money for it.
+The ledger starts empty, so nothing runs until you grant some:
+
+```bash
+tauceti-fleet budget --grant 100
+```
+
+```bash
+tauceti-fleet budget --grant-rate 20
+```
+
+The first adds $100 once; the second adds $20 an hour from now on, also while the fleet is
+stopped. `tauceti-fleet budget` shows the balance, and the view's `usage` row shows it too. The
+ledger is local accounting from the costs Claude reports, not the Console's bill.
+
+A fleet that should run all the time sets `schedule.active = "always"` and installs the timer
+(`tauceti-fleet schedule --install`): it starts the fleet, and starts it again after a reboot,
+unless `down` stopped it.
+
 ## macOS
 
 The tool runs on macOS too, with `up.sandbox = "host"` (bubble needs Incus). Claude credentials live

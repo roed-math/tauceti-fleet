@@ -32,12 +32,14 @@ only fleet-specific files here are the target lists.
 - **A GitHub account for the fleet, and only for the fleet.** Every request goes through a budget
   (the gate) because automated volume is what GitHub's abuse detection looks for, and an account
   can be suspended for it. Never sign the fleet in as a person.
-- **A Claude subscription.** The fleet signs it in several times, once per login chain, and spends
-  it. A **Codex** subscription is optional: `auto` workers use Codex while it has room and Claude
-  otherwise.
+- **A Claude subscription, or an API key.** The fleet signs a subscription in several times, once per
+  login chain, and spends it. A **Codex** subscription is optional: `auto` workers use Codex while it
+  has room and Claude otherwise. With `claude.billing = "api"` every worker runs Claude on an API key
+  instead, admitted against a local dollar budget you grant (docs/setup.md, "An API-billed fleet").
 - **A target list**: the milestones you want, from the roadmaps in
   [TauCetiRoadmap](https://github.com/TauCetiProject/TauCetiRoadmap). See
-  [docs/target-lists.md](docs/target-lists.md), or start from the one in `targets/`.
+  [docs/target-lists.md](docs/target-lists.md), or start from the one in `targets/`. With
+  `fleet.targets = "none"` the authors pick roadmap areas themselves.
 
 ## How a fleet works
 
@@ -85,7 +87,7 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | setting | meaning | default |
 |---|---|---|
 | `fleet.name` | short lowercase word; worker ids are `<name>-c1`, `<name>-fix1`, `<name>-rev1`, … | required |
-| `fleet.targets` | the target list the authors work through; several fleets may share one (docs/setup.md) | required |
+| `fleet.targets` | the target list the authors work through; several fleets may share one (docs/setup.md); `"none"`: no list, no curator, and each author picks a roadmap area itself | required |
 | `fleet.github_login` | the GitHub account every worker must act as; any other identity halts the worker | required |
 | `fleet.claim_repo` | the project-wide claim namespace; every fleet must agree on it | `TauCetiProject/tauceti-claims` |
 | `fleet.status_dir` | a directory the fleet users share, where each fleet publishes its view for `watch --fleets` (docs/operating.md) | unset (no publishing) |
@@ -96,7 +98,9 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `up.sandbox` | `bubble` (egress-denied containers) or `host` | `init` writes `bubble` |
 | `up.pace` | the worker's pacing curve, `time%:budget%` points; the reconcile applies a change | the worker's own curve |
 | `up.pace_claude`, `up.pace_codex` | a curve for that provider's windows only, overriding `up.pace` (an `auto` worker paces each provider on its own); the reconcile applies a change | `up.pace` |
-| `schedule.active` | weekly active slots in host-local time, e.g. `"Thu 07:00 -> Sat 15:00"` (comma-separated for several); `tauceti-fleet schedule --install` adds a systemd user timer that runs `up` when a slot opens and `down --drain` when it closes, acting only at the boundaries | always on |
+| `schedule.active` | weekly active slots in host-local time, e.g. `"Thu 07:00 -> Sat 15:00"` (comma-separated for several); `tauceti-fleet schedule --install` adds a systemd user timer that runs `up` when a slot opens and `down --drain` when it closes, acting only at the boundaries. `"always"`: the timer starts the fleet, and starts it again whenever its manager has gone (a reboot) unless `down` stopped it | unset: no timer action |
+| `claude.billing` | `subscription` (the login pool, paced by usage windows) or `api`: every worker runs Claude only, on the key in `claude.api_key_file`, with no pacing and no login pool | `subscription` |
+| `claude.api_key_file`, `claude.budget` | with `api`: the private file (mode 600) holding the key, and whether each session is admitted against the local grant ledger (`budget` below) | `~/.config/tauceti/anthropic.key`, `true` |
 | `up.claude`, `up.codex` | Claude authors, and `auto` authors (Codex first, then Claude) | 2 and 2; 1 and 0 in pilot mode |
 | `up.max_fixers`, `up.max_reviewers` | the most fixers and reviewers the reconcile runs as the backlog grows; the reconcile applies a change, and `logins` asks for a chain for each | 3 and 2 |
 | `up.fixer_backlog_start`, `up.fixer_backlog_step` | the fix backlog that brings a second fixer, and how many more PRs bring each one after it, up to `up.max_fixers`; the reconcile applies a change | 6 and 2 |
@@ -136,6 +140,7 @@ interpreter that has `rich`, for the live view.
 | `lookahead SLUG` | one lookahead round on that target-list item now: a session while it is blocked, its port once eligible (docs/operating.md) |
 | `logs ID [-f]` | one worker's log |
 | `gate …` | the worker's gate commands: `status`, `report`, `publication prune`, … |
+| `budget …` | the API workers' local grant ledger: `--grant USD`, `--grant-rate USD_PER_HOUR`, `--set-grant USD`, `--log`, `--recover` |
 | `clear-halt` | show each halted worker's incident, then clear it |
 | `warm-pool` | fill the Mathlib cache pool by hand |
 | `down` | stop the manager and its workers |
