@@ -1455,14 +1455,24 @@ def _decide_work() -> tuple[bool, float, bool]:
     return pending, newest, waits
 
 
+def _decide_added_open() -> bool:
+    """Is an item the decide stage added still open or in flight on the target list? The round retires
+    one whose PRs have all merged or closed, so the cadence keeps running while there is one. Local."""
+    try:
+        text = TARGETS.read_text()
+    except OSError:
+        return False
+    return re.search(r"^\s*-\s*\[[ ~]\].*\badded by the decide stage\b", text, re.M) is not None
+
+
 def periodic_due(stage: str) -> bool:
     if not periodic_enabled(stage):
         return False
     last = periodic_dir() / f"{stage}.last"
     if stage == "decide":
-        # Nothing to rule on and nothing waiting: not even the cadence runs it.
+        # Nothing to rule on, nothing waiting and no prerequisite to re-check: not even the cadence runs it.
         pending, newest, waits = _decide_work()
-        if not (pending or waits):
+        if not (pending or waits or _decide_added_open()):
             return False
     try:
         at = last.stat().st_mtime
