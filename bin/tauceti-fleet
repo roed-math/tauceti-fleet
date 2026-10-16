@@ -349,12 +349,20 @@ def read_leases() -> dict[str, str]:
 def assign_leases(specs: list[dict]) -> dict[str, str]:
     """Sticky leases, one chain per worker: a worker keeps its chain while it exists and is enabled;
     chains of workers that left the config or were disabled are released; free chains go to enabled
-    claude/auto workers without one, in config order. Workers left over share the operator's
-    ~/.claude (and `tauceti-fleet logins` says so). Pure: the caller writes the result."""
-    slots = {d.name for d in login_slots()}
+    claude/auto workers without one, in config order, healthy ones first. A worker whose chain can no
+    longer be renewed (chain_failing_since) moves to a healthy free chain when there is one. Workers
+    left over share the operator's ~/.claude (and `tauceti-fleet logins` says so). Reads the chains'
+    refresh markers; the caller writes the result."""
+    chains = login_slots()
+    slots = {d.name for d in chains}
+    failing = {d.name for d in chains if chain_failing_since(d) is not None}
     eligible = [s_["id"] for s_ in specs if s_["agent"] in ("claude", "auto") and s_["enabled"]] + [PERIODIC_WID]
     leases = {w: slot for w, slot in read_leases().items() if w in eligible and slot in slots}
-    free = sorted(slots - set(leases.values()))
+    healthy = sorted(slots - set(leases.values()) - failing)
+    for wid in sorted(leases):
+        if leases[wid] in failing and healthy:
+            leases[wid] = healthy.pop(0)
+    free = healthy + sorted(slots - set(leases.values()) - set(healthy))
     for wid in eligible:
         if wid not in leases and free:
             leases[wid] = free.pop(0)
@@ -755,6 +763,80 @@ def _claude_file_expiry(path: Path) -> tuple[float, bool] | None:
         return None
 
 
+# A refresh token the server has rejected never comes back, so a chain whose token expired and whose
+# renewal has failed since is unusable until the owner signs in again. The refresh markers that
+# `oauth.refresh_if_due` keeps beside the credential, whoever renews it (the worker, or the fleet for a
+# free chain), say so without reading a token: last-attempt is stamped before every exchange and
+# last-success after a good one. The grace keeps one transient failure off the attention list.
+CHAIN_FAILING_GRACE = 20 * 60
+
+
+def _marker_at(path: Path) -> float | None:
+    try:
+        return float(json.loads(path.read_text())["at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def chain_failing_since(d: Path, expiry: float | None = None) -> float | None:
+    """When this chain's current access token expired, if a renewal was tried after that, none has
+    succeeded since and nobody has signed in since; else None. A token that merely expired while no
+    worker needed it is not failing: it renews at its next use."""
+    cred = d / ".credentials.json"
+    attempt = _marker_at(d / ".credentials.json.refresh.last-attempt")
+    success = _marker_at(d / ".credentials.json.refresh.last-success")
+    if attempt is None or (success is not None and success >= attempt):
+        return None
+    try:
+        if cred.stat().st_mtime > attempt:
+            return None
+    except OSError:
+        return None
+    if expiry is None:
+        got = _claude_file_expiry(cred)
+        if got is None:
+            return None
+        expiry = got[0]
+    if attempt < expiry or time.time() < expiry + CHAIN_FAILING_GRACE:
+        return None
+    return expiry
+
+
+def login_incidents() -> None:
+    """A `login` item in the attention list for each chain whose renewal is failing (it needs a sign-in),
+    removed once the chain renews or is signed in again. Acknowledging one keeps it off the list until
+    the credential changes."""
+    if API or IS_MAC:
+        return
+    holder = {slot: w for w, slot in read_leases().items()}
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for d in login_slots():
+        path = INCIDENTS / f"login-{d.name}.json"
+        since = chain_failing_since(d)
+        if since is None:
+            path.unlink(missing_ok=True)
+            continue
+        try:
+            version = int((d / ".credentials.json").stat().st_mtime)
+        except OSError:
+            continue
+        acked = ACKED / path.name
+        if acked.is_file() and read_json(acked).get("credential_at") == version:
+            continue
+        prev = read_json(path) if path.is_file() else {}
+        expired = time.strftime("%m-%d %H:%MZ", time.gmtime(since))
+        rec = {"kind": "login", "key": d.name, "worker": holder.get(d.name, "free"),
+               "first_at": prev.get("first_at") or now, "last_at": now, "credential_at": version,
+               "detail": f"login chain {d.name} can no longer be renewed: its token expired {expired} and every "
+                         f"renewal since has failed. Sign in again as {_pwd.getpwuid(os.getuid()).pw_name}: "
+                         f"CLAUDE_CONFIG_DIR={d} claude auth login"}
+        try:
+            INCIDENTS.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(rec, indent=1) + "\n")
+        except OSError:
+            pass
+
+
 def _login_pool_line() -> tuple[str, str] | None:
     """One line on the login pool: chains, leases, nearest expiry, and any chain that can no longer be
     renewed (a sign-in is the only fix for that). None when there is no pool (macOS, or none made)."""
@@ -767,6 +849,8 @@ def _login_pool_line() -> tuple[str, str] | None:
         got = _claude_file_expiry(d / ".credentials.json")
         if got is None or not got[1]:
             dead.append(d.name)
+        elif chain_failing_since(d, got[0]) is not None:
+            dead.append(f"{d.name} (renewal failing)")
         elif soonest is None or got[0] < soonest:
             soonest = got[0]
     text = f"logins: {len(slots)} chains, {len(set(leases.values()))} leased"
@@ -2992,6 +3076,7 @@ def cmd_watch(a: argparse.Namespace) -> int:
                     freshened = time.time()
                     try:
                         freshen_logins(quiet=True)
+                        login_incidents()
                         ensure_periodic(quiet=True)
                         ensure_auth_proxy_alive(quiet=True)
                     except Exception as exc:
@@ -3281,6 +3366,7 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
             print(line)
         if not dry:
             freshen_logins(quiet)
+            login_incidents()
         ensure_pool_warm(quiet, start=not getattr(a, "dry_run", False))
         ensure_cache_proxy_alive(quiet, start=not getattr(a, "dry_run", False))
         ensure_auth_proxy_alive(quiet, start=not getattr(a, "dry_run", False))
@@ -3739,6 +3825,9 @@ def cmd_logins(a: argparse.Namespace) -> int:
             state = "UNREADABLE"
         elif not got[1]:
             state = "NOT renewable (no refresh token) — sign in again"
+        elif (since := chain_failing_since(d, got[0])) is not None:
+            state = (f"NOT renewable (token expired {time.strftime('%m-%d %H:%MZ', time.gmtime(since))}, every renewal "
+                     f"since failed) — sign in again: CLAUDE_CONFIG_DIR={d} claude auth login")
         else:
             left = (got[0] - time.time()) / 3600
             state = f"token {'expired, renews at next use' if left < 0 else f'ok, {left:.1f} h left'}"

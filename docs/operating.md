@@ -68,7 +68,10 @@ Reshaping the fleet never asks for a new sign-in.
 Nobody has to renew anything. A leased chain is renewed by its worker before each launch, early
 enough to outlast the round, including while the worker waits out a usage limit. A free chain is
 renewed by the tool, from every reconcile and every half hour from the live view. The only case that
-needs you is a chain that lost its refresh token; the live view's `credentials` row names it.
+needs you is a chain that can no longer be renewed: it lost its refresh token, or the server rejects
+it (its token expired and every renewal since has failed). The live view's `credentials` row names
+it, the attention list has a `login` item with the sign-in command, and the reconcile moves its
+worker to a healthy free chain if there is one.
 
 ```bash
 tauceti-fleet logins

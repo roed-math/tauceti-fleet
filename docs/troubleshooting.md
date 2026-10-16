@@ -47,6 +47,11 @@ cannot.
 
 ## Rounds fail or hang
 
+**A worker sits in `waiting-quota` with "claude usage HTTP 401", and its log repeats "refresh
+failed (OAuth endpoint returned HTTP 400)".** Its chain's refresh token is rejected, so waiting will
+not help. The attention list's `login` item for that chain gives the `claude auth login` line; the
+reconcile has moved the worker to a free chain if one was healthy.
+
 **A Claude round fails with "401 OAuth access token has been revoked", just after another worker
 logged "access token renewed".** The two workers share a login chain, and renewing a Claude token
 revokes the old one. `tauceti-fleet logins` lists the chains still to sign in; every Claude-capable
