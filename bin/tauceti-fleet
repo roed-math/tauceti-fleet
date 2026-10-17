@@ -498,9 +498,11 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
     def add(wid: str, agent: str, only: str, **extra):
         # Authors stay in the config but disabled while the worker's backpressure rule (>=
         # MAX_OPEN_PRS_BACKPRESSURE open PRs of mine) would make them decline every round anyway;
-        # keeping the definition keeps the checkout.
-        enabled = authors_on if only == "roadmap" else True
-        if only == "roadmap":
+        # keeping the definition keeps the checkout. A flexible worker (up.flex) stays on: it still
+        # has the account's PRs to fix.
+        stages = only.split(",")
+        enabled = authors_on if stages == ["roadmap"] else True
+        if "roadmap" in stages:
             author_rank[0] += 1
             if authors_active is not None and author_rank[0] > authors_active:
                 enabled = False
@@ -565,13 +567,14 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
     listed = {"roadmap_targets": str(TARGETS)} if TARGETS is not None else {}
     # API billing runs Claude only: every worker is pinned to it and there are no Codex authors.
     auto = "claude" if API else "auto"
+    authoring, fixing = (FLEX_STAGES, FLEX_STAGES) if FLEX else ("roadmap", FIX_STAGES)
     for i in range(1, a.claude + 1):
-        add(wid("c", i), "claude", "roadmap", **listed,
+        add(wid("c", i), "claude", authoring, **listed,
             author_model=a.claude_model, author_effort=a.claude_effort)
     # The "Codex" authors run `auto` (Codex first, Claude when Codex's window is spent) so that share of
     # authoring never parks with its subscription; the Claude authors above stay pinned.
     for i in range(1, (0 if API else a.codex) + 1):
-        add(wid("x", i), "auto", "roadmap", **listed)
+        add(wid("x", i), "auto", authoring, **listed)
     # Fixers alternate: odd ones pinned to Claude, even ones `auto` (the worker's pacer prefers Codex
     # and falls back to Claude when Codex's window is spent), so the Codex share of fixing survives
     # its subscription running dry instead of parking. Reviewers run `auto` for the same reason. An
@@ -579,10 +582,10 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
     for i in range(1, a.fixers + 1):
         # Fixers read the target list too: they take the PRs serving it first (worker c31c588).
         if i % 2 == 1 or API:
-            add(wid("fix", i), "claude", "fix,fix-ci,rebase", **listed,
+            add(wid("fix", i), "claude", fixing, **listed,
                 author_model=a.claude_model, author_effort=a.claude_effort)
         else:
-            add(wid("fix", i), "auto", "fix,fix-ci,rebase", **listed)
+            add(wid("fix", i), "auto", fixing, **listed)
     for i in range(1, a.reviewers + 1):
         # Reviewers read the list too: among the account's own PRs they take those serving it first
         # (worker 51c9754); the balance between our PRs and other people's is unchanged.
@@ -607,6 +610,10 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
 # the account's open PRs leave no room outside it, or authoring is blocked outright.
 _AUTHOR_IDLE_RE = re.compile(r"nothing to author|not authoring outside the list|declined by an author|"
                              r"no open targets|claimed by another worker", re.I)
+# A flexible worker reaches authoring only once it found nothing to fix, so its round ending at the
+# open-PR cap is idle too. An author's is not: it is disabled at the cap, and its status keeps that
+# reason after the reconcile turns it back on.
+_FLEX_IDLE_RE = re.compile(_AUTHOR_IDLE_RE.pattern + r"|backpressure, not authoring", re.I)
 
 
 def authors_idle(statuses: dict[str, dict]) -> bool:
@@ -614,7 +621,8 @@ def authors_idle(statuses: dict[str, dict]) -> bool:
     Authors the config has turned off are not asked (their status files still describe their last
     loop, "loop terminated"): while idle only the probe runs, and its next real round (a target opens
     up, a merge makes room) ends idleness at the following reconcile. A probe between rounds —
-    surveying, backing off — is still idle; only a round in progress says otherwise."""
+    surveying, backing off — is still idle; only a round in progress says otherwise. Under up.flex the
+    fixers are asked as well, since every one of them could also author."""
     cfg = CONFIG.read_text() if CONFIG.is_file() else ""
     off = set(re.findall(r'^id\s*=\s*"([^"]+)"\s*\nenabled\s*=\s*false', cfg, re.M))
     # The round-done hook runs before the loop records the round it just finished, so the hook's own
@@ -625,10 +633,12 @@ def authors_idle(statuses: dict[str, dict]) -> bool:
     def idle(wid: str, st: dict) -> bool:
         if wid == hook_wid:
             return hook_rc == "75"  # its recorded reason is the previous round's; the exit code is this one's
-        return st.get("state") != "running" and bool(_AUTHOR_IDLE_RE.search(str(st.get("failure_reason") or "")))
+        pattern = _FLEX_IDLE_RE if FLEX else _AUTHOR_IDLE_RE
+        return st.get("state") != "running" and bool(pattern.search(str(st.get("failure_reason") or "")))
 
+    kinds = "(?:[cx]|fix)" if FLEX else "[cx]"
     authors = [(wid, st) for wid, st in statuses.items()
-               if re.fullmatch(rf"{re.escape(NAME)}-[cx]\d+", wid) and wid not in off]
+               if re.fullmatch(rf"{re.escape(NAME)}-{kinds}\d+", wid) and wid not in off]
     return bool(authors) and all(idle(wid, st) for wid, st in authors)
 
 
@@ -2412,6 +2422,8 @@ def view_data(progress: Progress) -> dict:
     newest = max((s_ for s_ in statuses.values() if isinstance(s_.get("mine_open"), int)),
                  key=lambda s_: s_.get("survey_at") or 0, default={})
     off_reason = "backpressure" if (newest.get("mine_open") or 0) >= MAX_OPEN_PRS_BACKPRESSURE else "authors idle"
+    if FLEX:
+        off_reason = "idle"  # a flexible worker is never off for backpressure: it would still fix
     if draining():
         off_reason = "drained"
     for w in ids:
@@ -3133,6 +3145,8 @@ def cmd_up(a: argparse.Namespace) -> int:
         a.codex = 0 if a.codex is None else a.codex
         a.fixers, a.reviewers = 1, 1
         a.sandbox = a.sandbox or "bubble"
+    if FLEX:
+        a.fixers = a.max_fixers  # the reconcile runs every flexible slot, so pre-seed all their checkouts
     a.claude = 2 if a.claude is None else a.claude
     a.codex = 2 if a.codex is None else a.codex
     a.sandbox = a.sandbox or "host"
@@ -3283,6 +3297,12 @@ MAX_REVIEWERS = _setting_int("up", "max_reviewers") or 2
 # The fix backlog that brings a second fixer, and how many more PRs bring each one after it.
 FIXER_BACKLOG_START = _setting_int("up", "fixer_backlog_start") or 6
 FIXER_BACKLOG_STEP = max(1, _setting_int("up", "fixer_backlog_step") or 2)
+FIX_STAGES = "fix,fix-ci,rebase"
+# up.flex: every author and fixer slot runs both, and the worker's cascade chooses each round: a PR of
+# the account's that needs work if there is one it can claim (target-list PRs first), else authoring.
+# There are then up.claude + up.codex + up.max_fixers such workers, and the backlog sets no count.
+FLEX = _setting_bool("up", "flex")
+FLEX_STAGES = FIX_STAGES + ",roadmap"
 
 
 def fixers_for(mine_open: int, backlog: int, max_fixers: int) -> int:
@@ -3335,8 +3355,8 @@ def fleet_backlog(max_age_s: int = 7200) -> tuple[int | None, int | None, str]:
 def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
     """Set the fleet's shape from the backlog: authors enabled only when authoring can happen
     (mine_open < MAX_OPEN_PRS_BACKPRESSURE), fixers by fixers_for (max_fixers while authoring is
-    impossible, else by backlog). Under a lock, idempotent: the config is rewritten and applied only when the
-    shape changed. Counts come
+    impossible, else by backlog); under up.flex every slot stays on unless all are idle. Under a lock,
+    idempotent: the config is rewritten and applied only when the shape changed. Counts come
     from the workers' own status files; a GitHub read happens only when those are stale."""
     import fcntl
 
@@ -3352,16 +3372,28 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
             return 0
         want_fix = fixers_for(mine_open, backlog, a.max_fixers)
         authors_on = mine_open < MAX_OPEN_PRS_BACKPRESSURE
-        idle = authors_on and authors_idle(worker_status())
-        a.authors_enabled = authors_on
-        # Authors with nothing to author (the list offers nothing and our open PRs leave no room outside
-        # it): keep one as a probe and turn the rest into fixing capacity for our own waiting PRs, which
-        # are what would open the list up again (owner's ruling, 2026-09-27).
-        a.authors_active = 1 if idle else None
-        if idle:
-            want_fix = max(want_fix, min(a.max_fixers, backlog))
-        a.fixers = want_fix
-        active = want_fix + ((1 if idle else a.claude + a.codex) if authors_on else 0)
+        if FLEX:
+            # Every slot fixes first and authors otherwise, so the backlog and the open-PR cap set no
+            # count. Once every enabled slot's round found neither, the first stays on as the probe.
+            idle = authors_idle(worker_status())
+            a.authors_enabled, a.authors_active = True, (1 if idle else None)
+            a.fixers = a.max_fixers
+            # Reviewers follow the fleet's size, which an idle spell does not change.
+            active = a.claude + a.codex + a.max_fixers
+            shape = f"flex {'idle: 1 probe' if idle else f'{active} on'} (fix first, else author)"
+        else:
+            idle = authors_on and authors_idle(worker_status())
+            a.authors_enabled = authors_on
+            # Authors with nothing to author (the list offers nothing and our open PRs leave no room
+            # outside it): keep one as a probe and turn the rest into fixing capacity for our own
+            # waiting PRs, which are what would open the list up again (owner's ruling, 2026-09-27).
+            a.authors_active = 1 if idle else None
+            if idle:
+                want_fix = max(want_fix, min(a.max_fixers, backlog))
+            a.fixers = want_fix
+            active = want_fix + ((1 if idle else a.claude + a.codex) if authors_on else 0)
+            shape = (f"authors {('idle: 1 probe' if idle else 'on') if authors_on else f'off (backpressure ≥ {MAX_OPEN_PRS_BACKPRESSURE})'}, "
+                     f"fixers {want_fix}")
         a.reviewers = reviewers_for(active, getattr(a, "max_reviewers", MAX_REVIEWERS))
         dry = bool(getattr(a, "dry_run", False))
         specs = lease_logins(fleet_specs(a), persist=not dry)
@@ -3372,9 +3404,7 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
                 print(note)
         verdict = ("would change" if dry else "updated") if changed else "unchanged"
         line = (f"reconcile: mine_open={mine_open} needs-fix={backlog} [{source}] → "
-                f"authors {('idle: 1 probe' if idle else 'on') if authors_on else f'off (backpressure ≥ {MAX_OPEN_PRS_BACKPRESSURE})'}, "
-                f"fixers {want_fix}, reviewers {a.reviewers}; "
-                f"config {verdict}")
+                f"{shape}, reviewers {a.reviewers}; config {verdict}")
         if deferred:
             line += f"; deferred (mid-round): {', '.join(deferred)}"
         if not quiet or changed:
@@ -4261,6 +4291,9 @@ sandbox = "bubble"
 # max_reviewers = 2
 # fixer_backlog_start = 6
 # fixer_backlog_step = 2
+# true: the author and fixer slots (claude + codex + max_fixers) all fix and author, choosing each
+# round: one of the account's PRs that needs work if any, else a new PR.
+# flex = false
 
 [claude]
 # "subscription": the workers sign in through the login pool (`tauceti-fleet logins`) and pace by the

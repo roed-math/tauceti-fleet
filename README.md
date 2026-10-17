@@ -48,7 +48,9 @@ only fleet-specific files here are the target lists.
   CI and rebase the fleet's own PRs. **Reviewers** review other people's PRs, which is what the fleet
   owes the project for the reviews its PRs get.
 - After every round the worker calls `tauceti-fleet reconcile`, which **reshapes the fleet** from the
-  backlog: more fixers when many PRs need work, no authors while too many PRs are open.
+  backlog: more fixers when many PRs need work, no authors while too many PRs are open. With
+  `up.flex = true` there are no fixed roles: each author and fixer chooses at the start of every
+  round, fixing while any of the fleet's PRs needs work and authoring otherwise.
 - Every GitHub request, from the workers and from the agents inside their rounds, passes **the gate**:
   rolling-hour budgets for reads and writes, and a halt on any identity but the fleet's account.
 - Workers **claim** what they work on in a repository shared by every fleet in the project
@@ -104,6 +106,7 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `up.claude`, `up.codex` | Claude authors, and `auto` authors (Codex first, then Claude) | 2 and 2; 1 and 0 in pilot mode |
 | `up.max_fixers`, `up.max_reviewers` | the most fixers and reviewers the reconcile runs as the backlog grows; the reconcile applies a change, and `logins` asks for a chain for each | 3 and 2 |
 | `up.fixer_backlog_start`, `up.fixer_backlog_step` | the fix backlog that brings a second fixer, and how many more PRs bring each one after it, up to `up.max_fixers`; the reconcile applies a change | 6 and 2 |
+| `up.flex` | `true`: no fixed roles. Every author and fixer slot (`up.claude` + `up.codex` + `up.max_fixers`) fixes and authors, choosing each round: a PR of the account's that needs work if there is one, else a new PR (docs/operating.md); the reconcile applies a change | `false` |
 | `gate.mutations_per_hour`, `gate.reads_per_hour` | fleet-wide GitHub budgets, rolling hour; the reconcile after each round applies a change | 40 and 600 |
 | `authoring.max_open_prs` | authors stop while the account has this many open PRs in scope; the reconcile applies a change | the worker's 8 |
 | `authoring.fallback_max_open` | with nothing on the target list, authors work outside it only while at most this many PRs are open; the reconcile applies a change. `"auto"` paces it by the weekly Claude budget (docs/operating.md) | the worker's 6 |

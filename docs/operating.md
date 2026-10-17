@@ -29,6 +29,20 @@ reshapes the fleet:
 An `auto` worker uses Codex while Codex's usage window has room and Claude otherwise, so that half
 of the fleet never parks when one subscription runs dry.
 
+**Flexible workers (`up.flex = true`).** The fixed roles above suit a steady trickle of review. When
+other fleets review a batch of the account's PRs at once, the backlog outgrows `up.max_fixers` while
+the authors keep opening PRs. With `up.flex` every author and fixer slot (`up.claude` + `up.codex` +
+`up.max_fixers` of them, same ids, same agents) runs fix, fix-ci, rebase and roadmap, and the worker
+chooses at the start of each round. Its cascade takes the first of: a target-list PR that needs
+work, any other PR of the account's that needs work, a new PR. A PR another worker holds is skipped
+through the usual claims, so the slots spread over the backlog, and authoring resumes as soon as
+fewer PRs need work than there are slots to take them. The reconcile turns no slot off for the
+backlog or for the open-PR cap (at the cap a slot still fixes, and the worker itself refuses to
+author). When every enabled slot's last round found nothing to fix and nothing to author, all but
+the first are turned off and it probes, as idle authors do. Reviewers stay at `up.max_reviewers`.
+These rounds read every open PR's review state, as fixers' rounds do, where an author-only round
+reads just the PR list.
+
 **Config changes wait for the round to end.** The manager restarts a worker whenever its entry in
 `workers.toml` changes, which mid-round would throw away a build. The reconcile keeps a mid-round
 worker's old entry and switches it at a later reconcile that finds it between rounds; the reconcile
