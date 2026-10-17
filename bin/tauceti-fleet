@@ -4334,6 +4334,10 @@ def cmd_init(a: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    # The budget's own arguments are all options, which argparse's REMAINDER refuses after a subcommand
+    # ("unrecognized arguments: --grant"), so they go through untouched.
+    if sys.argv[1:2] == ["budget"]:
+        return tauceti("budget", *sys.argv[2:]).returncode
     ap = argparse.ArgumentParser(prog=PROG, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     it = sub.add_parser("init", help="write the fleet's settings (fleet.toml in the fleet home)")
@@ -4393,8 +4397,7 @@ def main() -> int:
     gt.set_defaults(fn=lambda a: tauceti("gate", *a.args).returncode)
     bg = sub.add_parser("budget", help="pass-through to `tauceti budget ...`, the API workers' local grant ledger "
                         "(--grant USD, --grant-rate USD_PER_HOUR, --set-grant, --log, --json)")
-    bg.add_argument("args", nargs=argparse.REMAINDER)
-    bg.set_defaults(fn=lambda a: tauceti("budget", *a.args).returncode)
+    bg.add_argument("args", nargs=argparse.REMAINDER)  # main() passes the command line on before parsing
     rv = sub.add_parser("review", help="review one PR now, as the periodic worker (for a PR that should not wait its turn)")
     rv.add_argument("pr", type=int)
     rv.add_argument("--agent", choices=("codex", "claude", "auto"), default="codex",
