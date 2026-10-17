@@ -67,6 +67,14 @@ check("…with the API billing fields", all(s.get("claude_billing") == "api" and
 check("…and no pace, OAuth refresh, login chain or target list",
       not any("pace" in s or "auto_refresh" in s or "roadmap_targets" in s or "CLAUDE_CONFIG_DIR" in s["env"]
               or any(k.startswith("TAUCETI_PACE") for k in s["env"]) for s in specs))
+api.MAX_OPEN_PRS_SETTING = 100
+api.worker_knows = lambda field: field == "max_open_prs"
+check("a worker that takes max_open_prs gets the setting as that field",
+      all(s.get("max_open_prs") == 100 for s in api.fleet_specs(shape())))
+api.worker_knows = lambda field: False
+check("…and an older one only the environment", not any("max_open_prs" in s for s in api.fleet_specs(shape())))
+api.MAX_OPEN_PRS_SETTING = None
+check("an integer field is written as one", "\nmax_open_prs = 100\n" in api.render_block({"id": "x", "max_open_prs": 100}))
 toml = api.render_toml(specs)
 check("the config says budget = true, unquoted", "\nbudget = true\n" in toml and 'claude_billing = "api"' in toml)
 api._gh_status = lambda: ("gh: acct", "green")  # `gh auth status` would ask GitHub

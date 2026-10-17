@@ -472,6 +472,15 @@ def freshen_logins(quiet: bool = True) -> list[str]:
     return notes
 
 
+def worker_knows(field: str) -> bool:
+    """Does the worker checkout accept this workers.toml field? An older one refuses unknown fields."""
+    try:
+        from tauceti_worker import worker_manager
+    except Exception:  # noqa: BLE001 - no importable worker: write only the fields every version has
+        return False
+    return field in getattr(worker_manager, "_WORKER_KEYS", ())
+
+
 def wid(kind: str, i: int | None = None) -> str:
     """A worker id: `<fleet name>-<kind><i>` (c = Claude author, x = auto author, fix, rev, periodic).
     The name keeps two fleets on one host apart: container names, checkouts and state all key on it."""
@@ -498,6 +507,10 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
         spec = {"id": wid, "enabled": enabled, "agent": agent, "only": only, "sandbox": extra.pop("sandbox", a.sandbox)}
         if a.pace and not API:
             spec["pace"] = a.pace
+        # A worker that has the field passes `--max-open-prs` to every round, its own default of 8 unless the
+        # config names one, and that overrides TAUCETI_MAX_OPEN_PRS below (gqa's first start, 2026-10-16).
+        if MAX_OPEN_PRS_SETTING and worker_knows("max_open_prs"):
+            spec["max_open_prs"] = MAX_OPEN_PRS_SETTING
         spec.update({k: v for k, v in extra.items() if v})
         # Credentials: the operator's Codex file, and on Linux the Claude credential file, are rotated
         # by the worker under the host flock (auto_refresh); on macOS an expiring Claude token is renewed
@@ -639,6 +652,8 @@ def render_block(s: dict) -> str:
             continue
         if isinstance(v, bool):
             out.append(f"{k} = {'true' if v else 'false'}")
+        elif isinstance(v, int):
+            out.append(f"{k} = {v}")
         elif k == "only":
             out.append(f"{k} = [" + ", ".join(toml_str(x) for x in str(v).split(",")) + "]")
         else:
