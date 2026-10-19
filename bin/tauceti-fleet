@@ -133,6 +133,12 @@ DEFAULT_CLAUDE_EFFORT = setting("models", "claude_effort", "high")
 # rather than on subscription logins, so there is no login pool, no usage pacing and no Codex. The key
 # stays in a private file the workers read; `budget` admits each session against the local grant ledger
 # (`tauceti-fleet budget`), which nothing else limits.
+# `up.mathlib_store`: work rounds mount one read-only Mathlib build per revision from the fleet home instead
+# of unpacking Mathlib into each container (the worker's mathlib_store); warm-pool keeps it to the pinned
+# revisions. `up.persistent_build`: each worker keeps its TauCeti build between its rounds.
+MATHLIB_STORE = FLEET_HOME / "mathlib-store" if _setting_bool("up", "mathlib_store") else None
+PERSISTENT_BUILD = _setting_bool("up", "persistent_build")
+STORE_GRACE_S = 6 * 3600  # a revision unpinned this long is pruned; a round started before may still use it
 API = setting("claude", "billing", "subscription").strip().lower() == "api"
 API_KEY_FILE = _expand(setting("claude", "api_key_file", "~/.config/tauceti/anthropic.key"))
 API_BUDGET = setting("claude", "budget", "true").strip().lower() not in ("false", "0", "no")
@@ -553,6 +559,8 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             **({"TAUCETI_FALLBACK_AUTO": "1", "TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_AUTO_MIN)}
                if FALLBACK_AUTO else {}),
             **LOOKAHEAD_ENV,
+            **({"TAUCETI_MATHLIB_STORE": str(MATHLIB_STORE)} if MATHLIB_STORE else {}),
+            **({"TAUCETI_PERSISTENT_BUILD": "1"} if PERSISTENT_BUILD else {}),
             **({} if API else provider_paces()),
             # Pilot mode interacts less on GitHub: no reactions, no automatic stuck-review issues.
             "TAUCETI_REACTIONS": "0" if a.pilot else "1",
@@ -3798,6 +3806,13 @@ def ensure_auth_proxy_alive(quiet: bool, *, start: bool = True) -> None:
     print(f"{line} → {result}")
 
 
+def _mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def ensure_pool_warm(quiet: bool, *, start: bool = True) -> None:
     """Start a background warm-pool for any needed Mathlib revision the pool lacks, unless one is
     already running. Called from reconcile (after every round) and from up. Best effort: a failure
@@ -3809,7 +3824,19 @@ def ensure_pool_warm(quiet: bool, *, start: bool = True) -> None:
             print(f"pool check skipped: {exc}")
         return
     missing = [rev for rev in needed if rev not in warmed_revs()]
-    if not missing:
+    if MATHLIB_STORE is not None:
+        from tauceti_worker import mathlib_store
+
+        for rev in needed:
+            if mathlib_store.ready(MATHLIB_STORE, rev):
+                os.utime(MATHLIB_STORE / rev / mathlib_store.READY)  # still pinned: keeps it from pruning
+            elif rev not in missing:
+                missing.append(rev)
+        stale = [d.name for d in MATHLIB_STORE.iterdir() if d.is_dir() and d.name not in needed
+                 and time.time() - _mtime(d / mathlib_store.READY) > STORE_GRACE_S] if MATHLIB_STORE.is_dir() else []
+    else:
+        stale = []
+    if not missing and not stale:
         return
     if not start:
         print(f"pool: {len(missing)} Mathlib revision(s) missing ({', '.join(r[:8] for r in missing)}); "
@@ -3828,10 +3855,12 @@ def ensure_pool_warm(quiet: bool, *, start: bool = True) -> None:
         lock.close()
     log = FLEET_HOME / "warm-pool.log"
     with open(log, "ab") as lf:
-        subprocess.Popen([str(Path(__file__).resolve()), "warm-pool", "--revs", *missing], stdout=lf, stderr=lf,
+        prune = ["--prune", *stale] if stale else []
+        subprocess.Popen([str(Path(__file__).resolve()), "warm-pool", "--revs", *missing, *prune], stdout=lf, stderr=lf,
                          stdin=subprocess.DEVNULL, start_new_session=True, env={**os.environ, "TAUCETI_FLEET_HOME": str(FLEET_HOME)})
     print(f"pool: warming {len(missing)} missing Mathlib revision(s) in the background "
-          f"({', '.join(r[:8] + ' ' + ','.join(needed[r][:2]) for r in missing)}) → {log}")
+          f"({', '.join(r[:8] + ' ' + ','.join(needed[r][:2]) for r in missing)})"
+          + (f", pruning {len(stale)} unpinned store revision(s)" if stale else "") + f" → {log}")
 
 
 def cmd_logins(a: argparse.Namespace) -> int:
@@ -3933,7 +3962,7 @@ def cmd_warm_pool(a: argparse.Namespace) -> int:
 
     pool = pool_dir()
     pool.mkdir(parents=True, exist_ok=True)
-    if a.revs:
+    if a.revs is not None:  # the reconcile's background run: these revisions, or none when it only prunes
         needed = {r: ["--revs"] for r in a.revs}
     else:
         needed = needed_revs(max_age_s=0)
@@ -3955,12 +3984,22 @@ def cmd_warm_pool(a: argparse.Namespace) -> int:
         print("cloning Mathlib (blobless, once) …", flush=True)
         subprocess.run(["git", "clone", "-q", "--filter=blob:none", "https://github.com/leanprover-community/mathlib4.git", str(ml)], check=True)
     (pool / ".warmed").mkdir(exist_ok=True)
+    if MATHLIB_STORE is not None:
+        from tauceti_worker import mathlib_store
     for rev, who in needed.items():
-        if rev in warmed_revs() and not a.force:
+        in_store = MATHLIB_STORE is None or mathlib_store.ready(MATHLIB_STORE, rev)
+        if rev in warmed_revs() and in_store and not a.force:
             print(f"== {rev[:12]} already warm", flush=True)
             continue
         print(f"== {rev[:12]} ({', '.join(who[:3])}{' …' if len(who) > 3 else ''}) {time.strftime('%H:%M:%S')}", flush=True)
         subprocess.run(["git", "-C", str(ml), "fetch", "-q", "origin", rev], check=False)
+        if MATHLIB_STORE is not None:
+            # The store's own unpack fills the pool too, so the shared checkout below is not needed.
+            t0 = time.time()
+            if mathlib_store.build(MATHLIB_STORE, rev, ml, pool, log=lambda m: print(f"   {m}", flush=True)):
+                (pool / ".warmed" / rev).write_text(time.strftime("%Y-%m-%dT%H:%M:%S"))
+            print(f"   ({time.time() - t0:.0f}s)", flush=True)
+            continue
         subprocess.run(["git", "-C", str(ml), "checkout", "-q", "--force", rev], check=True)
         t0 = time.time()
         r = subprocess.run(["lake", "exe", "cache", "get"], cwd=ml, env={**os.environ, "MATHLIB_CACHE_DIR": str(pool)},
@@ -3969,6 +4008,11 @@ def cmd_warm_pool(a: argparse.Namespace) -> int:
         print(f"   {tail[:110]}  ({time.time() - t0:.0f}s, rc={r.returncode})", flush=True)
         if r.returncode == 0:
             (pool / ".warmed" / rev).write_text(time.strftime("%Y-%m-%dT%H:%M:%S"))
+    if MATHLIB_STORE is not None:
+        for rev in a.prune or []:
+            if rev not in needed:
+                mathlib_store.remove(MATHLIB_STORE, rev, ml)
+                print(f"== {rev[:12]} removed from the store (unpinned for {STORE_GRACE_S // 3600} h)", flush=True)
     print(f"pool: {pool}  warm: {len(warmed_revs())} revision(s)")
     return 0
 
@@ -4517,6 +4561,7 @@ def main() -> int:
     wp.add_argument("--list-only", action="store_true", help="only list the revisions; do not download")
     wp.add_argument("--revs", nargs="*", help="warm exactly these Mathlib revisions (used by the automatic background run)")
     wp.add_argument("--force", action="store_true", help="re-fetch even revisions marked warm")
+    wp.add_argument("--prune", nargs="*", help="store revisions to remove (the reconcile passes the unpinned ones)")
     wp.set_defaults(fn=cmd_warm_pool)
     sc = sub.add_parser("schedule", help="the weekly active slots (schedule.active): show, tick, or install the timer")
     sc.add_argument("--tick", action="store_true", help="act if the clock crossed a slot boundary since the last tick")
