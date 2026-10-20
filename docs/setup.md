@@ -361,6 +361,20 @@ The directory goes beside the shared target list, in the group directory made ab
 could not replace what this one writes there. Run each fleet's `up` (or `reconcile`) once after
 setting it, so the workers get it.
 
+### A login shared with another operator
+
+When another operator's fleet runs the same GitHub login, each fleet should tend only the PRs it
+wrote. Authors name their branches after the worker (`roadmap/<slug>-<name>-c1`), so:
+
+```toml
+[fleet]
+own_branches_only = true
+```
+
+makes rebase, fix, fix-ci and the fixer count follow only branches containing `-<name>-`, and no
+bot PRs. The open-PR count that `authoring.max_open_prs` reads stays account-wide. Reviews are
+unaffected.
+
 ## An API-billed fleet
 
 With `claude.billing = "api"` the workers run Claude on an API key rather than on subscription

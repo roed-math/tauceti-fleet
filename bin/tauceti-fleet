@@ -125,6 +125,9 @@ WORKTREE = _expand(setting("paths", "worker", "~/TauCetiWorker-v2", "TAUCETI_FLE
 ROADMAP_CHECKOUT = _expand(setting("paths", "roadmap", "~/TauCetiRoadmap", "TAUCETI_FLEET_ROADMAP"))
 _SHARED_CACHE_RAW = setting("fleet", "shared_cache", "", "TAUCETI_FLEET_SHARED_CACHE")
 SHARED_CACHE = _expand(_SHARED_CACHE_RAW) if _SHARED_CACHE_RAW else None
+# `own_branches_only = true`: the GitHub login is shared with another operator's fleet, so the workers
+# tend only the PRs on this fleet's branches, which carry a worker id `<name>-<kind><n>`.
+OWN_BRANCHES = rf"-{re.escape(NAME)}-" if NAME and _setting_bool("fleet", "own_branches_only") else ""
 # The Claude model and effort every Claude round uses unless `up --claude-model/--claude-effort` says
 # otherwise. Once written into workers.toml, reconcile keeps that choice.
 DEFAULT_CLAUDE_MODEL = setting("models", "claude", "claude-opus-5-5")
@@ -553,6 +556,7 @@ def fleet_specs(a: argparse.Namespace) -> list[dict]:
             "TAUCETI_GATE_READS_PER_HOUR": str(a.reads_per_hour),
             # Scoreboard sidecars shared with the account's other fleets, so a slot starts warm.
             **({"TAUCETI_SHARED_READ_CACHE": str(SHARED_CACHE)} if SHARED_CACHE else {}),
+            **({"TAUCETI_OWN_BRANCHES": OWN_BRANCHES} if OWN_BRANCHES else {}),
             # Authoring backpressure, only when fleet.toml overrides the worker's default.
             **({"TAUCETI_MAX_OPEN_PRS": str(MAX_OPEN_PRS_SETTING)} if MAX_OPEN_PRS_SETTING else {}),
             **({"TAUCETI_TARGETS_FALLBACK_MAX_OPEN": str(FALLBACK_MAX_OPEN_SETTING)} if FALLBACK_MAX_OPEN_SETTING else {}),

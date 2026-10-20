@@ -103,6 +103,11 @@ check("a subscription fleet keeps its `auto` workers", {"auto", "claude"} == {s[
 check("…its pace, OAuth refresh and target list",
       all(s.get("pace") and s.get("auto_refresh") and s.get("roadmap_targets") == "/nonexistent/list.md" for s in specs))
 check("…and no API fields", not any("claude_billing" in s for s in specs) and sub.api_flags() == [])
+check("…and tends every PR of its login", not any("TAUCETI_OWN_BRANCHES" in s["env"] for s in specs))
+
+shared, _ = load("shared", '[fleet]\nname = "tsh"\ngithub_login = "acct"\ntargets = "none"\nown_branches_only = true\n')
+check("own_branches_only hands every worker its fleet's branch pattern",
+      {s["env"].get("TAUCETI_OWN_BRANCHES") for s in shared.fleet_specs(shape())} == {"-tsh-"})
 
 print("\nALL OK" if not fails else f"\n{fails} FAILED")
 sys.exit(1 if fails else 0)
