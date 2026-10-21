@@ -120,6 +120,7 @@ same user, give it another home and export `TAUCETI_FLEET_HOME` for every comman
 | `progress.enabled` | the progress-report worker `<name>-prog1` (see docs/operating.md); it publishes to TauCetiRoadmap, so it is off until you turn it on | `false` |
 | `progress.repo`, `progress.ref`, `progress.strategy` | which TauCetiProgress it runs, and how it picks a roadmap | the worker's pinned upstream; `threshold` |
 | `progress.threshold`, `progress.max_open` | the N + T a roadmap must exceed, and how many of its reports may be open at once | 10, 2 |
+| `progress.skip` | roadmaps the worker never chooses, such as one whose README no report can pass `check` against; needs a TauCetiProgress build with `--skip-area` | none |
 
 A flag of `up` overrides the matching setting for that run. For one-off runs the environment
 overrides settings too: `TAUCETI_FLEET_NAME`, `TAUCETI_FLEET_TARGETS`, `TAUCETI_EXPECT_LOGIN`,

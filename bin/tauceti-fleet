@@ -1553,6 +1553,9 @@ def progress_env() -> dict[str, str]:
                        ("TAUCETI_PROGRESS_MAX_OPEN", setting("progress", "max_open"))):
         if value:
             env[var] = value
+    skip = SETTINGS.get("progress", {}).get("skip")
+    if skip:
+        env["TAUCETI_PROGRESS_SKIP"] = ",".join(skip) if isinstance(skip, list) else str(skip)
     return env
 
 
@@ -4402,6 +4405,8 @@ reads_per_hour = 600
 # strategy = "threshold"
 # threshold = 10
 # max_open = 2
+# Roadmaps it never chooses, such as one whose README no report can pass `check` against.
+# skip = ["NewtonPolygons"]
 """
 
 
