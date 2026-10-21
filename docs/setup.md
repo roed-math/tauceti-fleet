@@ -371,9 +371,8 @@ wrote. Authors name their branches after the worker (`roadmap/<slug>-<name>-c1`)
 own_branches_only = true
 ```
 
-makes rebase, fix, fix-ci and the fixer count follow only branches containing `-<name>-`, and no
-bot PRs. The open-PR count that `authoring.max_open_prs` reads stays account-wide. Reviews are
-unaffected.
+makes rebase, fix, fix-ci, the fixer count and the open-PR count that `authoring.max_open_prs`
+caps follow only branches containing `-<name>-`, and no bot PRs. Reviews are unaffected.
 
 ## An API-billed fleet
 
