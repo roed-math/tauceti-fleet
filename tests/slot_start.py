@@ -6,7 +6,8 @@
     `up` gave, keeps the first failure across the tick's retries, shows in the all-fleets strip, and
     is archived by `attention --ack schedule`;
   * `up` fast-forwards a clean `main` roadmap checkout, at most once per 10 minutes, and leaves a
-    checkout with local changes or on another branch alone.
+    checkout with local changes or on another branch alone;
+  * a target area archived under `Completed/` with nothing open is accepted, and refused if it has open items.
 Run: python3 tests/slot_start.py. Exit 0 = all hold."""
 
 import contextlib
@@ -135,6 +136,29 @@ check("a checkout with local changes is left alone", "local changes" in (tf.refr
 git("checkout", "-q", "--", "README.md", cwd=co)
 git("checkout", "-q", "-b", "draft", cwd=co)
 check("a checkout on another branch is left alone", "not main" in (tf.refresh_roadmap_checkout() or ""))
+
+# ---- target areas against the checkout ------------------------------------------------------------------------------
+# Archiving moves a roadmap to Completed/<area>/ (TauCetiRoadmap#726 did that to NumberFieldArithmetic on 2026-10-21,
+# and every scheduled `up` of a fleet whose list still named it then refused to start).
+rm = TMP / "rm"
+for d in ("TauCetiRoadmap/Live", "Completed/Done", "Completed/Unfinished"):
+    (rm / d).mkdir(parents=True)
+    (rm / d / "README.md").write_text("x\n")
+open_counts = {"Live": 3, "Done": 0, "Unfinished": 2, "Nowhere": 1}
+tf.open_items = lambda t, area: [None] * open_counts[area]
+lst = type("T", (), {"areas": ["Live", "Done"]})()
+problem, archived = tf.target_area_problems(lst, rm)
+check("an archived area with nothing open is accepted", problem == "", problem)
+check("…and reported as archived", archived == ["Done"], archived)
+lst.areas = ["Live", "Unfinished"]
+problem, _ = tf.target_area_problems(lst, rm)
+check("an archived area with open items is refused, naming the count",
+      "Unfinished (2 open)" in problem and "Completed" in problem, problem)
+lst.areas = ["Live", "Nowhere"]
+problem, _ = tf.target_area_problems(lst, rm)
+check("an area in neither place is still refused", "'Nowhere'" in problem and "not roadmap directories" in problem, problem)
+lst.areas = ["Bad Name"]
+check("a malformed area name is refused", "not roadmap directories" in tf.target_area_problems(lst, rm)[0])
 
 print("ALL OK" if not fails else f"{fails} FAILED")
 sys.exit(1 if fails else 0)

@@ -2055,6 +2055,37 @@ def shared_cache_problem() -> str:
     return ""
 
 
+def target_area_problems(t, checkout: Path) -> tuple[str, list[str]]:
+    """(why `up` must refuse the target list, areas archived with nothing open).
+
+    An area is fine when `TauCetiRoadmap/<area>/README.md` exists. Archiving a roadmap moves it to
+    `Completed/<area>/`, usually with every list item for it already ticked (the list's `for:
+    archiving …` areas exist to get it there); such a section stays in the list as a record and is
+    accepted. An archived area that still has open items, or a name found in neither place, is a list
+    a worker would author against a missing roadmap, so `up` refuses it."""
+    root = checkout / "TauCetiRoadmap"
+    missing, archived_open, archived = [], [], []
+    for area in t.areas:
+        if re.fullmatch(r"[A-Za-z0-9_-]+", area) and (root / area / "README.md").is_file():
+            continue
+        if re.fullmatch(r"[A-Za-z0-9_-]+", area) and (checkout / "Completed" / area / "README.md").is_file():
+            n = len(open_items(t, area))
+            (archived_open if n else archived).append(f"{area} ({n} open)" if n else area)
+            continue
+        missing.append(repr(area[:40]))
+    bits = []
+    if missing:
+        bits.append("target file names areas that are not roadmap directories under " + str(root) + ": "
+                    + ", ".join(missing) + " — a worker would author against a roadmap that does not exist; "
+                    f"if the roadmap merged recently, `git -C {checkout} pull` first; otherwise move the area under "
+                    "the Gaps section until its roadmap PR merges")
+    if archived_open:
+        bits.append("target file has open items in roadmaps archived under " + str(checkout / "Completed") + ": "
+                    + ", ".join(archived_open) + " — tick the items the archive PR discharged, or move the rest "
+                    "under the Gaps section")
+    return "; ".join(bits), archived
+
+
 def refresh_roadmap_checkout() -> str | None:
     """Fast-forward the TauCetiRoadmap checkout when it is a clean `main`, so a roadmap merged since the
     last `up` is there for the area check below and for the agents. Nothing else updates it: claudeW's
@@ -3183,12 +3214,11 @@ def cmd_up(a: argparse.Namespace) -> int:
         roadmap_root = ROADMAP_CHECKOUT / "TauCetiRoadmap"
         if not roadmap_root.is_dir():
             die(f"no TauCetiRoadmap checkout at {ROADMAP_CHECKOUT} to check the target areas against (paths.roadmap in fleet.toml)")
-        bad = [a for a in t.areas if not re.fullmatch(r"[A-Za-z0-9_-]+", a) or not (roadmap_root / a / "README.md").is_file()]
-        if bad:
-            die("target file names areas that are not roadmap directories under " + str(roadmap_root) + ": "
-                + ", ".join(repr(a[:40]) for a in bad) + " — a worker would author against a roadmap that does not exist; "
-                f"if the roadmap merged recently, `git -C {ROADMAP_CHECKOUT} pull` first; otherwise move the area under "
-                "the Gaps section until its roadmap PR merges")
+        problem, archived = target_area_problems(t, ROADMAP_CHECKOUT)
+        if problem:
+            die(problem)
+        if archived:
+            print("targets: " + ", ".join(archived) + " archived under Completed/ with nothing open; no worker authors there")
         n_open = sum(len(open_items(t, area)) for area in t.areas)
         print(f"targets: {TARGETS} — {n_open} open items in {len(t.areas)} areas")
     else:
