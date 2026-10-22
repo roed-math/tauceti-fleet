@@ -104,6 +104,10 @@ check("spend shares: Claude rounds in the window only", tf.round_costs(now - 3 *
 
 # ---- an end-to-end step ----------------------------------------------------------------------------------
 tf.manager_alive = lambda: True  # the real runtime dir may hold a live manager's socket: decide it here
+# These steps run on the real clock, so give them a slot around it: 48 h left, before the 72 h reset. Under the
+# fixed Mon-Thu slot the horizon was 72 h from Thursday 07:00 to Monday afternoon, and the reset check failed.
+wd = lambda t: datetime.fromtimestamp(t).strftime("%a %H:%M")  # noqa: E731
+tf.SETTINGS.setdefault("schedule", {})["active"] = f"{wd(now - 3600)} -> {wd(now + 48 * 3600)}"
 resets = now + 3 * 86400
 (w1 / "cache").mkdir()
 (w1 / "cache" / "quota-claude.json").write_text(json.dumps({"fetched_at": now - 60, "payload": {
