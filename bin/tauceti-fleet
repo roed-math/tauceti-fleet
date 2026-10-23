@@ -2209,7 +2209,8 @@ def cmd_attention(a: argparse.Namespace) -> int:
         print("nothing needs you.")
         return 0
     for d in items:
-        pr = f"PR #{d['pr']}  https://github.com/{TAUCETI}/pull/{d['pr']}" if d.get("pr") else d.get("key")
+        repo = d.get("repo") if "/" in str(d.get("repo") or "") else TAUCETI  # progress reports live in TauCetiRoadmap
+        pr = f"PR #{d['pr']}  https://github.com/{repo}/pull/{d['pr']}" if d.get("pr") else d.get("key")
         print(f"== {pr}  ({d.get('kind')} · {d.get('stage') or ''} · {d.get('worker', '-')} · {d.get('last_at')}"
               f"{' · seen ' + str(d['count']) + 'x' if int(d.get('count') or 0) > 1 else ''})"
               + ("  [the agent's words read as: close this PR]" if d.get("close_hint") else ""))

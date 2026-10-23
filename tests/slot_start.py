@@ -103,6 +103,16 @@ rc, out = run("attention", "--ack", "schedule")
 check("`attention --ack schedule` archives it", not tf.START_FAILED.is_file() and "acknowledged 1" in out, out)
 
 
+# ---- attention links ------------------------------------------------------------------------------------------------
+tf.INCIDENTS.mkdir(parents=True, exist_ok=True)
+(tf.INCIDENTS / "progress-stuck-X-1369.json").write_text(json.dumps({
+    "kind": "progress-stuck", "key": "X-1369", "pr": 1369, "repo": "TauCetiProject/TauCetiRoadmap",
+    "detail": "report", "last_at": "2026-10-22T06:45:17Z"}))
+rc, out = run("attention")
+check("an attention item links the repository its PR is in",
+      "https://github.com/TauCetiProject/TauCetiRoadmap/pull/1369" in out, out)
+(tf.INCIDENTS / "progress-stuck-X-1369.json").unlink()
+
 # ---- the roadmap checkout ------------------------------------------------------------------------------------------
 def git(*a, cwd=None):
     return subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
