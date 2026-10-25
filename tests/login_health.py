@@ -114,4 +114,27 @@ chain("claude-3", NOW - H, attempt=NOW - 60, success=NOW - 13 * H, written=NOW -
 tf.login_incidents()
 check("a new failure after the acknowledged one is filed again", item.is_file())
 
+# A worker's credential pin follows its lease, whatever switched the lease.
+tf.WORKTREE = TMP / "worker"
+for name in ("claude-6", "claude-9"):
+    chain(name, NOW + 5 * H, attempt=NOW - H, success=NOW - H + 2)
+tf.LEASES.write_text(json.dumps({"gq2-rev2": "claude-9", "gq2-fix2": "claude-6", "gq2-rev1": "claude-9"}))
+
+
+def pin(wid, source):
+    iso = tf.WORKTREE / "state" / wid / "home" / ".claude"
+    iso.mkdir(parents=True, exist_ok=True)
+    (iso / ".credentials.json").write_text("{}")
+    (iso / ".tauceti-creds-source").write_text(str(tf.LOGINS / source))
+    return iso
+
+
+stale, kept, busy = pin("gq2-rev2", "claude-6"), pin("gq2-fix2", "claude-6"), pin("gq2-rev1", "claude-6")
+notes = tf.reset_stale_mirrors(["gq2-rev2", "gq2-fix2", "gq2-rev1"],
+                               {"gq2-rev1": {"state": "running", "heartbeat_at": time.time()}})
+check("a pin its lease no longer names is reset between rounds",
+      not (stale / ".tauceti-creds-source").exists() and not (stale / ".credentials.json").exists(), str(notes))
+check("a pin matching its lease is left alone", (kept / ".tauceti-creds-source").is_file())
+check("a worker mid-round keeps its pin until the round ends", (busy / ".tauceti-creds-source").is_file())
+
 sys.exit(1 if fails else 0)

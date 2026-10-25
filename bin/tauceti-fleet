@@ -435,6 +435,19 @@ def reset_stale_mirror(wid: str) -> str | None:
     return f"{wid}: credential mirror reset to reseed from {expected}"
 
 
+def reset_stale_mirrors(wids: list[str], statuses: dict[str, dict], hook_wid: str | None = None) -> list[str]:
+    """reset_stale_mirror for each of these workers that is between rounds, whatever switched its lease:
+    `up` used to switch workers without resetting their pins, and gq2-rev2 then ran on claude-6 (fix2's
+    chain) from the 2026-10-19 slot start while leased claude-9. A matching pin is left alone."""
+    notes = []
+    for wid in wids:
+        if wid != hook_wid and mid_round(statuses.get(wid, {})):
+            continue
+        if note := reset_stale_mirror(wid):
+            notes.append(note)
+    return notes
+
+
 def _watchdog_note(line: str) -> None:
     try:
         FLEET_HOME.mkdir(parents=True, exist_ok=True)
@@ -3239,7 +3252,11 @@ def cmd_up(a: argparse.Namespace) -> int:
     # A dry run validates a separate file: writing the live one would leave it changed but never
     # applied, and the next reconcile would then see nothing to apply.
     target = FLEET_HOME / "workers.dry-run.toml" if a.dry_run else CONFIG
-    changed, _switched, deferred = write_config(specs, worker_status(), path=target)
+    statuses = worker_status()
+    changed, switched, deferred = write_config(specs, statuses, path=target)
+    if not a.dry_run:
+        for note in reset_stale_mirrors([s_["id"] for s_ in specs if s_["id"] not in deferred], statuses):
+            print(note)
     print(f"config: {target} ({'would change' if a.dry_run and changed else 'updated' if changed else 'unchanged'}; "
           f"pace={a.pace or 'worker default'})"
           + (f"; kept for workers mid-round: {', '.join(deferred)}" if deferred else ""))
@@ -3443,10 +3460,13 @@ def reconcile(a: argparse.Namespace, *, apply: bool, quiet: bool) -> int:
         a.reviewers = reviewers_for(active, getattr(a, "max_reviewers", MAX_REVIEWERS))
         dry = bool(getattr(a, "dry_run", False))
         specs = lease_logins(fleet_specs(a), persist=not dry)
-        changed, switched, deferred = write_config(specs, worker_status(), os.environ.get("TAUCETI_ROUND_WID"), write=not dry)
-        for wid in switched:
-            note = f"{wid}: would switch to its new definition" if dry else reset_stale_mirror(wid)
-            if note:
+        statuses, hook_wid = worker_status(), os.environ.get("TAUCETI_ROUND_WID")
+        changed, switched, deferred = write_config(specs, statuses, hook_wid, write=not dry)
+        if dry:
+            for wid in switched:
+                print(f"{wid}: would switch to its new definition")
+        else:
+            for note in reset_stale_mirrors([s_["id"] for s_ in specs if s_["id"] not in deferred], statuses, hook_wid):
                 print(note)
         verdict = ("would change" if dry else "updated") if changed else "unchanged"
         line = (f"reconcile: mine_open={mine_open} needs-fix={backlog} [{source}] → "
